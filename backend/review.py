@@ -42,7 +42,7 @@ MAX_DIFF_CHARS   = 12_000
 MAX_COMMENTS     = 8
 
 USE_OPENAI = bool(OPENAI_KEY and not ANTHROPIC_KEY)
-MODEL          = "gpt-4o" if USE_OPENAI else "claude-sonnet-4-6"
+MODEL          = "gpt-4o" if USE_OPENAI else os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
 
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────────
@@ -253,9 +253,14 @@ def _anthropic_review(user_msg: str) -> str:
             "content-type":         "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        resp = json.loads(r.read())
-    return resp["content"][0]["text"]
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resp = json.loads(r.read())
+        return resp["content"][0]["text"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"Anthropic API error {e.code}: {body[:500]}", file=sys.stderr)
+        raise
 
 
 def _openai_review(user_msg: str) -> str:
