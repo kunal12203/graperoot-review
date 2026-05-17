@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS reviews (
     num_high     INTEGER DEFAULT 0,
     findings     TEXT,
     error        TEXT,
-    installed_by TEXT
+    installed_by TEXT,
+    status       TEXT DEFAULT 'completed'
 );
 CREATE TABLE IF NOT EXISTS users (
     github_id     BIGINT PRIMARY KEY,
@@ -118,7 +119,8 @@ CREATE TABLE IF NOT EXISTS reviews (
     num_high     INTEGER DEFAULT 0,
     findings    TEXT,
     error       TEXT,
-    installed_by TEXT
+    installed_by TEXT,
+    status      TEXT DEFAULT 'completed'
 );
 CREATE TABLE IF NOT EXISTS users (
     github_id     INTEGER PRIMARY KEY,
@@ -192,11 +194,13 @@ def _migrate_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_limit INTEGER DEFAULT 5",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free'",
+        "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'completed'",
     ]
     new_cols_sq = [
         "ALTER TABLE users ADD COLUMN session_token TEXT",
         "ALTER TABLE users ADD COLUMN monthly_limit INTEGER DEFAULT 5",
         "ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'",
+        "ALTER TABLE reviews ADD COLUMN status TEXT DEFAULT 'completed'",
     ]
     if DATABASE_URL and _HAS_PG:
         for sql in new_cols_pg:
@@ -244,6 +248,43 @@ def save_review(owner, repo, pr_num, pr_title, pr_url, head_sha,
     else:
         db.execute(sql, vals)
         db.commit()
+
+
+def save_review_pending(owner, repo, pr_num, pr_title, pr_url, head_sha, installed_by=None):
+    """Insert a 'pending' row immediately when a review is queued. Returns row id."""
+    if not (DATABASE_URL and _HAS_PG):
+        return None
+    con = _pg_conn()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO reviews (owner, repo, pr_num, pr_title, pr_url, head_sha,
+                             created_at, status, installed_by, num_findings)
+        VALUES (%s,%s,%s,%s,%s,%s, NOW(), 'pending', %s, 0)
+        RETURNING id
+    """, (owner, repo, pr_num, pr_title, pr_url, head_sha, installed_by))
+    row = cur.fetchone()
+    row_id = dict(row)["id"] if row else None
+    con.commit(); cur.close(); con.close()
+    return row_id
+
+
+def update_review_done(row_id, elapsed, cost, findings, error=None):
+    """Update the pending row to completed/failed once _run_review finishes."""
+    if not row_id or not (DATABASE_URL and _HAS_PG):
+        return
+    num_findings = len(findings) if findings else 0
+    num_critical = sum(1 for f in (findings or []) if f.get("severity") == "CRITICAL")
+    num_high     = sum(1 for f in (findings or []) if f.get("severity") == "HIGH")
+    status = "failed" if error else "completed"
+    con = _pg_conn()
+    cur = con.cursor()
+    cur.execute("""
+        UPDATE reviews SET elapsed_s=%s, cost_usd=%s, num_findings=%s,
+            num_critical=%s, num_high=%s, findings=%s, error=%s, status=%s
+        WHERE id=%s
+    """, (elapsed, cost, num_findings, num_critical, num_high,
+          json.dumps(findings or []), error, status, row_id))
+    con.commit(); cur.close(); con.close()
 
 
 def _query(sql: str, params=(), one=False):
@@ -373,7 +414,7 @@ def _build_graph_bg(owner: str, repo: str, github_token: str, head_sha: str = ""
         print(f"[graph] bg build failed: {e}", flush=True)
 
 
-def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by):
+def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by, review_id=None):
     pr_url_gh = pr_url or f"https://github.com/{owner}/{repo}/pull/{pr_num}"
     print(f"[review] {owner}/{repo}#{pr_num}", flush=True)
     t0 = time.time()
@@ -446,8 +487,11 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
 
     with app.app_context():
         try:
-            save_review(owner, repo, pr_num, pr_title, pr_url_gh, head_sha,
-                        elapsed, cost, findings, error, installed_by)
+            if review_id:
+                update_review_done(review_id, elapsed, cost, findings, error)
+            else:
+                save_review(owner, repo, pr_num, pr_title, pr_url_gh, head_sha,
+                            elapsed, cost, findings, error, installed_by)
         except Exception as e:
             print(f"[db] save failed: {e}", flush=True)
 
@@ -809,7 +853,7 @@ def api_reviews():
     rows = _query(
         f"""SELECT id, pr_title, owner||'/'||repo AS repo, pr_url,
                    num_findings AS findings,
-                   CASE WHEN error IS NOT NULL THEN 'failed' ELSE 'completed' END AS status,
+                   COALESCE(status, CASE WHEN error IS NOT NULL THEN 'failed' ELSE 'completed' END) AS status,
                    created_at
             FROM reviews WHERE installed_by = {ph}
             ORDER BY created_at DESC LIMIT 50""",
@@ -900,9 +944,11 @@ def api_trigger_review():
     except Exception as e:
         return jsonify({"error": "pr_fetch_failed", "message": str(e)}), 500
 
+    review_id = save_review_pending(owner, repo, pr_num, pr_title, pr_url_gh, head_sha, login)
+
     Thread(
         target=_run_review,
-        args=(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url_gh, login),
+        args=(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url_gh, login, review_id),
         daemon=True,
     ).start()
 

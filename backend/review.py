@@ -295,6 +295,9 @@ def post_review(
 ) -> None:
     if not comments:
         print("  No issues found — PR looks clean.")
+        gh(f"/repos/{owner}/{repo}/issues/{pr_num}/comments",
+           method="POST",
+           body={"body": "**GrapeRoot Review** — No issues found. This PR looks clean.\n\n_Powered by [GrapeRoot](https://graperoot.dev) — graph-aware AI review_"})
         return
 
     # Build GitHub review body (summary at top)

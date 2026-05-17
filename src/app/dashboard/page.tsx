@@ -157,6 +157,14 @@ export default function DashboardPage() {
   const [loadingReviews, setLoadingReviews] = useState(true);
   const [queuedPRs, setQueuedPRs] = useState<Set<string>>(new Set());
 
+  const fetchReviews = useCallback((tok: string) => {
+    const headers: HeadersInit = { Authorization: `Bearer ${tok}` };
+    fetch(`${API}/api/reviews`, { headers })
+      .then(r => r.ok ? r.json() : [])
+      .then(r => { if (Array.isArray(r)) setReviews(r); })
+      .finally(() => setLoadingReviews(false));
+  }, []);
+
   const fetchData = useCallback((tok: string) => {
     const headers: HeadersInit = { Authorization: `Bearer ${tok}` };
 
@@ -170,11 +178,8 @@ export default function DashboardPage() {
       .then(p => { if (Array.isArray(p)) setPrs(p); })
       .finally(() => setLoadingPRs(false));
 
-    fetch(`${API}/api/reviews`, { headers })
-      .then(r => r.ok ? r.json() : [])
-      .then(r => { if (Array.isArray(r)) setReviews(r); })
-      .finally(() => setLoadingReviews(false));
-  }, []);
+    fetchReviews(tok);
+  }, [fetchReviews]);
 
   useEffect(() => {
     const storedUser  = localStorage.getItem("gr_user");
@@ -184,6 +189,14 @@ export default function DashboardPage() {
     setToken(storedToken);
     fetchData(storedToken);
   }, [router, fetchData]);
+
+  // Poll every 4s while any review is pending
+  useEffect(() => {
+    const hasPending = reviews.some(r => r.status === "pending");
+    if (!hasPending || !token) return;
+    const id = setInterval(() => fetchReviews(token), 4000);
+    return () => clearInterval(id);
+  }, [reviews, token, fetchReviews]);
 
   function logout() {
     localStorage.removeItem("gr_user");
