@@ -68,6 +68,94 @@ def gh(path: str, method: str = "GET", body: dict | None = None) -> Any:
         raise
 
 
+def gh_file(owner: str, repo: str, path: str, ref: str) -> str:
+    """Fetch decoded file content from GitHub at a specific ref. Returns '' on error."""
+    import base64
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "graperoot-review/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        if data.get("encoding") == "base64":
+            return base64.b64decode(data["content"].replace("\n", "")).decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"  [ctx] could not fetch {path}@{ref[:7]}: {e}", file=sys.stderr)
+    return ""
+
+
+def gh_search_imports(owner: str, repo: str, filename: str) -> list[str]:
+    """Find files in the repo that import from filename (best-effort via GitHub search)."""
+    stem = filename.rsplit("/", 1)[-1].replace(".py", "")
+    req = urllib.request.Request(
+        f"https://api.github.com/search/code?q={urllib.parse.quote(stem)}+repo:{owner}/{repo}&per_page=10",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "graperoot-review/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            items = json.loads(r.read()).get("items", [])
+        return [i["path"] for i in items if i["path"] != filename][:5]
+    except Exception:
+        return []
+
+
+def build_file_context(owner: str, repo: str, changed_files: list[str],
+                       base_sha: str, head_sha: str, max_chars: int = 12000) -> str:
+    """
+    Fetch full content of changed files at base + head, plus files that import them.
+    Returns a formatted string to inject into the review prompt as codebase context.
+    This is the no-clone alternative to the AST graph — gives the model full visibility
+    into what existed before the PR and what adjacent files look like.
+    """
+    parts: list[str] = []
+    budget = max_chars
+
+    for path in changed_files[:6]:
+        if budget <= 0:
+            break
+
+        # Base (before PR) — critical for spotting omissions like the flask sansio case
+        base = gh_file(owner, repo, path, base_sha)
+        if base:
+            snippet = base[:min(3000, budget // len(changed_files))]
+            parts.append(f"### {path}  [BASE — before this PR]\n```\n{snippet}\n{'...(truncated)' if len(base) > len(snippet) else ''}\n```")
+            budget -= len(snippet)
+
+        # Head (after PR) for new files or heavily modified ones
+        head = gh_file(owner, repo, path, head_sha)
+        if head and head != base:
+            snippet = head[:min(2000, budget // max(len(changed_files), 1))]
+            parts.append(f"### {path}  [HEAD — after this PR]\n```\n{snippet}\n{'...(truncated)' if len(head) > len(snippet) else ''}\n```")
+            budget -= len(snippet)
+
+    # Find and include a few files that import from the changed files
+    already = set(changed_files)
+    for path in changed_files[:3]:
+        if budget <= 0:
+            break
+        for importer in gh_search_imports(owner, repo, path):
+            if importer in already or budget <= 0:
+                continue
+            content = gh_file(owner, repo, importer, head_sha)
+            if content:
+                snippet = content[:min(1500, budget)]
+                parts.append(f"### {importer}  [imports from changed file]\n```\n{snippet}\n```")
+                budget -= len(snippet)
+                already.add(importer)
+
+    return "\n\n".join(parts)
+
+
 def gh_diff(owner: str, repo: str, pr_num: int) -> str:
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}"
     req = urllib.request.Request(
@@ -195,6 +283,7 @@ def claude_review(
     diff_text: str,
     impact_summary: str,
     symbol_excerpts: str,
+    file_context: str = "",
 ) -> list[dict]:
     """Call Claude or GPT-4o with all context and return structured review comments."""
     if not ANTHROPIC_KEY and not OPENAI_KEY:
@@ -209,10 +298,15 @@ def claude_review(
 ### Linked Issue / Intent
 {linked_issue or "(none)"}
 
-### Blast Radius (files affected beyond the diff)
-{impact_summary or "(graph not available — reviewing diff only)"}
+### Full file content (base + head versions of changed files, plus importers)
+This shows you what the files looked like BEFORE the PR and AFTER, so you can spot
+omissions, incomplete refactors, asymmetries, or missed re-exports.
+{file_context or "(not available)"}
 
-### Key Symbol Excerpts (from changed files)
+### Blast Radius (files affected beyond the diff)
+{impact_summary or "(not available — graph not built)"}
+
+### Key Symbol Excerpts
 {symbol_excerpts or "(none)"}
 
 ### Diff
@@ -457,17 +551,23 @@ def main() -> None:
         except Exception:
             pass
 
+    base_sha = pr["base"]["sha"]
+
     print("  Fetching diff...")
     diff    = gh_diff(owner, repo, pr_num)
     changed_files, hunks = parse_diff(diff)
     print(f"  Changed files: {len(changed_files)}")
 
-    # ── Graph context ──────────────────────────────────────────────────────────
+    # ── Codebase context (full file content via GitHub API — no clone needed) ──
+    print(f"  Fetching full file context for {len(changed_files)} file(s)...")
+    file_context = build_file_context(owner, repo, changed_files, base_sha, head_sha)
+    print(f"  File context: {len(file_context)} chars")
+
+    # ── Graph context (MCP / pre-built — used when available) ─────────────────
     impact_summary  = ""
     symbol_excerpts = ""
 
     if GR_GRAPH_CONTEXT:
-        # Injected by webhook server (graph already built + queried there)
         impact_summary = GR_GRAPH_CONTEXT
         print(f"  Graph: using pre-built context ({len(GR_GRAPH_CONTEXT)} chars)")
     elif mcp_available():
@@ -499,7 +599,7 @@ def main() -> None:
 
     print("  Reviewing with Claude...")
     comments = claude_review(title, body, linked_issue, diff_text,
-                             impact_summary, symbol_excerpts)
+                             impact_summary, symbol_excerpts, file_context)
 
     # Print summary
     print(f"\n  Found {len(comments)} issue(s):\n")
