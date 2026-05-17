@@ -331,10 +331,11 @@ Review this PR. Return a JSON array of comments as instructed."""
 
     text = re.sub(r"^```(?:json)?\n?", "", text.strip())
     text = re.sub(r"\n?```$", "", text)
+    print(f"  Model response ({len(text)} chars): {text[:500]}")
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        print(f"Model returned non-JSON:\n{text[:400]}", file=sys.stderr)
+        print(f"  Model returned non-JSON:\n{text[:600]}", file=sys.stderr)
         return []
 
 

@@ -478,6 +478,9 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
     elapsed = time.time() - t0
     findings, cost, error = [], 0.0, None
 
+    # Always log subprocess stdout so we can see model output in Railway logs
+    if result.stdout.strip():
+        print(f"[review.py stdout]\n{result.stdout[:3000]}", flush=True)
     if result.returncode != 0:
         error = (result.stderr + result.stdout)[:3000] or f"exit code {result.returncode}"
         print(f"[review] FAILED {owner}/{repo}#{pr_num}:\n{error}", flush=True)
