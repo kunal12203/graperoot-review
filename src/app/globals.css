@@ -1,26 +1,260 @@
-@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+@layer base {
+  * {
+    scroll-behavior: smooth;
+    box-sizing: border-box;
+  }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  body {
+    @apply bg-[#09090b] text-zinc-100 antialiased font-mono;
+    font-feature-settings: "calt" 1;
+  }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  code, pre, kbd, samp {
+    @apply font-mono;
+  }
+
+  ::-webkit-scrollbar {
+    width: 5px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-zinc-950;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-zinc-700 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #a855f7;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer utilities {
+  .text-gradient {
+    background: linear-gradient(135deg, #ffffff 0%, #d8b4fe 40%, #c084fc 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .grape-glow {
+    box-shadow: 0 0 60px rgba(168, 85, 247, 0.2), 0 0 0 1px rgba(168, 85, 247, 0.15);
+  }
+
+  .grape-border-glow {
+    box-shadow: 0 0 0 1px rgba(168, 85, 247, 0.25), 0 0 40px rgba(168, 85, 247, 0.12);
+  }
+
+  .dot-grid {
+    background-image: radial-gradient(circle, rgba(168, 85, 247, 0.12) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+
+  .card-glass {
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    backdrop-filter: blur(8px);
+  }
+
+  .card-glass:hover {
+    background: rgba(168, 85, 247, 0.06);
+    border-color: rgba(168, 85, 247, 0.2);
+    transform: translateY(-3px);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(168, 85, 247, 0.15);
+    transition: all 0.3s ease;
+  }
+}
+
+/* ---- Keyframe Animations ---- */
+
+@keyframes blob {
+  0%   { transform: translate(0px, 0px) scale(1); }
+  33%  { transform: translate(40px, -60px) scale(1.12); }
+  66%  { transform: translate(-25px, 25px) scale(0.9); }
+  100% { transform: translate(0px, 0px) scale(1); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-18px); }
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(28px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+@keyframes shimmer {
+  from { background-position: -200% 0; }
+  to   { background-position:  200% 0; }
+}
+
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+
+@keyframes marquee-reverse {
+  from { transform: translateX(-50%); }
+  to   { transform: translateX(0); }
+}
+
+.animate-marquee {
+  animation: marquee 35s linear infinite;
+}
+
+.animate-marquee-reverse {
+  animation: marquee-reverse 35s linear infinite;
+}
+
+.animate-marquee:hover,
+.animate-marquee-reverse:hover {
+  animation-play-state: paused;
+}
+
+@keyframes gradientShift {
+  0%, 100% { background-position: 0% 50%; }
+  50%       { background-position: 100% 50%; }
+}
+
+/* ---- Topographic drift — seamless horizontal scroll ---- */
+@keyframes topoDrift {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-1200px); }
+}
+.animate-topo-drift {
+  animation-name: topoDrift;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  transform-box: fill-box;
+}
+
+/* ---- Concentric ripples ---- */
+@keyframes ripple {
+  0% {
+    width: 0;
+    height: 0;
+    opacity: 0.55;
+    border-width: 2.5px;
+    transform: translate(-50%, -50%);
+  }
+  100% {
+    width: var(--ripple-max, 600px);
+    height: var(--ripple-max, 600px);
+    opacity: 0;
+    border-width: 0.4px;
+    transform: translate(-50%, -50%);
+  }
+}
+.animate-ripple {
+  animation-name: ripple;
+  animation-iteration-count: infinite;
+  animation-timing-function: ease-out;
+  animation-fill-mode: both;
+}
+
+/* ---- Hex grid pulse — wave emanating from center ---- */
+@keyframes hexPulse {
+  0%, 100% {
+    fill-opacity: 0;
+    stroke-opacity: 0.05;
+  }
+  50% {
+    fill-opacity: 0.085;
+    stroke-opacity: 0.26;
+  }
+}
+.animate-hex-pulse {
+  animation-name: hexPulse;
+  animation-duration: 3s;
+  animation-iteration-count: infinite;
+  animation-timing-function: ease-in-out;
+  animation-fill-mode: backwards;
+}
+
+
+/* ---- Animation Classes ---- */
+
+.animate-blob {
+  animation: blob 9s infinite;
+}
+.animate-blob-delay-2 {
+  animation: blob 9s infinite 2.5s;
+}
+.animate-blob-delay-4 {
+  animation: blob 9s infinite 5s;
+}
+.animate-float {
+  animation: float 7s ease-in-out infinite;
+}
+.animate-float-delay {
+  animation: float 7s ease-in-out infinite 1.5s;
+}
+.animate-fade-in-up {
+  animation: fadeInUp 0.65s ease-out both;
+}
+.animate-fade-in-up-delay-1 {
+  animation: fadeInUp 0.65s ease-out 0.1s both;
+}
+.animate-fade-in-up-delay-2 {
+  animation: fadeInUp 0.65s ease-out 0.2s both;
+}
+.animate-fade-in-up-delay-3 {
+  animation: fadeInUp 0.65s ease-out 0.3s both;
+}
+.animate-cursor {
+  animation: blink 1s step-end infinite;
+}
+
+/* Flowing gradient border for testimonial cards */
+@keyframes flowBorder {
+  0%   { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+.animate-flow-border {
+  animation: flowBorder 4s linear infinite;
+}
+
+/* Heading shimmer sweep */
+@keyframes textShimmer {
+  0%   { background-position: 200% 50%; }
+  100% { background-position: -200% 50%; }
+}
+.animate-text-shimmer {
+  animation: textShimmer 6s linear infinite;
+}
+
+/* Gentle vertical bob */
+@keyframes bob {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-4px); }
+}
+.animate-bob {
+  animation: bob 4s ease-in-out infinite;
+}
+
+/* Bar grow-from-left for benchmark visualizations */
+@keyframes barGrow {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+.animate-bar-grow {
+  transform-origin: left center;
+  animation: barGrow 1.1s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Soft glow pulse for accent dots */
+@keyframes glowPulse {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50%       { opacity: 1;    transform: scale(1.15); }
+}
+.animate-glow-pulse {
+  animation: glowPulse 3s ease-in-out infinite;
 }

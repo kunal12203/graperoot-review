@@ -1,65 +1,90 @@
-import Image from "next/image";
+import Navbar from "@/components/Navbar";
+import Footer from "@/components/Footer";
+import { ArrowRight } from "lucide-react";
 
-export default function Home() {
+export default function ReviewPage() {
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <main className="min-h-screen text-white">
+      <Navbar />
+
+      {/* ── HERO ──────────────────────────────────────────────────────────── */}
+      <section className="relative min-h-screen flex items-center overflow-hidden">
+        <div className="relative z-10 w-full max-w-5xl mx-auto px-4 sm:px-6 pt-24 pb-12 text-center flex flex-col items-center">
+          <div className="inline-flex items-center gap-2 text-[11px] font-semibold text-grape-300 bg-grape-500/10 border border-grape-500/20 px-3 py-1.5 rounded-full mb-6 tracking-widest uppercase animate-fade-in-up-delay-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-grape-400 animate-pulse" />
+            5 free reviews — no credit card
+          </div>
+
+          <h1 className="font-sans text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-bold uppercase leading-[1.05] tracking-tight mb-5 animate-fade-in-up-delay-1">
+            <span className="bg-gradient-to-r from-grape-300 via-grape-400 to-purple-400 bg-clip-text text-transparent">
+              Graph-proven
+            </span>
+            <br />
+            <span className="text-zinc-100">AI code review</span>
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+
+          <p className="text-base sm:text-lg text-zinc-300 max-w-xl leading-relaxed mb-8 animate-fade-in-up-delay-2">
+            Every finding cites the real import chain — not a guess.
+            Installs as a GitHub App in 2 minutes. No YAML. No CLI.
           </p>
+
+          <div className="flex flex-col sm:flex-row gap-3 justify-center animate-fade-in-up-delay-3">
+            <a
+              href="https://github.com/apps/graperoot-review/installations/new/permissions?target_id=84341876"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-grape-600 hover:bg-grape-500 text-white font-semibold transition-all shadow-xl shadow-grape-900/40 text-sm"
+            >
+              <GhIcon />
+              Install GitHub App — free
+            </a>
+            <a
+              href="https://review.graperoot.dev/compare"
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-xl border border-white/[0.08] hover:border-grape-500/40 bg-white/[0.04] hover:bg-white/[0.07] text-zinc-300 hover:text-white font-semibold transition-all text-sm"
+            >
+              vs CodeRabbit, CodeAnt &amp; more <ArrowRight size={14} />
+            </a>
+          </div>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
+      </section>
+
+      {/* ── FINAL CTA ─────────────────────────────────────────────────────── */}
+      <section className="px-4 py-28 border-t border-zinc-800/50 text-center relative overflow-hidden">
+        <div className="absolute inset-0 pointer-events-none">
+          <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-[600px] h-[300px] rounded-full bg-grape-500/6 blur-[80px]" />
+        </div>
+        <div className="relative z-10 max-w-xl mx-auto">
+          <h2 className="font-sans text-3xl sm:text-4xl font-bold text-zinc-100 mb-4 tracking-tight">
+            Your next PR deserves a
+            <br />
+            <span className="bg-gradient-to-r from-grape-300 via-grape-400 to-purple-400 bg-clip-text text-transparent">
+              graph-proven review.
+            </span>
+          </h2>
+          <p className="text-zinc-500 text-sm mb-8 leading-relaxed">
+            Install in 2 minutes. Free for open source. No credit card.
+          </p>
           <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+            href="https://github.com/apps/graperoot-review/installations/new/permissions?target_id=84341876"
             target="_blank"
             rel="noopener noreferrer"
+            className="inline-flex items-center gap-2 px-7 py-3.5 rounded-xl bg-grape-600 hover:bg-grape-500 text-white font-semibold transition-all shadow-xl shadow-grape-900/40 text-sm"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
+            <GhIcon />
+            Install GitHub App — free
           </a>
         </div>
-      </main>
-    </div>
+      </section>
+
+      <Footer />
+    </main>
+  );
+}
+
+function GhIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4 flex-shrink-0">
+      <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
+    </svg>
   );
 }
