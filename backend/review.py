@@ -110,7 +110,7 @@ def gh_search_imports(owner: str, repo: str, filename: str) -> list[str]:
 
 
 def build_file_context(owner: str, repo: str, changed_files: list[str],
-                       base_sha: str, head_sha: str, max_chars: int = 12000) -> str:
+                       base_sha: str, head_sha: str, max_chars: int = 40000) -> str:
     """
     Fetch full content of changed files at base + head, plus files that import them.
     Returns a formatted string to inject into the review prompt as codebase context.
@@ -124,17 +124,17 @@ def build_file_context(owner: str, repo: str, changed_files: list[str],
         if budget <= 0:
             break
 
-        # Base (before PR) — critical for spotting omissions like the flask sansio case
+        # Base (before PR) — FULL content, critical for spotting omissions
         base = gh_file(owner, repo, path, base_sha)
         if base:
-            snippet = base[:min(3000, budget // len(changed_files))]
+            snippet = base[:min(15000, budget)]
             parts.append(f"### {path}  [BASE — before this PR]\n```\n{snippet}\n{'...(truncated)' if len(base) > len(snippet) else ''}\n```")
             budget -= len(snippet)
 
         # Head (after PR) for new files or heavily modified ones
         head = gh_file(owner, repo, path, head_sha)
         if head and head != base:
-            snippet = head[:min(2000, budget // max(len(changed_files), 1))]
+            snippet = head[:min(10000, budget)]
             parts.append(f"### {path}  [HEAD — after this PR]\n```\n{snippet}\n{'...(truncated)' if len(head) > len(snippet) else ''}\n```")
             budget -= len(snippet)
 
