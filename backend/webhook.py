@@ -479,9 +479,18 @@ def login():
 
 @app.route("/auth/callback")
 def auth_callback():
-    code  = request.args.get("code", "")
-    state = request.args.get("state", "")
-    if not code or state != session.pop("oauth_state", None):
+    code            = request.args.get("code", "")
+    state           = request.args.get("state", "")
+    installation_id = request.args.get("installation_id", "")
+
+    if not code:
+        abort(400)
+
+    # Installation callbacks have no state — only validate state for
+    # standalone OAuth (Login button flow)
+    if installation_id:
+        session.pop("oauth_state", None)
+    elif state != session.pop("oauth_state", None):
         abort(400)
 
     # Exchange code for access token
