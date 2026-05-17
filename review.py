@@ -35,10 +35,14 @@ from typing import Any
 # ── Config ────────────────────────────────────────────────────────────────────
 GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_KEY     = os.environ.get("OPENAI_API_KEY", "")
 MCP_PORT       = int(os.environ.get("GRAPEROOT_PORT", os.environ.get("DG_MCP_PORT", "8765")))
 MAX_DIFF_CHARS = 12_000   # truncate very large diffs
 MAX_COMMENTS   = 8        # never post more than this many comments per PR
-MODEL          = "claude-sonnet-4-6"
+
+# Use OpenAI if no Anthropic key is set
+USE_OPENAI     = bool(OPENAI_KEY and not ANTHROPIC_KEY)
+MODEL          = "gpt-4o" if USE_OPENAI else "claude-sonnet-4-6"
 
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────────
@@ -192,9 +196,9 @@ def claude_review(
     impact_summary: str,
     symbol_excerpts: str,
 ) -> list[dict]:
-    """Call Claude with all context and get structured review comments."""
-    if not ANTHROPIC_KEY:
-        print("ANTHROPIC_API_KEY not set", file=sys.stderr)
+    """Call Claude or GPT-4o with all context and return structured review comments."""
+    if not ANTHROPIC_KEY and not OPENAI_KEY:
+        print("Set ANTHROPIC_API_KEY or OPENAI_API_KEY", file=sys.stderr)
         return []
 
     user_msg = f"""## PR: {pr_title}
@@ -219,34 +223,61 @@ def claude_review(
 
 Review this PR. Return a JSON array of comments as instructed."""
 
+    if USE_OPENAI:
+        text = _openai_review(user_msg)
+    else:
+        text = _anthropic_review(user_msg)
+
+    text = re.sub(r"^```(?:json)?\n?", "", text.strip())
+    text = re.sub(r"\n?```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        print(f"Model returned non-JSON:\n{text[:400]}", file=sys.stderr)
+        return []
+
+
+def _anthropic_review(user_msg: str) -> str:
     payload = {
         "model": MODEL,
         "max_tokens": 2048,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_msg}],
     }
-    data = json.dumps(payload).encode()
-    req  = urllib.request.Request(
+    req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
-        data=data, method="POST",
+        data=json.dumps(payload).encode(), method="POST",
         headers={
-            "x-api-key": ANTHROPIC_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "x-api-key":            ANTHROPIC_KEY,
+            "anthropic-version":    "2023-06-01",
+            "content-type":         "application/json",
         },
     )
     with urllib.request.urlopen(req, timeout=60) as r:
         resp = json.loads(r.read())
+    return resp["content"][0]["text"]
 
-    text = resp["content"][0]["text"].strip()
-    # Strip markdown code fences if Claude wrapped it
-    text = re.sub(r"^```(?:json)?\n?", "", text)
-    text = re.sub(r"\n?```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print(f"Claude returned non-JSON:\n{text[:400]}", file=sys.stderr)
-        return []
+
+def _openai_review(user_msg: str) -> str:
+    payload = {
+        "model": MODEL,
+        "max_tokens": 2048,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_msg},
+        ],
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode(), method="POST",
+        headers={
+            "Authorization": f"Bearer {OPENAI_KEY}",
+            "Content-Type":  "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        resp = json.loads(r.read())
+    return resp["choices"][0]["message"]["content"]
 
 
 # ── Post comments to GitHub ────────────────────────────────────────────────────
