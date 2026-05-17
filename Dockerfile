@@ -13,8 +13,9 @@ ENV PYTHONUNBUFFERED=1 \
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
-COPY review.py  /app/review.py
-COPY webhook.py /app/webhook.py
+COPY review.py   /app/review.py
+COPY webhook.py  /app/webhook.py
+COPY landing/    /app/landing/
 
 # Required env vars (set in Railway / docker run -e):
 #   ANTHROPIC_API_KEY       — Claude API key
