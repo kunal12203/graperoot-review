@@ -12,10 +12,18 @@ Routes:
 """
 from __future__ import annotations
 
-import hashlib, hmac, json, os, sqlite3, subprocess, sys, time, secrets, urllib.request, urllib.parse
+import hashlib, hmac, json, os, subprocess, sys, time, secrets, urllib.request, urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    _HAS_PG = True
+except ImportError:
+    import sqlite3
+    _HAS_PG = False
 
 from flask import Flask, request, jsonify, redirect, session, abort, g
 
@@ -35,77 +43,172 @@ FALLBACK_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
 OAUTH_CLIENT_ID     = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "")
 SESSION_SECRET  = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
-DB_PATH         = os.environ.get("DB_PATH", "/app/data/reviews.db")
+DATABASE_URL    = os.environ.get("DATABASE_URL", "")          # NeonDB / any Postgres
+DB_PATH         = os.environ.get("DB_PATH", "/app/data/reviews.db")  # SQLite fallback
 
 app = Flask(__name__)
 app.secret_key = SESSION_SECRET
 
 # ── Database ───────────────────────────────────────────────────────────────────
+# Uses PostgreSQL (NeonDB) when DATABASE_URL is set, SQLite otherwise.
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS reviews (
+    id           SERIAL PRIMARY KEY,
+    owner        TEXT NOT NULL,
+    repo         TEXT NOT NULL,
+    pr_num       INTEGER NOT NULL,
+    pr_title     TEXT,
+    pr_url       TEXT,
+    head_sha     TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    elapsed_s    REAL,
+    cost_usd     REAL DEFAULT 0,
+    num_findings INTEGER DEFAULT 0,
+    num_critical INTEGER DEFAULT 0,
+    num_high     INTEGER DEFAULT 0,
+    findings     TEXT,
+    error        TEXT,
+    installed_by TEXT
+);
+CREATE TABLE IF NOT EXISTS users (
+    github_id    BIGINT PRIMARY KEY,
+    login        TEXT NOT NULL,
+    avatar_url   TEXT,
+    access_token TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_repo     ON reviews(owner, repo);
+CREATE INDEX IF NOT EXISTS idx_reviews_created  ON reviews(created_at DESC);
+"""
+
+SCHEMA_SQLITE = """
+CREATE TABLE IF NOT EXISTS reviews (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner       TEXT NOT NULL,
+    repo        TEXT NOT NULL,
+    pr_num      INTEGER NOT NULL,
+    pr_title    TEXT,
+    pr_url      TEXT,
+    head_sha    TEXT,
+    created_at  TEXT NOT NULL,
+    elapsed_s   REAL,
+    cost_usd    REAL DEFAULT 0,
+    num_findings INTEGER DEFAULT 0,
+    num_critical INTEGER DEFAULT 0,
+    num_high     INTEGER DEFAULT 0,
+    findings    TEXT,
+    error       TEXT,
+    installed_by TEXT
+);
+CREATE TABLE IF NOT EXISTS users (
+    github_id   INTEGER PRIMARY KEY,
+    login       TEXT NOT NULL,
+    avatar_url  TEXT,
+    access_token TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_repo ON reviews(owner, repo);
+CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at DESC);
+"""
+
+
+def _pg_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
 
 def get_db():
     if "db" not in g:
-        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        if DATABASE_URL and _HAS_PG:
+            g.db = _pg_conn()
+            g._is_pg = True
+        else:
+            Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+            import sqlite3 as _sq
+            g.db = _sq.connect(DB_PATH)
+            g.db.row_factory = _sq.Row
+            g._is_pg = False
     return g.db
+
 
 @app.teardown_appcontext
 def close_db(e=None):
     db = g.pop("db", None)
     if db:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _ph(n: int) -> str:
+    """Placeholder: %s for Postgres, ? for SQLite."""
+    return ",".join(["%s"] * n) if (DATABASE_URL and _HAS_PG) else ",".join(["?"] * n)
+
 
 def init_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.executescript("""
-        CREATE TABLE IF NOT EXISTS reviews (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner       TEXT NOT NULL,
-            repo        TEXT NOT NULL,
-            pr_num      INTEGER NOT NULL,
-            pr_title    TEXT,
-            pr_url      TEXT,
-            head_sha    TEXT,
-            created_at  TEXT NOT NULL,
-            elapsed_s   REAL,
-            cost_usd    REAL DEFAULT 0,
-            num_findings INTEGER DEFAULT 0,
-            num_critical INTEGER DEFAULT 0,
-            num_high     INTEGER DEFAULT 0,
-            findings    TEXT,
-            error       TEXT,
-            installed_by TEXT
-        );
-        CREATE TABLE IF NOT EXISTS users (
-            github_id   INTEGER PRIMARY KEY,
-            login       TEXT NOT NULL,
-            avatar_url  TEXT,
-            access_token TEXT,
-            created_at  TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_reviews_repo ON reviews(owner, repo);
-        CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at DESC);
-    """)
-    con.commit()
-    con.close()
+    if DATABASE_URL and _HAS_PG:
+        con = _pg_conn()
+        cur = con.cursor()
+        cur.execute(SCHEMA)
+        con.commit()
+        cur.close(); con.close()
+        print("[db] PostgreSQL (NeonDB) initialized", flush=True)
+    else:
+        import sqlite3 as _sq
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        con = _sq.connect(DB_PATH)
+        con.executescript(SCHEMA_SQLITE)
+        con.commit(); con.close()
+        print(f"[db] SQLite fallback at {DB_PATH}", flush=True)
+
 
 def save_review(owner, repo, pr_num, pr_title, pr_url, head_sha,
                 elapsed, cost, findings, error=None, installed_by=None):
-    db = get_db()
+    db   = get_db()
+    is_pg = getattr(g, "_is_pg", False)
     num_findings = len(findings) if findings else 0
     num_critical = sum(1 for f in (findings or []) if f.get("severity") == "CRITICAL")
     num_high     = sum(1 for f in (findings or []) if f.get("severity") == "HIGH")
-    db.execute("""
+    ph = "%s" if is_pg else "?"
+
+    sql = f"""
         INSERT INTO reviews
           (owner,repo,pr_num,pr_title,pr_url,head_sha,created_at,elapsed_s,
            cost_usd,num_findings,num_critical,num_high,findings,error,installed_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (owner, repo, pr_num, pr_title, pr_url, head_sha,
-          datetime.now(timezone.utc).isoformat(),
-          elapsed, cost, num_findings, num_critical, num_high,
-          json.dumps(findings or []), error, installed_by))
-    db.commit()
+        VALUES ({",".join([ph]*15)})
+    """
+    vals = (owner, repo, pr_num, pr_title, pr_url, head_sha,
+            datetime.now(timezone.utc).isoformat(),
+            elapsed, cost, num_findings, num_critical, num_high,
+            json.dumps(findings or []), error, installed_by)
+
+    if is_pg:
+        cur = db.cursor()
+        cur.execute(sql, vals)
+        db.commit()
+        cur.close()
+    else:
+        db.execute(sql, vals)
+        db.commit()
+
+
+def _query(sql: str, params=(), one=False):
+    """Run a SELECT and return list of dicts (or one dict)."""
+    db   = get_db()
+    is_pg = getattr(g, "_is_pg", False)
+    if is_pg:
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = [dict(r) for r in (cur.fetchall() if not one else [cur.fetchone()])]
+        cur.close()
+    else:
+        cur = db.execute(sql, params)
+        raw = cur.fetchall()
+        rows = [dict(r) for r in raw]
+        if one:
+            rows = [rows[0]] if rows else [{}]
+    return rows[0] if one else rows
 
 # ── GitHub App auth ────────────────────────────────────────────────────────────
 
@@ -246,15 +349,28 @@ def auth_callback():
     }
     session["gh_token"] = access_token
 
-    db = get_db()
-    db.execute("""
-        INSERT INTO users (github_id, login, avatar_url, access_token, created_at)
-        VALUES (?,?,?,?,?)
-        ON CONFLICT(github_id) DO UPDATE SET
-          login=excluded.login, avatar_url=excluded.avatar_url, access_token=excluded.access_token
-    """, (user["id"], user["login"], user.get("avatar_url",""), access_token,
-          datetime.now(timezone.utc).isoformat()))
-    db.commit()
+    db    = get_db()
+    is_pg = getattr(g, "_is_pg", False)
+    ph    = "%s" if is_pg else "?"
+    now   = datetime.now(timezone.utc).isoformat()
+    if is_pg:
+        upsert = f"""
+            INSERT INTO users (github_id, login, avatar_url, access_token, created_at)
+            VALUES ({ph},{ph},{ph},{ph},{ph})
+            ON CONFLICT(github_id) DO UPDATE SET
+              login=EXCLUDED.login, avatar_url=EXCLUDED.avatar_url, access_token=EXCLUDED.access_token
+        """
+        cur = db.cursor()
+        cur.execute(upsert, (user["id"], user["login"], user.get("avatar_url",""), access_token, now))
+        db.commit(); cur.close()
+    else:
+        db.execute(f"""
+            INSERT INTO users (github_id, login, avatar_url, access_token, created_at)
+            VALUES ({ph},{ph},{ph},{ph},{ph})
+            ON CONFLICT(github_id) DO UPDATE SET
+              login=excluded.login, avatar_url=excluded.avatar_url, access_token=excluded.access_token
+        """, (user["id"], user["login"], user.get("avatar_url",""), access_token, now))
+        db.commit()
     return redirect("/dashboard")
 
 @app.route("/logout")
@@ -272,30 +388,31 @@ def _base_url():
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    user = current_user()
-    db   = get_db()
+    user   = current_user()
+    is_pg  = bool(DATABASE_URL and _HAS_PG)
+    concat = "owner||'/'||repo" if not is_pg else "owner||'/'||repo"
 
-    stats = db.execute("""
+    stats  = _query("""
         SELECT
-          COUNT(*) total,
-          COALESCE(SUM(cost_usd),0) total_cost,
-          COALESCE(SUM(num_findings),0) total_findings,
-          COALESCE(SUM(num_critical),0) total_critical,
-          COALESCE(AVG(elapsed_s),0) avg_time,
-          COALESCE(AVG(cost_usd),0) avg_cost
+          COUNT(*)                       AS total,
+          COALESCE(SUM(cost_usd),0)      AS total_cost,
+          COALESCE(SUM(num_findings),0)  AS total_findings,
+          COALESCE(SUM(num_critical),0)  AS total_critical,
+          COALESCE(AVG(elapsed_s),0)     AS avg_time,
+          COALESCE(AVG(cost_usd),0)      AS avg_cost
         FROM reviews WHERE error IS NULL
-    """).fetchone()
+    """, one=True)
 
-    recent = db.execute("""
+    recent = _query("""
         SELECT owner,repo,pr_num,pr_title,pr_url,created_at,
                cost_usd,num_findings,num_critical,num_high,elapsed_s,error
         FROM reviews ORDER BY created_at DESC LIMIT 50
-    """).fetchall()
+    """)
 
-    repos = db.execute("""
-        SELECT owner||'/'||repo repo, COUNT(*) cnt, SUM(num_findings) findings
+    repos  = _query("""
+        SELECT owner||'/'||repo AS repo, COUNT(*) AS cnt, COALESCE(SUM(num_findings),0) AS findings
         FROM reviews GROUP BY owner,repo ORDER BY cnt DESC LIMIT 10
-    """).fetchall()
+    """)
 
     return _render_dashboard(user, stats, recent, repos)
 
@@ -407,11 +524,8 @@ def _render_dashboard(user, stats, recent, repos):
 @app.route("/api/reviews")
 @login_required
 def api_reviews():
-    db = get_db()
-    rows = db.execute("""
-        SELECT * FROM reviews ORDER BY created_at DESC LIMIT 200
-    """).fetchall()
-    return jsonify([dict(r) for r in rows])
+    rows = _query("SELECT * FROM reviews ORDER BY created_at DESC LIMIT 200")
+    return jsonify(rows)
 
 # ── Webhook ────────────────────────────────────────────────────────────────────
 
@@ -461,11 +575,13 @@ def webhook():
 
 @app.route("/health")
 def health():
+    db_status = "postgres" if (DATABASE_URL and _HAS_PG) else "sqlite"
     return jsonify({
         "status":   "ok",
         "app_mode": bool(APP_ID and PRIVATE_KEY and _HAS_JWT),
         "oauth":    bool(OAUTH_CLIENT_ID),
-        "db":       Path(DB_PATH).exists(),
+        "db":       db_status,
+        "db_url":   bool(DATABASE_URL),
     })
 
 @app.route("/")
