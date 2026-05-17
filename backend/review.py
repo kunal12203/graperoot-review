@@ -253,34 +253,37 @@ def parse_diff(diff: str) -> tuple[list[str], dict[str, str]]:
 
 # ── Claude review ──────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a world-class staff engineer doing an exhaustive code review.
-You have the diff, the full content of changed files before and after, and the content
-of files that import from or are imported by the changed files.
+SYSTEM_PROMPT = """You are a world-class staff engineer doing an exhaustive, precise code review.
+You have the diff, the full content of changed files BEFORE and AFTER the PR, and the
+content of files that import from the changed modules.
 
 Return a JSON array of review comments. Each comment:
 {
-  "path": "src/file.ts",       // file path relative to repo root
-  "line": 42,                  // line number in the NEW file (right side of diff)
+  "path": "src/file.ts",
+  "line": 42,                  // line number in the NEW file
   "severity": "CRITICAL|HIGH|MEDIUM|LOW",
   "title": "one-line summary",
-  "body": "detailed explanation. Include the exact broken code and a concrete fix."
+  "body": "explanation. Quote the EXACT problematic line(s) from the provided context, then give the fix."
 }
+
+ANTI-HALLUCINATION RULES — violating these is worse than finding nothing:
+- NEVER invent code that is not in the provided context. If you say 'the code has X', X must appear verbatim in the diff or file content above.
+- Before reporting a bug, locate the exact line in the provided code. If you cannot find it, do not report it.
+- Do not assume code exists outside what is shown. Only reason about what you can see.
 
 Severity guide:
 - CRITICAL: correctness bug, data loss, security vulnerability, broken public API
-- HIGH: logic error, missing error handling on external call, race condition, incomplete refactor
-- MEDIUM: performance issue, missing test for risky path, subtle behavioral change, asymmetry
-- LOW: code smell, unclear naming, missing documentation for non-obvious behavior
+- HIGH: logic error, missing error handling, race condition, incomplete refactor that breaks callers
+- MEDIUM: behavioral change vs the base, missing re-export, asymmetry in a refactor
+- LOW: code smell, unclear naming, non-obvious side effect
 
-Be exhaustive. Do NOT cap at a small number — report every real issue you find.
-Cross-reference the base file content vs head content to catch:
-  - Classes or methods that existed before but were not moved/re-exported
-  - Asymmetries in refactors (e.g. some methods moved, others not)
-  - Broken import chains in files that depend on the changed modules
-  - Missing backward-compatibility re-exports
-  - Incomplete interface implementations
-Do NOT report style issues, whitespace, or trivially obvious things.
-Return ONLY the JSON array, no markdown wrapper, no explanation outside the array."""
+For refactoring PRs — do this explicitly:
+1. List every class and method in the BASE version of each changed file.
+2. Check if each one appears in either the new version or a new sansio/shared module.
+3. Report any that are missing from both — these are incomplete refactors.
+
+Return ONLY the JSON array, no markdown wrapper, no explanation outside the array.
+If nothing is wrong, return []."""
 
 
 def claude_review(
@@ -305,24 +308,25 @@ def claude_review(
 ### Linked Issue / Intent
 {linked_issue or "(none)"}
 
-### Full file content (base + head versions of changed files, plus importers)
-This shows you what the files looked like BEFORE the PR and AFTER, so you can spot
-omissions, incomplete refactors, asymmetries, or missed re-exports.
-{file_context or "(not available)"}
-
-### Blast Radius (files affected beyond the diff)
-{impact_summary or "(not available — graph not built)"}
-
-### Key Symbol Excerpts
-{symbol_excerpts or "(none)"}
-
-### Diff
+### Diff (what changed)
 ```diff
 {diff_text[:MAX_DIFF_CHARS]}
 {"... (truncated)" if len(diff_text) > MAX_DIFF_CHARS else ""}
 ```
 
-Review this PR. Return a JSON array of comments as instructed."""
+### Full file content — BASE and HEAD versions + affected files
+Use this to find: omissions (things in BASE not in HEAD), incomplete refactors,
+missing re-exports, broken import chains, and behavioral changes.
+Every issue you report MUST be traceable to specific lines in this content or the diff above.
+{file_context or "(not available)"}
+
+### Blast radius — files connected to the changed modules (graph)
+{impact_summary or "(not available)"}
+
+### Key symbol excerpts
+{symbol_excerpts or "(none)"}
+
+Review this PR. Apply the anti-hallucination rules strictly. Return JSON array only."""
 
     if USE_OPENAI:
         text = _openai_review(user_msg)
