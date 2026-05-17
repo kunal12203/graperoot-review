@@ -389,9 +389,10 @@ def compare_mode(
 def main() -> None:
     ap = argparse.ArgumentParser(description="GrapeRoot Review")
     ap.add_argument("pr_url", help="GitHub PR URL")
-    ap.add_argument("--dry",  action="store_true", help="Print review, don't post")
-    ap.add_argument("--vs",   action="store_true", help="Side-by-side vs plain Claude")
-    ap.add_argument("--port", type=int, default=0, help="GrapeRoot MCP port")
+    ap.add_argument("--dry",      action="store_true", help="Print review, don't post")
+    ap.add_argument("--vs",       action="store_true", help="Side-by-side vs plain Claude")
+    ap.add_argument("--port",     type=int, default=0, help="GrapeRoot MCP port")
+    ap.add_argument("--json-out", default="",          help="Write findings + cost to this JSON file")
     args = ap.parse_args()
 
     global MCP_PORT
@@ -400,8 +401,8 @@ def main() -> None:
 
     if not GITHUB_TOKEN:
         print("Error: set GITHUB_TOKEN env var", file=sys.stderr); sys.exit(1)
-    if not ANTHROPIC_KEY:
-        print("Error: set ANTHROPIC_API_KEY env var", file=sys.stderr); sys.exit(1)
+    if not ANTHROPIC_KEY and not OPENAI_KEY:
+        print("Error: set ANTHROPIC_API_KEY or OPENAI_API_KEY", file=sys.stderr); sys.exit(1)
 
     owner, repo, pr_num = parse_pr_url(args.pr_url)
     print(f"GrapeRoot Review: {owner}/{repo}#{pr_num}")
@@ -473,7 +474,17 @@ def main() -> None:
         print(f"             {c['body'][:120]}...\n" if len(c['body']) > 120
               else f"             {c['body']}\n")
 
+    t_review = time.time()
     post_review(owner, repo, pr_num, comments, head_sha, dry_run=args.dry)
+
+    if args.json_out:
+        cost_usd = _last_cost if hasattr(sys.modules[__name__], "_last_cost") else 0.0
+        import pathlib
+        pathlib.Path(args.json_out).write_text(json.dumps({
+            "findings": comments,
+            "cost_usd": cost_usd,
+            "elapsed_s": round(time.time() - t_review, 1),
+        }))
 
 
 if __name__ == "__main__":
