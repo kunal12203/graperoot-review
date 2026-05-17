@@ -239,32 +239,103 @@ def _verify_sig(payload: bytes, sig_header: str) -> bool:
     mac = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(f"sha256={mac}", sig_header or "")
 
-# ── Review runner ──────────────────────────────────────────────────────────────
+# ── Graph + review runner ──────────────────────────────────────────────────────
+
+try:
+    from graph_service import ensure_graph, graph_impact, graph_read_symbol, graph_summary
+    _HAS_GRAPH_SVC = True
+except ImportError:
+    _HAS_GRAPH_SVC = False
+
+
+def _build_graph_bg(owner: str, repo: str, github_token: str, head_sha: str = "") -> None:
+    """Build graph in background thread — called on app installation."""
+    try:
+        from graph_service import build_graph
+        build_graph(owner, repo, github_token, head_sha)
+    except Exception as e:
+        print(f"[graph] bg build failed: {e}", flush=True)
+
 
 def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by):
     pr_url_gh = pr_url or f"https://github.com/{owner}/{repo}/pull/{pr_num}"
     print(f"[review] {owner}/{repo}#{pr_num}", flush=True)
     t0 = time.time()
-    env = {**os.environ, "GITHUB_TOKEN": github_token, "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
-           "OPENAI_API_KEY": OPENAI_KEY}
+
+    # ── Ensure graph is built (clone + build if needed) ───────────────────────
+    graph_available = False
+    graph_ctx = ""
+    if _HAS_GRAPH_SVC:
+        try:
+            graph_available = ensure_graph(owner, repo, github_token, head_sha)
+        except Exception as e:
+            print(f"[graph] ensure failed: {e}", flush=True)
+
+    # ── Fetch diff to get changed files for blast-radius ──────────────────────
+    if graph_available:
+        try:
+            diff_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}"
+            req = urllib.request.Request(
+                diff_url,
+                headers={"Authorization": f"Bearer {github_token}",
+                         "Accept": "application/vnd.github.diff",
+                         "User-Agent": "graperoot-review/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                diff_text = r.read().decode("utf-8", errors="replace")
+
+            import re as _re
+            changed_files = _re.findall(r"diff --git a/.+ b/(.+)", diff_text)
+
+            impact = graph_impact(owner, repo, changed_files)
+            if impact.get("ok"):
+                summary = impact.get("summary", "")
+                affected = impact.get("affected_files", [])[:8]
+                recommended = impact.get("recommended_reads", changed_files[:3])
+
+                graph_ctx = f"### Blast Radius\n{summary}\n"
+                excerpts = []
+                for ref in recommended[:4]:
+                    text = graph_read_symbol(owner, repo, ref)
+                    if text:
+                        excerpts.append(f"### {ref}\n{text[:600]}")
+                if excerpts:
+                    graph_ctx += "\n### Key Symbol Excerpts\n" + "\n\n".join(excerpts)
+
+                print(f"[graph] blast-radius: {len(affected)} affected files", flush=True)
+        except Exception as e:
+            print(f"[graph] context failed: {e}", flush=True)
+
+    # ── Run review subprocess ─────────────────────────────────────────────────
+    json_out = f"/tmp/review-{owner}-{repo}-{pr_num}.json"
+    env = {
+        **os.environ,
+        "GITHUB_TOKEN":     github_token,
+        "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+        "OPENAI_API_KEY":   OPENAI_KEY,
+        "GR_GRAPH_CONTEXT": graph_ctx,  # injected into review prompt
+    }
 
     result = subprocess.run(
-        [sys.executable, "review.py", pr_url_gh, "--json-out", "/tmp/last_review.json"],
+        [sys.executable, "review.py", pr_url_gh, "--json-out", json_out],
         env=env, timeout=300, capture_output=True, text=True,
     )
     elapsed = time.time() - t0
     findings, cost, error = [], 0.0, None
 
     if result.returncode != 0:
-        error = result.stderr[:500] or "exit code " + str(result.returncode)
+        error = result.stderr[:500] or f"exit code {result.returncode}"
         print(f"[review] FAILED {owner}/{repo}#{pr_num}: {error[:100]}", flush=True)
     else:
         try:
-            out = json.loads(Path("/tmp/last_review.json").read_text())
+            out      = json.loads(Path(json_out).read_text())
             findings = out.get("findings", [])
             cost     = out.get("cost_usd", 0)
         except Exception:
             pass
+        finally:
+            try: Path(json_out).unlink()
+            except Exception: pass
 
     with app.app_context():
         try:
@@ -273,7 +344,9 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
         except Exception as e:
             print(f"[db] save failed: {e}", flush=True)
 
-    print(f"[review] done {owner}/{repo}#{pr_num} {len(findings)} findings ${cost:.4f} {elapsed:.0f}s", flush=True)
+    print(f"[review] done {owner}/{repo}#{pr_num} — {len(findings)} findings "
+          f"{'(graph)' if graph_available else '(diff-only)'} "
+          f"${cost:.4f} {elapsed:.0f}s", flush=True)
 
 # ── OAuth helpers ──────────────────────────────────────────────────────────────
 
@@ -527,7 +600,24 @@ def api_reviews():
     rows = _query("SELECT * FROM reviews ORDER BY created_at DESC LIMIT 200")
     return jsonify(rows)
 
+
+@app.route("/api/graph/<owner>/<repo>")
+@login_required
+def api_graph_status(owner, repo):
+    if _HAS_GRAPH_SVC:
+        return jsonify(graph_summary(owner, repo))
+    return jsonify({"exists": False, "reason": "graph_service_unavailable"})
+
 # ── Webhook ────────────────────────────────────────────────────────────────────
+
+def _get_token(data: dict) -> str:
+    installation_id = data.get("installation", {}).get("id", 0)
+    try:
+        return _installation_token(installation_id) if installation_id else FALLBACK_TOKEN
+    except Exception as e:
+        print(f"[webhook] token error: {e}", flush=True)
+        return FALLBACK_TOKEN
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -536,10 +626,36 @@ def webhook():
         abort(401)
 
     event = request.headers.get("X-GitHub-Event", "")
+    data  = request.get_json(force=True) or {}
+
+    # ── App installed on a repo → pre-build graph ────────────────────────────
+    if event == "installation" and data.get("action") == "created":
+        token = _get_token(data)
+        for repo_info in data.get("repositories", []):
+            parts = repo_info.get("full_name", "").split("/", 1)
+            if len(parts) == 2:
+                owner, repo = parts
+                Thread(target=_build_graph_bg, args=(owner, repo, token), daemon=True).start()
+                print(f"[webhook] queued graph build for {owner}/{repo}", flush=True)
+        return jsonify({"ok": True, "action": "graph_build_queued"})
+
+    # ── Push to default branch → rebuild graph ───────────────────────────────
+    if event == "push":
+        ref     = data.get("ref", "")
+        default = data.get("repository", {}).get("default_branch", "main")
+        if ref == f"refs/heads/{default}":
+            owner    = data["repository"]["owner"]["login"]
+            repo     = data["repository"]["name"]
+            head_sha = data.get("after", "")
+            token    = _get_token(data)
+            Thread(target=_build_graph_bg, args=(owner, repo, token, head_sha), daemon=True).start()
+            print(f"[webhook] push → queued graph rebuild for {owner}/{repo}@{head_sha[:7]}", flush=True)
+        return jsonify({"ok": True, "action": "graph_rebuild_queued"})
+
+    # ── Pull request → review ────────────────────────────────────────────────
     if event != "pull_request":
         return jsonify({"ok": True, "skipped": event})
 
-    data   = request.get_json(force=True) or {}
     action = data.get("action", "")
     if action not in ("opened", "synchronize", "reopened"):
         return jsonify({"ok": True, "skipped": action})
@@ -551,14 +667,8 @@ def webhook():
     head_sha     = pr["head"]["sha"]
     pr_title     = pr.get("title", "")
     pr_url       = pr.get("html_url", "")
-    installation_id = data.get("installation", {}).get("id", 0)
     installed_by = data.get("installation", {}).get("account", {}).get("login", "")
-
-    try:
-        github_token = _installation_token(installation_id) if installation_id else FALLBACK_TOKEN
-    except Exception as e:
-        print(f"[webhook] token error: {e}", flush=True)
-        github_token = FALLBACK_TOKEN
+    github_token = _get_token(data)
 
     if not github_token:
         return jsonify({"ok": False, "error": "no_token"}), 500

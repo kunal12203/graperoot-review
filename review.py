@@ -33,15 +33,15 @@ from typing import Any
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
-ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-OPENAI_KEY     = os.environ.get("OPENAI_API_KEY", "")
-MCP_PORT       = int(os.environ.get("GRAPEROOT_PORT", os.environ.get("DG_MCP_PORT", "8765")))
-MAX_DIFF_CHARS = 12_000   # truncate very large diffs
-MAX_COMMENTS   = 8        # never post more than this many comments per PR
+GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_KEY       = os.environ.get("OPENAI_API_KEY", "")
+MCP_PORT         = int(os.environ.get("GRAPEROOT_PORT", os.environ.get("DG_MCP_PORT", "8765")))
+GR_GRAPH_CONTEXT = os.environ.get("GR_GRAPH_CONTEXT", "")  # injected by webhook server
+MAX_DIFF_CHARS   = 12_000
+MAX_COMMENTS     = 8
 
-# Use OpenAI if no Anthropic key is set
-USE_OPENAI     = bool(OPENAI_KEY and not ANTHROPIC_KEY)
+USE_OPENAI = bool(OPENAI_KEY and not ANTHROPIC_KEY)
 MODEL          = "gpt-4o" if USE_OPENAI else "claude-sonnet-4-6"
 
 
@@ -433,7 +433,11 @@ def main() -> None:
     impact_summary  = ""
     symbol_excerpts = ""
 
-    if mcp_available():
+    if GR_GRAPH_CONTEXT:
+        # Injected by webhook server (graph already built + queried there)
+        impact_summary = GR_GRAPH_CONTEXT
+        print(f"  Graph: using pre-built context ({len(GR_GRAPH_CONTEXT)} chars)")
+    elif mcp_available():
         print(f"  Graph: running impact analysis on {len(changed_files)} files...")
         impact = graph_impact(changed_files)
         if impact:
@@ -442,7 +446,6 @@ def main() -> None:
                 f"Changed files touch {len(affected)} downstream files:\n" +
                 "\n".join(f"  - {f}" for f in affected)
             )
-            # Read key changed symbols at symbol level
             recommended = impact.get("recommended_reads", changed_files[:3])
             excerpts = []
             for ref in recommended[:4]:
@@ -451,7 +454,7 @@ def main() -> None:
                     excerpts.append(f"### {ref}\n{text[:800]}")
             symbol_excerpts = "\n\n".join(excerpts)
     else:
-        print(f"  Graph: MCP server not running on port {MCP_PORT} — reviewing diff only")
+        print(f"  Graph: not available — reviewing diff only")
         print(f"  Tip: run  dgc {os.getcwd()}  first for graph-aware review")
 
     # ── Run review ─────────────────────────────────────────────────────────────
