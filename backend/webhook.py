@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""GrapeRoot Review — webhook server + web dashboard.
+
+Routes:
+    GET  /               Landing page
+    GET  /login          Redirect to GitHub OAuth
+    GET  /auth/callback  GitHub OAuth callback
+    GET  /dashboard      Analytics dashboard (protected)
+    GET  /api/reviews    JSON list of reviews (protected)
+    POST /webhook        GitHub App webhook
+    GET  /health         Health check
+"""
+from __future__ import annotations
+
+import hashlib, hmac, json, os, subprocess, sys, time, secrets, urllib.request, urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Thread
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    _HAS_PG = True
+except ImportError:
+    import sqlite3
+    _HAS_PG = False
+
+from flask import Flask, request, jsonify, redirect, session, abort, g
+
+try:
+    import jwt
+    _HAS_JWT = True
+except ImportError:
+    _HAS_JWT = False
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+WEBHOOK_SECRET  = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+APP_ID          = os.environ.get("GITHUB_APP_ID", "")
+PRIVATE_KEY     = os.environ.get("GITHUB_PRIVATE_KEY", "").replace("\\n", "\n")
+ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_KEY      = os.environ.get("OPENAI_API_KEY", "")
+FALLBACK_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
+OAUTH_CLIENT_ID     = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "")
+SESSION_SECRET  = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
+DATABASE_URL    = os.environ.get("DATABASE_URL", "")          # NeonDB / any Postgres
+DB_PATH         = os.environ.get("DB_PATH", "/app/data/reviews.db")  # SQLite fallback
+
+app = Flask(__name__)
+app.secret_key = SESSION_SECRET
+
+FRONTEND_ORIGIN = "https://review.graperoot.dev"
+
+@app.after_request
+def _cors(response):
+    origin = request.headers.get("Origin", "")
+    if origin in (FRONTEND_ORIGIN, "http://localhost:3000"):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Vary"] = "Origin"
+    return response
+
+@app.route("/api/<path:path>", methods=["OPTIONS"])
+def _api_preflight(path):
+    return "", 204
+
+# ── Database ───────────────────────────────────────────────────────────────────
+# Uses PostgreSQL (NeonDB) when DATABASE_URL is set, SQLite otherwise.
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS reviews (
+    id           SERIAL PRIMARY KEY,
+    owner        TEXT NOT NULL,
+    repo         TEXT NOT NULL,
+    pr_num       INTEGER NOT NULL,
+    pr_title     TEXT,
+    pr_url       TEXT,
+    head_sha     TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    elapsed_s    REAL,
+    cost_usd     REAL DEFAULT 0,
+    num_findings INTEGER DEFAULT 0,
+    num_critical INTEGER DEFAULT 0,
+    num_high     INTEGER DEFAULT 0,
+    findings     TEXT,
+    error        TEXT,
+    installed_by TEXT
+);
+CREATE TABLE IF NOT EXISTS users (
+    github_id     BIGINT PRIMARY KEY,
+    login         TEXT NOT NULL,
+    avatar_url    TEXT,
+    access_token  TEXT,
+    session_token TEXT,
+    monthly_limit INTEGER DEFAULT 5,
+    plan          TEXT DEFAULT 'free',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_repo     ON reviews(owner, repo);
+CREATE INDEX IF NOT EXISTS idx_reviews_created  ON reviews(created_at DESC);
+"""
+
+SCHEMA_SQLITE = """
+CREATE TABLE IF NOT EXISTS reviews (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner       TEXT NOT NULL,
+    repo        TEXT NOT NULL,
+    pr_num      INTEGER NOT NULL,
+    pr_title    TEXT,
+    pr_url      TEXT,
+    head_sha    TEXT,
+    created_at  TEXT NOT NULL,
+    elapsed_s   REAL,
+    cost_usd    REAL DEFAULT 0,
+    num_findings INTEGER DEFAULT 0,
+    num_critical INTEGER DEFAULT 0,
+    num_high     INTEGER DEFAULT 0,
+    findings    TEXT,
+    error       TEXT,
+    installed_by TEXT
+);
+CREATE TABLE IF NOT EXISTS users (
+    github_id     INTEGER PRIMARY KEY,
+    login         TEXT NOT NULL,
+    avatar_url    TEXT,
+    access_token  TEXT,
+    session_token TEXT,
+    monthly_limit INTEGER DEFAULT 5,
+    plan          TEXT DEFAULT 'free',
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_repo ON reviews(owner, repo);
+CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at DESC);
+"""
+
+
+def _pg_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def get_db():
+    if "db" not in g:
+        if DATABASE_URL and _HAS_PG:
+            g.db = _pg_conn()
+            g._is_pg = True
+        else:
+            Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+            import sqlite3 as _sq
+            g.db = _sq.connect(DB_PATH)
+            g.db.row_factory = _sq.Row
+            g._is_pg = False
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(e=None):
+    db = g.pop("db", None)
+    if db:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _ph(n: int) -> str:
+    """Placeholder: %s for Postgres, ? for SQLite."""
+    return ",".join(["%s"] * n) if (DATABASE_URL and _HAS_PG) else ",".join(["?"] * n)
+
+
+def init_db():
+    if DATABASE_URL and _HAS_PG:
+        con = _pg_conn()
+        cur = con.cursor()
+        cur.execute(SCHEMA)
+        con.commit()
+        cur.close(); con.close()
+        print("[db] PostgreSQL (NeonDB) initialized", flush=True)
+    else:
+        import sqlite3 as _sq
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        con = _sq.connect(DB_PATH)
+        con.executescript(SCHEMA_SQLITE)
+        con.commit(); con.close()
+        print(f"[db] SQLite fallback at {DB_PATH}", flush=True)
+    _migrate_db()
+
+
+def _migrate_db():
+    """Add columns introduced after initial schema deploy."""
+    new_cols_pg = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_limit INTEGER DEFAULT 5",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free'",
+    ]
+    new_cols_sq = [
+        "ALTER TABLE users ADD COLUMN session_token TEXT",
+        "ALTER TABLE users ADD COLUMN monthly_limit INTEGER DEFAULT 5",
+        "ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'",
+    ]
+    if DATABASE_URL and _HAS_PG:
+        con = _pg_conn()
+        cur = con.cursor()
+        for sql in new_cols_pg:
+            try: cur.execute(sql)
+            except Exception: pass
+        con.commit(); cur.close(); con.close()
+    else:
+        import sqlite3 as _sq
+        con = _sq.connect(DB_PATH)
+        for sql in new_cols_sq:
+            try: con.execute(sql)
+            except Exception: pass
+        con.commit(); con.close()
+
+
+def save_review(owner, repo, pr_num, pr_title, pr_url, head_sha,
+                elapsed, cost, findings, error=None, installed_by=None):
+    db   = get_db()
+    is_pg = getattr(g, "_is_pg", False)
+    num_findings = len(findings) if findings else 0
+    num_critical = sum(1 for f in (findings or []) if f.get("severity") == "CRITICAL")
+    num_high     = sum(1 for f in (findings or []) if f.get("severity") == "HIGH")
+    ph = "%s" if is_pg else "?"
+
+    sql = f"""
+        INSERT INTO reviews
+          (owner,repo,pr_num,pr_title,pr_url,head_sha,created_at,elapsed_s,
+           cost_usd,num_findings,num_critical,num_high,findings,error,installed_by)
+        VALUES ({",".join([ph]*15)})
+    """
+    vals = (owner, repo, pr_num, pr_title, pr_url, head_sha,
+            datetime.now(timezone.utc).isoformat(),
+            elapsed, cost, num_findings, num_critical, num_high,
+            json.dumps(findings or []), error, installed_by)
+
+    if is_pg:
+        cur = db.cursor()
+        cur.execute(sql, vals)
+        db.commit()
+        cur.close()
+    else:
+        db.execute(sql, vals)
+        db.commit()
+
+
+def _query(sql: str, params=(), one=False):
+    """Run a SELECT and return list of dicts (or one dict)."""
+    db   = get_db()
+    is_pg = getattr(g, "_is_pg", False)
+    if is_pg:
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = [dict(r) for r in (cur.fetchall() if not one else [cur.fetchone()])]
+        cur.close()
+    else:
+        cur = db.execute(sql, params)
+        raw = cur.fetchall()
+        rows = [dict(r) for r in raw]
+        if one:
+            rows = [rows[0]] if rows else [{}]
+    return rows[0] if one else rows
+
+# ── GitHub App auth ────────────────────────────────────────────────────────────
+
+def _installation_token(installation_id: int) -> str:
+    if not (APP_ID and PRIVATE_KEY and _HAS_JWT):
+        return FALLBACK_TOKEN
+    now = int(time.time())
+    token = jwt.encode(
+        {"iat": now - 60, "exp": now + 600, "iss": APP_ID},
+        PRIVATE_KEY, algorithm="RS256",
+    )
+    req = urllib.request.Request(
+        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+        data=b"{}", method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "graperoot-review/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())["token"]
+
+def _verify_sig(payload: bytes, sig_header: str) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    mac = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={mac}", sig_header or "")
+
+# ── Graph + review runner ──────────────────────────────────────────────────────
+
+try:
+    from graph_service import ensure_graph, graph_impact, graph_read_symbol, graph_summary
+    _HAS_GRAPH_SVC = True
+except ImportError:
+    _HAS_GRAPH_SVC = False
+
+
+def _build_graph_bg(owner: str, repo: str, github_token: str, head_sha: str = "") -> None:
+    """Build graph in background thread — called on app installation."""
+    try:
+        from graph_service import build_graph
+        build_graph(owner, repo, github_token, head_sha)
+    except Exception as e:
+        print(f"[graph] bg build failed: {e}", flush=True)
+
+
+def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by):
+    pr_url_gh = pr_url or f"https://github.com/{owner}/{repo}/pull/{pr_num}"
+    print(f"[review] {owner}/{repo}#{pr_num}", flush=True)
+    t0 = time.time()
+
+    # ── Graph context (self-hosted only — hosted service uses diff only) ────────
+    # On the hosted service we never clone repos. Code stays on GitHub.
+    # Full graph analysis is available for self-hosted deployments (BYOK + Docker).
+    graph_available = False
+    graph_ctx = ""
+    if _HAS_GRAPH_SVC and os.environ.get("ENABLE_GRAPH_CLONE") == "1":
+        # Only enabled when operator explicitly opts in (self-hosted deployments)
+        try:
+            graph_available = ensure_graph(owner, repo, github_token, head_sha)
+        except Exception as e:
+            print(f"[graph] ensure failed: {e}", flush=True)
+
+        if graph_available:
+            try:
+                diff_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}"
+                req = urllib.request.Request(
+                    diff_url,
+                    headers={"Authorization": f"Bearer {github_token}",
+                             "Accept": "application/vnd.github.diff",
+                             "User-Agent": "graperoot-review/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    diff_text = r.read().decode("utf-8", errors="replace")
+                import re as _re
+                changed_files = _re.findall(r"diff --git a/.+ b/(.+)", diff_text)
+                impact = graph_impact(owner, repo, changed_files)
+                if impact.get("ok"):
+                    graph_ctx = f"### Blast Radius\n{impact.get('summary','')}\n"
+                    for ref in impact.get("recommended_reads", changed_files[:3])[:4]:
+                        text = graph_read_symbol(owner, repo, ref)
+                        if text:
+                            graph_ctx += f"\n### {ref}\n{text[:600]}"
+            except Exception as e:
+                print(f"[graph] context failed: {e}", flush=True)
+
+    # ── Run review subprocess ─────────────────────────────────────────────────
+    json_out = f"/tmp/review-{owner}-{repo}-{pr_num}.json"
+    env = {
+        **os.environ,
+        "GITHUB_TOKEN":     github_token,
+        "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+        "OPENAI_API_KEY":   OPENAI_KEY,
+        "GR_GRAPH_CONTEXT": graph_ctx,  # injected into review prompt
+    }
+
+    result = subprocess.run(
+        [sys.executable, "review.py", pr_url_gh, "--json-out", json_out],
+        env=env, timeout=300, capture_output=True, text=True,
+    )
+    elapsed = time.time() - t0
+    findings, cost, error = [], 0.0, None
+
+    if result.returncode != 0:
+        error = result.stderr[:500] or f"exit code {result.returncode}"
+        print(f"[review] FAILED {owner}/{repo}#{pr_num}: {error[:100]}", flush=True)
+    else:
+        try:
+            out      = json.loads(Path(json_out).read_text())
+            findings = out.get("findings", [])
+            cost     = out.get("cost_usd", 0)
+        except Exception:
+            pass
+        finally:
+            try: Path(json_out).unlink()
+            except Exception: pass
+
+    with app.app_context():
+        try:
+            save_review(owner, repo, pr_num, pr_title, pr_url_gh, head_sha,
+                        elapsed, cost, findings, error, installed_by)
+        except Exception as e:
+            print(f"[db] save failed: {e}", flush=True)
+
+    print(f"[review] done {owner}/{repo}#{pr_num} — {len(findings)} findings "
+          f"{'(graph)' if graph_available else '(diff-only)'} "
+          f"${cost:.4f} {elapsed:.0f}s", flush=True)
+
+# ── OAuth helpers ──────────────────────────────────────────────────────────────
+
+def _gh_api(path, token):
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "graperoot-review/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+def current_user():
+    return session.get("user")
+
+
+def _token_user():
+    """Validate Bearer token from Authorization header; return user row or None."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:].strip()
+    if not token:
+        return None
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph = "%s" if is_pg else "?"
+    row = _query(f"SELECT * FROM users WHERE session_token = {ph}", (token,), one=True)
+    return row if row.get("github_id") else None
+
+
+def _within_limit(login: str) -> bool:
+    """Return True if this GitHub login hasn't hit their monthly review limit."""
+    if not login:
+        return True
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph = "%s" if is_pg else "?"
+    user_row = _query(f"SELECT monthly_limit FROM users WHERE login = {ph}", (login,), one=True)
+    limit = user_row.get("monthly_limit") if user_row.get("github_id") else 5
+    if limit is None:  # NULL = unlimited (Pro / Enterprise)
+        return True
+    if is_pg:
+        count = _query(
+            f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND created_at >= date_trunc('month', NOW())",
+            (login,), one=True,
+        )
+    else:
+        count = _query(
+            f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND created_at >= strftime('%Y-%m-01','now')",
+            (login,), one=True,
+        )
+    return (count.get("cnt") or 0) < limit
+
+
+def login_required(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not current_user():
+            return redirect("/login")
+        return f(*args, **kwargs)
+    return decorated
+
+# ── Auth routes ────────────────────────────────────────────────────────────────
+
+@app.route("/login")
+def login():
+    if not OAUTH_CLIENT_ID:
+        return "<h2>OAuth not configured — set GITHUB_OAUTH_CLIENT_ID</h2>", 503
+    state = secrets.token_hex(16)
+    session["oauth_state"] = state
+    params = urllib.parse.urlencode({
+        "client_id": OAUTH_CLIENT_ID,
+        "redirect_uri": f"{_base_url()}/auth/callback",
+        "scope": "read:user user:email",
+        "state": state,
+    })
+    return redirect(f"https://github.com/login/oauth/authorize?{params}")
+
+@app.route("/auth/callback")
+def auth_callback():
+    code  = request.args.get("code", "")
+    state = request.args.get("state", "")
+    if not code or state != session.pop("oauth_state", None):
+        abort(400)
+
+    # Exchange code for access token
+    data = urllib.parse.urlencode({
+        "client_id":     OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "code":          code,
+        "redirect_uri":  f"{_base_url()}/auth/callback",
+    }).encode()
+    req = urllib.request.Request(
+        "https://github.com/login/oauth/access_token",
+        data=data, method="POST",
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        token_data = json.loads(r.read())
+
+    access_token = token_data.get("access_token", "")
+    if not access_token:
+        return "<h2>OAuth failed — no access token</h2>", 400
+
+    user = _gh_api("/user", access_token)
+    session["user"] = {
+        "id":         user["id"],
+        "login":      user["login"],
+        "avatar_url": user.get("avatar_url", ""),
+    }
+    session["gh_token"] = access_token
+
+    db           = get_db()
+    is_pg        = getattr(g, "_is_pg", False)
+    ph           = "%s" if is_pg else "?"
+    now          = datetime.now(timezone.utc).isoformat()
+    sess_token   = secrets.token_urlsafe(32)
+
+    if is_pg:
+        upsert = f"""
+            INSERT INTO users (github_id, login, avatar_url, access_token, session_token, monthly_limit, plan, created_at)
+            VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})
+            ON CONFLICT(github_id) DO UPDATE SET
+              login=EXCLUDED.login, avatar_url=EXCLUDED.avatar_url,
+              access_token=EXCLUDED.access_token, session_token=EXCLUDED.session_token
+        """
+        cur = db.cursor()
+        cur.execute(upsert, (user["id"], user["login"], user.get("avatar_url",""),
+                             access_token, sess_token, 5, "free", now))
+        db.commit(); cur.close()
+    else:
+        db.execute(f"""
+            INSERT INTO users (github_id, login, avatar_url, access_token, session_token, monthly_limit, plan, created_at)
+            VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})
+            ON CONFLICT(github_id) DO UPDATE SET
+              login=excluded.login, avatar_url=excluded.avatar_url,
+              access_token=excluded.access_token, session_token=excluded.session_token
+        """, (user["id"], user["login"], user.get("avatar_url",""),
+              access_token, sess_token, 5, "free", now))
+        db.commit()
+
+    return redirect(f"{FRONTEND_ORIGIN}/auth?user={user['login']}&token={sess_token}")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+def _base_url():
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    scheme = "https" if request.headers.get("X-Forwarded-Proto") == "https" else request.scheme
+    return f"{scheme}://{host}"
+
+# ── Dashboard ──────────────────────────────────────────────────────────────────
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    user   = current_user()
+    is_pg  = bool(DATABASE_URL and _HAS_PG)
+    concat = "owner||'/'||repo" if not is_pg else "owner||'/'||repo"
+
+    stats  = _query("""
+        SELECT
+          COUNT(*)                       AS total,
+          COALESCE(SUM(cost_usd),0)      AS total_cost,
+          COALESCE(SUM(num_findings),0)  AS total_findings,
+          COALESCE(SUM(num_critical),0)  AS total_critical,
+          COALESCE(AVG(elapsed_s),0)     AS avg_time,
+          COALESCE(AVG(cost_usd),0)      AS avg_cost
+        FROM reviews WHERE error IS NULL
+    """, one=True)
+
+    recent = _query("""
+        SELECT owner,repo,pr_num,pr_title,pr_url,created_at,
+               cost_usd,num_findings,num_critical,num_high,elapsed_s,error
+        FROM reviews ORDER BY created_at DESC LIMIT 50
+    """)
+
+    repos  = _query("""
+        SELECT owner||'/'||repo AS repo, COUNT(*) AS cnt, COALESCE(SUM(num_findings),0) AS findings
+        FROM reviews GROUP BY owner,repo ORDER BY cnt DESC LIMIT 10
+    """)
+
+    return _render_dashboard(user, stats, recent, repos)
+
+def _render_dashboard(user, stats, recent, repos):
+    rows = ""
+    for r in recent:
+        sev = ""
+        if r["num_critical"]: sev += f'<span style="color:#f87171">●{r["num_critical"]} CRIT</span> '
+        if r["num_high"]: sev += f'<span style="color:#fb923c">●{r["num_high"]} HIGH</span>'
+        if r["error"]: sev = f'<span style="color:#ef4444">✗ error</span>'
+        dt = r["created_at"][:16].replace("T"," ") if r["created_at"] else ""
+        pr_link = f'<a href="{r["pr_url"]}" target="_blank" style="color:#d8b4fe;text-decoration:none">{r["owner"]}/{r["repo"]}#{r["pr_num"]}</a>'
+        title = (r["pr_title"] or "")[:55]
+        rows += f"""<tr>
+          <td style="padding:.6rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05)">{pr_link}</td>
+          <td style="padding:.6rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05);color:#a1a1aa;font-size:.75rem">{title}</td>
+          <td style="padding:.6rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05)">{sev or '<span style="color:#4ade80">✓ clean</span>'}</td>
+          <td style="padding:.6rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05);color:#a1a1aa;font-size:.75rem">${r["cost_usd"]:.4f}</td>
+          <td style="padding:.6rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05);color:#a1a1aa;font-size:.75rem">{dt}</td>
+        </tr>"""
+
+    repo_rows = ""
+    for r in repos:
+        repo_rows += f"""<tr>
+          <td style="padding:.5rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05);color:#d8b4fe">{r["repo"]}</td>
+          <td style="padding:.5rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05);color:#a1a1aa;text-align:center">{r["cnt"]}</td>
+          <td style="padding:.5rem .875rem;border-bottom:1px solid rgba(255,255,255,0.05);color:#fb923c;text-align:center">{r["findings"] or 0}</td>
+        </tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Dashboard — GrapeRoot Review</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Mulish:wght@600;700;800&display=swap" rel="stylesheet"/>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:'JetBrains Mono',monospace;background:#09090b;color:#f4f4f5;min-height:100vh;-webkit-font-smoothing:antialiased}}
+    .topbar{{background:#0e0e11;border-bottom:1px solid rgba(255,255,255,0.07);padding:.875rem 1.5rem;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}}
+    .logo{{display:flex;align-items:center;gap:8px;font-family:'Mulish',sans-serif;font-weight:700;color:#fff;text-decoration:none}}
+    .logo-icon{{width:28px;height:28px;border-radius:8px;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.3);display:flex;align-items:center;justify-content:center;font-size:.875rem}}
+    .user{{display:flex;align-items:center;gap:.75rem;font-size:.8125rem;color:#a1a1aa}}
+    .user img{{width:28px;height:28px;border-radius:50%;border:1px solid rgba(255,255,255,.1)}}
+    .logout{{color:#71717a;text-decoration:none;font-size:.75rem;padding:.25rem .75rem;border:1px solid rgba(255,255,255,.06);border-radius:6px;transition:all .2s}}
+    .logout:hover{{color:#fff;border-color:rgba(255,255,255,.15)}}
+    .main{{max-width:1200px;margin:0 auto;padding:2rem 1.5rem}}
+    h1{{font-family:'Mulish',sans-serif;font-size:1.5rem;font-weight:800;color:#fff;margin-bottom:1.5rem}}
+    .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-bottom:2rem}}
+    .stat-card{{background:#111113;border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:1.25rem}}
+    .stat-card .val{{font-family:'Mulish',sans-serif;font-size:1.875rem;font-weight:800;color:#fff;line-height:1}}
+    .stat-card .val.grape{{background:linear-gradient(135deg,#d8b4fe,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}}
+    .stat-card .lbl{{font-size:.6875rem;color:#71717a;margin-top:.375rem}}
+    .card{{background:#111113;border:1px solid rgba(255,255,255,.07);border-radius:12px;overflow:hidden;margin-bottom:1.5rem}}
+    .card-header{{background:#0e0e11;padding:.75rem 1rem;border-bottom:1px solid rgba(255,255,255,.05);font-size:.8125rem;font-weight:600;color:#a1a1aa;display:flex;align-items:center;justify-content:space-between}}
+    table{{width:100%;border-collapse:collapse;font-size:.8125rem}}
+    th{{padding:.6rem .875rem;text-align:left;font-size:.6875rem;color:#71717a;text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid rgba(255,255,255,.07)}}
+    .empty{{padding:2.5rem;text-align:center;color:#52525b;font-size:.8125rem}}
+    .view-all{{font-size:.75rem;color:#a855f7;text-decoration:none}}
+    .view-all:hover{{color:#d8b4fe}}
+  </style>
+</head>
+<body>
+<div class="topbar">
+  <a class="logo" href="/"><div class="logo-icon">🍇</div> GrapeRoot Review</a>
+  <div class="user">
+    <img src="{user['avatar_url']}" alt="" onerror="this.style.display='none'"/>
+    <span>{user['login']}</span>
+    <a class="logout" href="/logout">Sign out</a>
+  </div>
+</div>
+<div class="main">
+  <h1>Review Analytics</h1>
+  <div class="stats">
+    <div class="stat-card"><div class="val grape">{stats['total']}</div><div class="lbl">Total reviews</div></div>
+    <div class="stat-card"><div class="val">{stats['total_findings']}</div><div class="lbl">Issues found</div></div>
+    <div class="stat-card"><div class="val" style="color:#f87171">{stats['total_critical']}</div><div class="lbl">Critical findings</div></div>
+    <div class="stat-card"><div class="val">${stats['total_cost']:.3f}</div><div class="lbl">Total API cost</div></div>
+    <div class="stat-card"><div class="val">${stats['avg_cost']:.4f}</div><div class="lbl">Avg cost / review</div></div>
+    <div class="stat-card"><div class="val">{stats['avg_time']:.0f}s</div><div class="lbl">Avg review time</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      Recent reviews
+      <a class="view-all" href="/api/reviews">JSON export →</a>
+    </div>
+    <table>
+      <thead><tr>
+        <th>PR</th><th>Title</th><th>Findings</th><th>Cost</th><th>When</th>
+      </tr></thead>
+      <tbody>{rows or '<tr><td colspan=5 class="empty">No reviews yet — install the GitHub App and open a PR.</td></tr>'}</tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-header">Top repositories</div>
+    <table>
+      <thead><tr><th>Repo</th><th style="text-align:center">Reviews</th><th style="text-align:center">Findings</th></tr></thead>
+      <tbody>{repo_rows or '<tr><td colspan=3 class="empty">No data yet.</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>"""
+
+# ── API ────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/stats")
+def api_stats():
+    token_u = _token_user()
+    sess_u  = current_user()
+    if not token_u and not sess_u:
+        return jsonify({"error": "unauthorized"}), 401
+    login = (token_u or sess_u)["login"]
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph    = "%s" if is_pg else "?"
+
+    if is_pg:
+        month_filter = f"AND created_at >= date_trunc('month', NOW())"
+    else:
+        month_filter = f"AND created_at >= strftime('%Y-%m-01','now')"
+
+    monthly = _query(
+        f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND error IS NULL {month_filter}",
+        (login,), one=True,
+    )
+    total   = _query(
+        f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND error IS NULL",
+        (login,), one=True,
+    )
+    repos   = _query(
+        f"SELECT COUNT(DISTINCT owner||'/'||repo) AS cnt FROM reviews WHERE installed_by = {ph}",
+        (login,), one=True,
+    )
+    user_row = _query(f"SELECT monthly_limit, plan FROM users WHERE login = {ph}", (login,), one=True)
+    limit   = user_row.get("monthly_limit", 5) if user_row.get("github_id") else 5
+
+    return jsonify({
+        "reviews_this_month": monthly.get("cnt") or 0,
+        "monthly_limit":      limit,
+        "total_reviews":      total.get("cnt") or 0,
+        "repos_count":        repos.get("cnt") or 0,
+    })
+
+
+@app.route("/api/reviews")
+def api_reviews():
+    token_u = _token_user()
+    sess_u  = current_user()
+    if not token_u and not sess_u:
+        return jsonify({"error": "unauthorized"}), 401
+    login = (token_u or sess_u)["login"]
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph    = "%s" if is_pg else "?"
+
+    rows = _query(
+        f"""SELECT id, pr_title, owner||'/'||repo AS repo, pr_url,
+                   num_findings AS findings,
+                   CASE WHEN error IS NOT NULL THEN 'failed' ELSE 'completed' END AS status,
+                   created_at
+            FROM reviews WHERE installed_by = {ph}
+            ORDER BY created_at DESC LIMIT 50""",
+        (login,),
+    )
+    return jsonify(rows)
+
+
+@app.route("/api/graph/<owner>/<repo>")
+@login_required
+def api_graph_status(owner, repo):
+    if _HAS_GRAPH_SVC:
+        return jsonify(graph_summary(owner, repo))
+    return jsonify({"exists": False, "reason": "graph_service_unavailable"})
+
+# ── Webhook ────────────────────────────────────────────────────────────────────
+
+def _get_token(data: dict) -> str:
+    installation_id = data.get("installation", {}).get("id", 0)
+    try:
+        return _installation_token(installation_id) if installation_id else FALLBACK_TOKEN
+    except Exception as e:
+        print(f"[webhook] token error: {e}", flush=True)
+        return FALLBACK_TOKEN
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    payload = request.get_data()
+    if not _verify_sig(payload, request.headers.get("X-Hub-Signature-256", "")):
+        abort(401)
+
+    event = request.headers.get("X-GitHub-Event", "")
+    data  = request.get_json(force=True) or {}
+
+    # ── App installed → just log it (no cloning on hosted service) ───────────
+    if event == "installation" and data.get("action") == "created":
+        repos = [r.get("full_name","") for r in data.get("repositories", [])]
+        print(f"[webhook] app installed by {data.get('installation',{}).get('account',{}).get('login','')} on {repos}", flush=True)
+        return jsonify({"ok": True, "action": "installation_noted"})
+
+    # ── Push: only rebuild graph if self-hosted mode enabled ─────────────────
+    if event == "push":
+        if os.environ.get("ENABLE_GRAPH_CLONE") == "1":
+            ref     = data.get("ref", "")
+            default = data.get("repository", {}).get("default_branch", "main")
+            if ref == f"refs/heads/{default}":
+                owner    = data["repository"]["owner"]["login"]
+                repo     = data["repository"]["name"]
+                head_sha = data.get("after", "")
+                token    = _get_token(data)
+                Thread(target=_build_graph_bg, args=(owner, repo, token, head_sha), daemon=True).start()
+        return jsonify({"ok": True})
+
+    # ── Pull request → review ────────────────────────────────────────────────
+    if event != "pull_request":
+        return jsonify({"ok": True, "skipped": event})
+
+    action = data.get("action", "")
+    if action not in ("opened", "synchronize", "reopened"):
+        return jsonify({"ok": True, "skipped": action})
+
+    pr           = data["pull_request"]
+    owner        = data["repository"]["owner"]["login"]
+    repo         = data["repository"]["name"]
+    pr_num       = pr["number"]
+    head_sha     = pr["head"]["sha"]
+    pr_title     = pr.get("title", "")
+    pr_url       = pr.get("html_url", "")
+    installed_by = data.get("installation", {}).get("account", {}).get("login", "")
+    github_token = _get_token(data)
+
+    if not github_token:
+        return jsonify({"ok": False, "error": "no_token"}), 500
+
+    if not _within_limit(installed_by):
+        print(f"[webhook] {installed_by} monthly limit reached — skipping {owner}/{repo}#{pr_num}", flush=True)
+        return jsonify({"ok": True, "skipped": "monthly_limit_reached"})
+
+    Thread(
+        target=_run_review,
+        args=(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by),
+        daemon=True,
+    ).start()
+
+    return jsonify({"ok": True, "queued": f"{owner}/{repo}#{pr_num}"})
+
+# ── Health + landing ───────────────────────────────────────────────────────────
+
+@app.route("/health")
+def health():
+    db_status = "postgres" if (DATABASE_URL and _HAS_PG) else "sqlite"
+    return jsonify({
+        "status":   "ok",
+        "app_mode": bool(APP_ID and PRIVATE_KEY and _HAS_JWT),
+        "oauth":    bool(OAUTH_CLIENT_ID),
+        "db":       db_status,
+        "db_url":   bool(DATABASE_URL),
+    })
+
+@app.route("/")
+def index():
+    landing = Path(__file__).parent / "landing" / "index.html"
+    if landing.exists():
+        return landing.read_text(), 200, {"Content-Type": "text/html"}
+    return redirect("/dashboard") if current_user() else jsonify({"service": "GrapeRoot Review"})
+
+# ── Startup ────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    init_db()
+    port = int(os.environ.get("PORT", 8080))
+    print(f"GrapeRoot Review on :{port}")
+    print(f"  App mode : {'yes' if APP_ID else 'no'}")
+    print(f"  OAuth    : {'yes' if OAUTH_CLIENT_ID else 'NO — set GITHUB_OAUTH_CLIENT_ID'}")
+    print(f"  DB       : {DB_PATH}")
+    app.run(host="0.0.0.0", port=port)
