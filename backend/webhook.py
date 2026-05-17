@@ -12,7 +12,7 @@ Routes:
 """
 from __future__ import annotations
 
-import hashlib, hmac, json, os, subprocess, sys, time, secrets, urllib.request, urllib.parse
+import hashlib, hmac, json, os, re, subprocess, sys, time, secrets, urllib.request, urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
@@ -289,6 +289,65 @@ def _installation_token(installation_id: int) -> str:
     )
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())["token"]
+
+def _app_jwt() -> str:
+    now = int(time.time())
+    return jwt.encode({"iat": now - 60, "exp": now + 600, "iss": APP_ID}, PRIVATE_KEY, algorithm="RS256")
+
+def _app_request(path: str):
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={
+            "Authorization": f"Bearer {_app_jwt()}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "graperoot-review/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+def _get_repo_installation_id(owner: str, repo: str):
+    if not (APP_ID and PRIVATE_KEY and _HAS_JWT):
+        return None
+    try:
+        return _app_request(f"/repos/{owner}/{repo}/installation").get("id")
+    except Exception as e:
+        print(f"[review] get installation failed: {e}", flush=True)
+        return None
+
+def _get_all_installations():
+    if not (APP_ID and PRIVATE_KEY and _HAS_JWT):
+        return []
+    try:
+        return _app_request("/app/installations?per_page=100")
+    except Exception as e:
+        print(f"[api] get installations failed: {e}", flush=True)
+        return []
+
+def _get_installation_repos(inst_token: str):
+    req = urllib.request.Request(
+        "https://api.github.com/installation/repositories?per_page=100",
+        headers={
+            "Authorization": f"Bearer {inst_token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "graperoot-review/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read()).get("repositories", [])
+
+def _get_open_prs(owner: str, repo: str, inst_token: str):
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=20&sort=updated",
+        headers={
+            "Authorization": f"Bearer {inst_token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "graperoot-review/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
 
 def _verify_sig(payload: bytes, sig_header: str) -> bool:
     if not WEBHOOK_SECRET:
@@ -757,6 +816,97 @@ def api_reviews():
         (login,),
     )
     return jsonify(rows)
+
+
+@app.route("/api/prs")
+def api_prs():
+    token_u = _token_user()
+    sess_u  = current_user()
+    if not token_u and not sess_u:
+        return jsonify({"error": "unauthorized"}), 401
+
+    installations = _get_all_installations()
+    all_prs = []
+    for inst in installations:
+        inst_id = inst.get("id")
+        if not inst_id:
+            continue
+        try:
+            inst_token = _installation_token(inst_id)
+            repos = _get_installation_repos(inst_token)
+            for repo in repos:
+                owner = repo["owner"]["login"]
+                name  = repo["name"]
+                try:
+                    prs = _get_open_prs(owner, name, inst_token)
+                    for pr in prs:
+                        all_prs.append({
+                            "number":     pr["number"],
+                            "title":      pr["title"],
+                            "repo":       f"{owner}/{name}",
+                            "pr_url":     pr["html_url"],
+                            "author":     pr["user"]["login"],
+                            "branch":     pr["head"]["ref"],
+                            "head_sha":   pr["head"]["sha"],
+                            "created_at": pr["created_at"],
+                            "updated_at": pr["updated_at"],
+                        })
+                except Exception as e:
+                    print(f"[api/prs] {owner}/{name}: {e}", flush=True)
+        except Exception as e:
+            print(f"[api/prs] installation {inst_id}: {e}", flush=True)
+
+    all_prs.sort(key=lambda p: p["updated_at"], reverse=True)
+    return jsonify(all_prs)
+
+
+@app.route("/api/review", methods=["POST"])
+def api_trigger_review():
+    token_u = _token_user()
+    sess_u  = current_user()
+    if not token_u and not sess_u:
+        return jsonify({"error": "unauthorized"}), 401
+
+    login = (token_u or sess_u)["login"]
+
+    if not _within_limit(login):
+        return jsonify({"error": "monthly_limit_reached",
+                        "message": "Monthly review limit reached. Upgrade to Pro for unlimited reviews."}), 429
+
+    data   = request.get_json(force=True) or {}
+    pr_url = data.get("pr_url", "").strip()
+
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_url)
+    if not m:
+        return jsonify({"error": "invalid_pr_url"}), 400
+
+    owner, repo, pr_num = m.group(1), m.group(2), int(m.group(3))
+
+    installation_id = _get_repo_installation_id(owner, repo)
+    if not installation_id:
+        return jsonify({"error": "app_not_installed",
+                        "message": f"GrapeRoot Review is not installed on {owner}/{repo}"}), 404
+
+    try:
+        github_token = _installation_token(installation_id)
+    except Exception as e:
+        return jsonify({"error": "token_failed", "message": str(e)}), 500
+
+    try:
+        pr_data  = _gh_api(f"/repos/{owner}/{repo}/pulls/{pr_num}", github_token)
+        head_sha = pr_data["head"]["sha"]
+        pr_title = pr_data.get("title", "")
+        pr_url_gh = pr_data.get("html_url", pr_url)
+    except Exception as e:
+        return jsonify({"error": "pr_fetch_failed", "message": str(e)}), 500
+
+    Thread(
+        target=_run_review,
+        args=(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url_gh, login),
+        daemon=True,
+    ).start()
+
+    return jsonify({"ok": True, "queued": f"{owner}/{repo}#{pr_num}"})
 
 
 @app.route("/api/graph/<owner>/<repo>")
