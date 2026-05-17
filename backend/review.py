@@ -38,8 +38,8 @@ ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_KEY       = os.environ.get("OPENAI_API_KEY", "")
 MCP_PORT         = int(os.environ.get("GRAPEROOT_PORT", os.environ.get("DG_MCP_PORT", "8765")))
 GR_GRAPH_CONTEXT = os.environ.get("GR_GRAPH_CONTEXT", "")  # injected by webhook server
-MAX_DIFF_CHARS   = 12_000
-MAX_COMMENTS     = 8
+MAX_DIFF_CHARS   = 24_000
+MAX_COMMENTS     = 25
 
 USE_OPENAI = bool(OPENAI_KEY and not ANTHROPIC_KEY)
 MODEL          = "gpt-4o" if USE_OPENAI else os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
@@ -253,27 +253,34 @@ def parse_diff(diff: str) -> tuple[list[str], dict[str, str]]:
 
 # ── Claude review ──────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a senior software engineer doing a code review.
-You have access to the full codebase context via the graph — use it.
+SYSTEM_PROMPT = """You are a world-class staff engineer doing an exhaustive code review.
+You have the diff, the full content of changed files before and after, and the content
+of files that import from or are imported by the changed files.
 
 Return a JSON array of review comments. Each comment:
 {
   "path": "src/file.ts",       // file path relative to repo root
   "line": 42,                  // line number in the NEW file (right side of diff)
-  "severity": "CRITICAL|HIGH|MEDIUM|LOW|STYLE",
+  "severity": "CRITICAL|HIGH|MEDIUM|LOW",
   "title": "one-line summary",
-  "body": "detailed explanation with suggested fix if applicable"
+  "body": "detailed explanation. Include the exact broken code and a concrete fix."
 }
 
-Rules:
-- CRITICAL: bug that will cause incorrect behavior, data loss, security issue
-- HIGH: logic error, missing error handling on external call, race condition
-- MEDIUM: performance issue, missing test coverage for risky change
-- LOW: code smell, unclear naming
-- STYLE: formatting, whitespace — OMIT these unless specifically asked
-- Maximum 8 comments total. Rank by severity, omit STYLE entirely.
-- If the PR is clean, return [] (empty array).
-- Return ONLY the JSON array, no markdown wrapper."""
+Severity guide:
+- CRITICAL: correctness bug, data loss, security vulnerability, broken public API
+- HIGH: logic error, missing error handling on external call, race condition, incomplete refactor
+- MEDIUM: performance issue, missing test for risky path, subtle behavioral change, asymmetry
+- LOW: code smell, unclear naming, missing documentation for non-obvious behavior
+
+Be exhaustive. Do NOT cap at a small number — report every real issue you find.
+Cross-reference the base file content vs head content to catch:
+  - Classes or methods that existed before but were not moved/re-exported
+  - Asymmetries in refactors (e.g. some methods moved, others not)
+  - Broken import chains in files that depend on the changed modules
+  - Missing backward-compatibility re-exports
+  - Incomplete interface implementations
+Do NOT report style issues, whitespace, or trivially obvious things.
+Return ONLY the JSON array, no markdown wrapper, no explanation outside the array."""
 
 
 def claude_review(
@@ -334,7 +341,7 @@ Review this PR. Return a JSON array of comments as instructed."""
 def _anthropic_review(user_msg: str) -> str:
     payload = {
         "model": MODEL,
-        "max_tokens": 2048,
+        "max_tokens": 4096,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_msg}],
     }
@@ -360,7 +367,7 @@ def _anthropic_review(user_msg: str) -> str:
 def _openai_review(user_msg: str) -> str:
     payload = {
         "model": MODEL,
-        "max_tokens": 2048,
+        "max_tokens": 4096,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_msg},

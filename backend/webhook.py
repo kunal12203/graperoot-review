@@ -447,10 +447,17 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
                 impact = graph_impact(owner, repo, changed_files)
                 if impact.get("ok"):
                     graph_ctx = f"### Blast Radius\n{impact.get('summary','')}\n"
-                    for ref in impact.get("recommended_reads", changed_files[:3])[:4]:
-                        text = graph_read_symbol(owner, repo, ref)
-                        if text:
-                            graph_ctx += f"\n### {ref}\n{text[:600]}"
+                    # Fetch actual file content from GitHub for blast-radius files.
+                    # graph_read_symbol() only has import/export metadata (clone was deleted).
+                    # Real code content is what makes the difference vs Greptile.
+                    reads = impact.get("recommended_reads", changed_files[:3])[:6]
+                    affected = impact.get("affected_files", [])[:6]
+                    to_read = list(dict.fromkeys(reads + affected))  # dedup, preserve order
+                    for ref in to_read[:8]:
+                        file_path = ref.split("::")[0] if "::" in ref else ref
+                        content = _gh_file_content(owner, repo, file_path, head_sha, github_token)
+                        if content:
+                            graph_ctx += f"\n### {file_path}  [affected by this PR]\n```\n{content[:1500]}\n```\n"
             except Exception as e:
                 print(f"[graph] context failed: {e}", flush=True)
 
@@ -500,6 +507,25 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
           f"${cost:.4f} {elapsed:.0f}s", flush=True)
 
 # ── OAuth helpers ──────────────────────────────────────────────────────────────
+
+def _gh_file_content(owner: str, repo: str, path: str, ref: str, token: str) -> str:
+    """Fetch decoded file content from GitHub at a specific ref."""
+    import base64
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "graperoot-review/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        if data.get("encoding") == "base64":
+            return base64.b64decode(data["content"].replace("\n", "")).decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"[graph] fetch {path}: {e}", flush=True)
+    return ""
+
 
 def _gh_api(path, token):
     req = urllib.request.Request(
