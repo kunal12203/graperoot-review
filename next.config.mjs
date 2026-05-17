@@ -1,8 +1,7 @@
-import type { NextConfig } from "next";
-
 const RAILWAY = "https://graperoot-review-production.up.railway.app";
 
-const nextConfig: NextConfig = {
+/** @type {import('next').NextConfig} */
+const nextConfig = {
   async redirects() {
     return [
       { source: "/login", destination: `${RAILWAY}/login`, permanent: false },
