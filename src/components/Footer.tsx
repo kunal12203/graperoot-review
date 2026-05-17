@@ -1,7 +1,6 @@
 import { Twitter, Linkedin, Github } from "lucide-react";
 
 const GH_APP = "https://github.com/apps/graperoot-review/installations/new/permissions?target_id=84341876";
-const MAIN   = "https://graperoot.dev";
 
 const SOCIALS = [
   { label: "Twitter / X", href: "https://x.com/krishna37930189",             Icon: Twitter  },
@@ -19,8 +18,8 @@ const PRODUCT = [
 const GET_STARTED = [
   { label: "Install GitHub App", href: GH_APP,                        accent: true  },
   { label: "Contact",            href: "mailto:hello@graperoot.dev",   accent: false },
-  { label: "Privacy",            href: `${MAIN}/privacy`,              accent: false },
-  { label: "Terms",              href: `${MAIN}/terms`,                accent: false },
+  { label: "Privacy",            href: "/privacy",                     accent: false },
+  { label: "Terms",              href: "/terms",                       accent: false },
 ];
 
 export default function Footer() {
