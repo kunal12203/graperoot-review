@@ -453,6 +453,8 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
                     reads = impact.get("recommended_reads", changed_files[:3])[:6]
                     affected = impact.get("affected_files", [])[:6]
                     to_read = list(dict.fromkeys(reads + affected))  # dedup, preserve order
+                    # Filter out stdlib/external modules — only real repo file paths
+                    to_read = [r for r in to_read if "/" in r or r.endswith((".py",".ts",".js",".go",".rs",".java"))]
                     for ref in to_read[:8]:
                         file_path = ref.split("::")[0] if "::" in ref else ref
                         content = _gh_file_content(owner, repo, file_path, head_sha, github_token)

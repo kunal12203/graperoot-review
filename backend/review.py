@@ -371,14 +371,16 @@ def _openai_review(user_msg: str) -> str:
     if is_reasoning:
         payload = {
             "model": MODEL,
-            "max_completion_tokens": 8192,
+            # Large budget: o1 uses some tokens for internal reasoning,
+            # the rest goes to output. Don't use reasoning_effort on o1 —
+            # it spends all budget on reasoning with 0 output tokens left.
+            "max_completion_tokens": 16000,
             "messages": [
-                # Merge system prompt into user message for reasoning models
                 {"role": "user", "content": f"{SYSTEM_PROMPT}\n\n---\n\n{user_msg}"},
             ],
         }
-        # reasoning_effort supported on o1 and newer
-        if MODEL in ("o1", "o3", "o3-mini", "o4-mini"):
+        # reasoning_effort is an o3/o4 parameter — NOT for o1
+        if MODEL.startswith(("o3", "o4")):
             payload["reasoning_effort"] = "high"
     else:
         payload = {
