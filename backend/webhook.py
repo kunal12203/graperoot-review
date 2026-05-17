@@ -199,12 +199,14 @@ def _migrate_db():
         "ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'",
     ]
     if DATABASE_URL and _HAS_PG:
-        con = _pg_conn()
-        cur = con.cursor()
         for sql in new_cols_pg:
-            try: cur.execute(sql)
-            except Exception: pass
-        con.commit(); cur.close(); con.close()
+            try:
+                con = _pg_conn()
+                cur = con.cursor()
+                cur.execute(sql)
+                con.commit(); cur.close(); con.close()
+            except Exception as e:
+                print(f"[migrate] {e}", flush=True)
     else:
         import sqlite3 as _sq
         con = _sq.connect(DB_PATH)
@@ -251,7 +253,11 @@ def _query(sql: str, params=(), one=False):
     if is_pg:
         cur = db.cursor()
         cur.execute(sql, params)
-        rows = [dict(r) for r in (cur.fetchall() if not one else [cur.fetchone()])]
+        if one:
+            result = cur.fetchone()
+            rows = [dict(result)] if result is not None else [{}]
+        else:
+            rows = [dict(r) for r in cur.fetchall()]
         cur.close()
     else:
         cur = db.execute(sql, params)
@@ -416,8 +422,11 @@ def _token_user():
         return None
     is_pg = bool(DATABASE_URL and _HAS_PG)
     ph = "%s" if is_pg else "?"
-    row = _query(f"SELECT * FROM users WHERE session_token = {ph}", (token,), one=True)
-    return row if row.get("github_id") else None
+    try:
+        row = _query(f"SELECT * FROM users WHERE session_token = {ph}", (token,), one=True)
+        return row if row.get("github_id") else None
+    except Exception:
+        return None
 
 
 def _within_limit(login: str) -> bool:
