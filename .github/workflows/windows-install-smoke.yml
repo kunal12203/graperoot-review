@@ -1,0 +1,62 @@
+name: Windows install smoke test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install-smoke:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure license secret is present
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.DG_LICENSE_KEY }}") {
+            Write-Error "Missing DG_LICENSE_KEY secret. Add it in repo Settings > Secrets and re-run."
+            exit 1
+          }
+
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+          irm get.scoop.sh | iex
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          scoop install python311 nodejs
+          python --version
+          node --version
+          npm --version
+
+      - name: Install Claude Code
+        shell: pwsh
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Install dual-graph from bucket
+        shell: pwsh
+        env:
+          DG_LICENSE_KEY: ${{ secrets.DG_LICENSE_KEY }}
+        run: |
+          scoop bucket add dual-graph https://github.com/kunal12203/scoop-dual-graph
+          scoop update
+          scoop install dual-graph
+
+      - name: Smoke test dgc
+        shell: pwsh
+        run: |
+          $proj = Join-Path $env:RUNNER_TEMP "dg-smoke"
+          New-Item -ItemType Directory -Force -Path $proj | Out-Null
+          Set-Content -Path (Join-Path $proj "README.md") -Value "# Smoke"
+          & dgc $proj
+
+      - name: Report installed version
+        shell: pwsh
+        run: |
+          $ver = Get-Content "$env:USERPROFILE\.dual-graph\version.txt" -Raw
+          Write-Host "dual-graph version: $ver"

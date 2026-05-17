@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Data (never commit user data)
+data/
+!data/.gitkeep
+*.jsonl
+bench_log.jsonl
+comparison/
+
+# Old root-level files (moved to dashboard/)
+/server.py
+/static/
+
+# Core engine (now in private repo)
+/core/
+
+# Local venvs
+.venv-mcp/
+
+# Node
+node_modules/
+
+# License server (private — deployed to Railway separately)
+license/
+license_server/
+
+# Secrets — never commit
+.env
+.env.*
+RELEASING.md
+
+# Cloudflare Wrangler local state
+.wrangler/
+
+# Redis dump
+dump.rdb
+
+# macOS
+.DS_Store
+
+# Claude local settings (machine-specific, auto-generated)
+.claude/settings.local.json
+
+# Local project graphs (per-project, stays on machine)
+.dual-graph/
+.dual-graph-context/
+benchmark/dgc-claude/
+benchmark/normal-claude/
+.dual-graph/
+
+# Secrets — never commit
+*.pem
+*.key
+.env
+.env.*
