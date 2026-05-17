@@ -431,8 +431,8 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
     findings, cost, error = [], 0.0, None
 
     if result.returncode != 0:
-        error = result.stderr[:500] or f"exit code {result.returncode}"
-        print(f"[review] FAILED {owner}/{repo}#{pr_num}: {error[:100]}", flush=True)
+        error = (result.stderr + result.stdout)[:3000] or f"exit code {result.returncode}"
+        print(f"[review] FAILED {owner}/{repo}#{pr_num}:\n{error}", flush=True)
     else:
         try:
             out      = json.loads(Path(json_out).read_text())

@@ -335,9 +335,34 @@ def post_review(
             print(f"  [{c['body'][:120]}]  → {c['path']}:{c['line']}")
         return
 
-    result = gh(f"/repos/{owner}/{repo}/pulls/{pr_num}/reviews",
-                method="POST", body=review_payload)
-    print(f"  Posted review: {result.get('html_url', result.get('id', '?'))}")
+    try:
+        result = gh(f"/repos/{owner}/{repo}/pulls/{pr_num}/reviews",
+                    method="POST", body=review_payload)
+        print(f"  Posted review: {result.get('html_url', result.get('id', '?'))}")
+    except urllib.error.HTTPError as e:
+        if e.code != 422:
+            raise
+        # Inline comment line numbers didn't match diff positions — fall back to
+        # a single body-only review that lists all findings inline as text.
+        print("  422 on inline comments — falling back to body-only review", file=sys.stderr)
+        fallback_lines = ["**GrapeRoot Review**\n"]
+        for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            items = by_sev.get(sev, [])
+            for c in items:
+                emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}.get(sev, "·")
+                fallback_lines.append(
+                    f"{emoji} **[{sev}]** `{c['path']}` — **{c['title']}**\n\n{c['body']}\n"
+                )
+        fallback_lines.append("\n_Powered by [GrapeRoot](https://graperoot.dev) — graph-aware AI review_")
+        fallback_payload = {
+            "commit_id": pr_head_sha,
+            "body":      "\n".join(fallback_lines),
+            "event":     "COMMENT",
+            "comments":  [],
+        }
+        result = gh(f"/repos/{owner}/{repo}/pulls/{pr_num}/reviews",
+                    method="POST", body=fallback_payload)
+        print(f"  Posted fallback review: {result.get('html_url', result.get('id', '?'))}")
 
 
 # ── Side-by-side comparison ────────────────────────────────────────────────────
