@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GrapeRoot Review — Graph-proven AI code review</title>
+  <meta name="description" content="AI code review that cites the actual import chain. Every finding is graph-proven — not a guess. Beats CodeRabbit at $19/user/mo." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0a0a0f;
+      --bg2:      #111118;
+      --bg3:      #1a1a24;
+      --border:   #2a2a38;
+      --purple:   #7c6af7;
+      --purple2:  #9d8fff;
+      --green:    #22c55e;
+      --red:      #ef4444;
+      --orange:   #f97316;
+      --yellow:   #eab308;
+      --text:     #f1f0ff;
+      --muted:    #8884a8;
+      --card:     #13131e;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    /* ── NAV ─────────────────────────────────────────────────────────── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 2rem; height: 60px;
+      background: rgba(10,10,15,0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-logo {
+      display: flex; align-items: center; gap: 10px;
+      font-weight: 700; font-size: 1rem; color: var(--text);
+      text-decoration: none;
+    }
+    .nav-logo .grape { font-size: 1.3rem; }
+    .nav-links { display: flex; align-items: center; gap: 2rem; }
+    .nav-links a { color: var(--muted); text-decoration: none; font-size: 0.9rem; transition: color .2s; }
+    .nav-links a:hover { color: var(--text); }
+    .nav-cta {
+      background: var(--purple); color: #fff; text-decoration: none;
+      padding: 0.45rem 1.1rem; border-radius: 8px;
+      font-size: 0.875rem; font-weight: 600; transition: opacity .2s;
+    }
+    .nav-cta:hover { opacity: 0.85; }
+
+    /* ── HERO ────────────────────────────────────────────────────────── */
+    .hero {
+      min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 100px 2rem 4rem;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::before {
+      content: '';
+      position: absolute; top: -200px; left: 50%; transform: translateX(-50%);
+      width: 800px; height: 800px; border-radius: 50%;
+      background: radial-gradient(circle, rgba(124,106,247,0.12) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(124,106,247,0.12); border: 1px solid rgba(124,106,247,0.3);
+      color: var(--purple2); padding: 0.3rem 0.9rem; border-radius: 100px;
+      font-size: 0.8rem; font-weight: 600; margin-bottom: 1.5rem;
+      letter-spacing: 0.02em;
+    }
+    .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--purple); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 800; line-height: 1.1;
+      letter-spacing: -0.03em;
+      max-width: 820px;
+    }
+    h1 .highlight {
+      background: linear-gradient(135deg, var(--purple) 0%, var(--purple2) 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero-sub {
+      margin-top: 1.5rem;
+      font-size: 1.15rem; color: var(--muted);
+      max-width: 580px; line-height: 1.7;
+    }
+    .hero-actions {
+      margin-top: 2.5rem;
+      display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center;
+    }
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--purple); color: #fff;
+      padding: 0.8rem 1.8rem; border-radius: 10px;
+      font-size: 1rem; font-weight: 700; text-decoration: none;
+      transition: transform .2s, box-shadow .2s;
+      box-shadow: 0 0 30px rgba(124,106,247,0.35);
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 0 40px rgba(124,106,247,0.5); }
+    .btn-secondary {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: transparent; color: var(--text);
+      padding: 0.8rem 1.8rem; border-radius: 10px;
+      font-size: 1rem; font-weight: 600; text-decoration: none;
+      border: 1px solid var(--border); transition: border-color .2s, background .2s;
+    }
+    .btn-secondary:hover { border-color: var(--purple); background: rgba(124,106,247,0.08); }
+
+    .hero-stats {
+      margin-top: 4rem;
+      display: flex; gap: 3rem; flex-wrap: wrap; justify-content: center;
+    }
+    .stat { text-align: center; }
+    .stat-val { font-size: 2rem; font-weight: 800; color: var(--text); }
+    .stat-label { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+
+    /* ── DEMO COMMENT ────────────────────────────────────────────────── */
+    .demo-wrap {
+      padding: 0 2rem 6rem;
+      display: flex; justify-content: center;
+    }
+    .demo-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      width: 100%; max-width: 780px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    .demo-header {
+      background: var(--bg3);
+      padding: 0.75rem 1.25rem;
+      display: flex; align-items: center; gap: 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8rem; color: var(--muted);
+    }
+    .demo-header strong { color: var(--text); }
+    .demo-body { padding: 1.25rem 1.5rem; }
+    .review-summary {
+      background: rgba(124,106,247,0.07);
+      border: 1px solid rgba(124,106,247,0.2);
+      border-radius: 8px; padding: 1rem 1.25rem;
+      margin-bottom: 1.25rem; font-size: 0.875rem;
+    }
+    .review-summary strong { color: var(--purple2); }
+    .review-summary .sev-line { margin-top: 0.5rem; }
+    .comment-block {
+      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+      margin-bottom: 1rem;
+    }
+    .comment-file {
+      background: var(--bg3); padding: 0.5rem 1rem;
+      font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+      color: var(--muted); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .sev-badge {
+      font-size: 0.7rem; font-weight: 700; padding: 2px 8px; border-radius: 4px;
+      letter-spacing: 0.05em;
+    }
+    .sev-critical { background: rgba(239,68,68,0.15); color: #ef4444; }
+    .sev-high     { background: rgba(249,115,22,0.15); color: #f97316; }
+    .comment-body { padding: 1rem 1.25rem; font-size: 0.875rem; }
+    .comment-title { font-weight: 600; margin-bottom: 0.4rem; }
+    .comment-text { color: var(--muted); line-height: 1.6; }
+    .graph-citation {
+      margin-top: 0.75rem;
+      background: rgba(124,106,247,0.07);
+      border-left: 3px solid var(--purple);
+      padding: 0.5rem 0.75rem; border-radius: 0 6px 6px 0;
+      font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--purple2);
+    }
+    .graph-citation-label { font-size: 0.7rem; color: var(--muted); margin-bottom: 3px; font-family: 'Inter', sans-serif; }
+    .suggestion-block {
+      margin-top: 0.75rem; border-radius: 6px; overflow: hidden;
+    }
+    .suggestion-label {
+      background: rgba(34,197,94,0.1); color: var(--green);
+      font-size: 0.7rem; font-weight: 700; padding: 4px 10px;
+      letter-spacing: 0.05em;
+    }
+    .suggestion-code {
+      background: rgba(0,0,0,0.3);
+      font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+      padding: 0.75rem 1rem; color: #a8d8b0;
+    }
+
+    /* ── SECTION COMMON ──────────────────────────────────────────────── */
+    section { padding: 6rem 2rem; }
+    .section-label {
+      text-align: center; font-size: 0.8rem; font-weight: 700;
+      color: var(--purple); letter-spacing: 0.1em; text-transform: uppercase;
+      margin-bottom: 0.75rem;
+    }
+    h2 {
+      text-align: center; font-size: clamp(1.8rem, 4vw, 2.8rem);
+      font-weight: 800; letter-spacing: -0.02em; max-width: 640px; margin: 0 auto;
+    }
+    .section-sub {
+      text-align: center; color: var(--muted); margin: 1rem auto 0;
+      max-width: 520px; font-size: 1rem;
+    }
+
+    /* ── VS TABLE ────────────────────────────────────────────────────── */
+    .vs-wrap { max-width: 860px; margin: 3rem auto 0; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th {
+      padding: 0.75rem 1.25rem; text-align: left;
+      font-size: 0.8rem; font-weight: 700; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      border-bottom: 1px solid var(--border);
+    }
+    th.highlight-col { color: var(--purple2); }
+    td {
+      padding: 0.85rem 1.25rem;
+      border-bottom: 1px solid rgba(42,42,56,0.5);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    td.highlight-col {
+      background: rgba(124,106,247,0.05);
+      border-left: 1px solid rgba(124,106,247,0.15);
+      border-right: 1px solid rgba(124,106,247,0.15);
+    }
+    .check { color: var(--green); font-weight: 700; }
+    .cross { color: #444; }
+    .price-tag { font-weight: 700; color: var(--text); }
+    .price-lower { color: var(--green); }
+
+    /* ── HOW IT WORKS ────────────────────────────────────────────────── */
+    .steps {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1.5rem; max-width: 960px; margin: 3rem auto 0;
+    }
+    .step {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 1.75rem;
+    }
+    .step-num {
+      width: 36px; height: 36px; border-radius: 8px;
+      background: rgba(124,106,247,0.15); color: var(--purple2);
+      font-weight: 800; font-size: 0.9rem;
+      display: flex; align-items: center; justify-content: center;
+      margin-bottom: 1rem;
+    }
+    .step h3 { font-size: 1rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .step p { font-size: 0.875rem; color: var(--muted); line-height: 1.6; }
+
+    /* ── PRICING ─────────────────────────────────────────────────────── */
+    #pricing { background: var(--bg2); }
+    .plans {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 1.5rem; max-width: 1000px; margin: 3rem auto 0;
+    }
+    .plan {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 2rem;
+      position: relative; transition: border-color .2s;
+    }
+    .plan:hover { border-color: var(--purple); }
+    .plan.featured {
+      border-color: var(--purple);
+      box-shadow: 0 0 0 1px var(--purple), 0 20px 40px rgba(124,106,247,0.15);
+    }
+    .plan-badge {
+      position: absolute; top: -12px; left: 50%; transform: translateX(-50%);
+      background: var(--purple); color: #fff;
+      font-size: 0.7rem; font-weight: 700; padding: 3px 12px; border-radius: 100px;
+      letter-spacing: 0.05em; white-space: nowrap;
+    }
+    .plan-name { font-size: 0.85rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+    .plan-price { margin-top: 0.75rem; }
+    .plan-price .amount { font-size: 2.5rem; font-weight: 800; }
+    .plan-price .period { color: var(--muted); font-size: 0.875rem; }
+    .plan-desc { margin-top: 0.5rem; font-size: 0.85rem; color: var(--muted); }
+    .plan-features { margin-top: 1.5rem; display: flex; flex-direction: column; gap: 0.6rem; }
+    .plan-feature {
+      display: flex; align-items: flex-start; gap: 8px;
+      font-size: 0.875rem; color: var(--muted);
+    }
+    .plan-feature .icon { color: var(--green); flex-shrink: 0; margin-top: 2px; }
+    .plan-feature.dim { opacity: 0.4; }
+    .plan-feature.dim .icon { color: var(--muted); }
+    .plan-cta {
+      display: block; text-align: center; margin-top: 1.75rem;
+      padding: 0.7rem; border-radius: 8px; font-weight: 700; font-size: 0.9rem;
+      text-decoration: none; transition: all .2s;
+    }
+    .plan-cta.primary { background: var(--purple); color: #fff; }
+    .plan-cta.primary:hover { opacity: 0.85; }
+    .plan-cta.outline {
+      border: 1px solid var(--border); color: var(--text);
+    }
+    .plan-cta.outline:hover { border-color: var(--purple); background: rgba(124,106,247,0.08); }
+
+    /* ── SELF HOSTED ─────────────────────────────────────────────────── */
+    .selfhosted-card {
+      max-width: 760px; margin: 2rem auto 0;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 2rem 2.5rem;
+      display: flex; align-items: center; gap: 2rem; flex-wrap: wrap;
+    }
+    .selfhosted-card .icon { font-size: 2.5rem; flex-shrink: 0; }
+    .selfhosted-card h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 0.4rem; }
+    .selfhosted-card p { color: var(--muted); font-size: 0.875rem; }
+    .selfhosted-card .actions { margin-left: auto; display: flex; gap: 0.75rem; flex-wrap: wrap; }
+
+    /* ── CTA FOOTER ──────────────────────────────────────────────────── */
+    .cta-section {
+      text-align: center; padding: 7rem 2rem;
+      background: linear-gradient(180deg, var(--bg) 0%, rgba(124,106,247,0.05) 50%, var(--bg) 100%);
+    }
+    .cta-section h2 { max-width: 580px; }
+    .cta-section p { color: var(--muted); margin: 1rem auto 2.5rem; max-width: 480px; }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem; text-align: center;
+      font-size: 0.8rem; color: var(--muted);
+    }
+    footer a { color: var(--muted); text-decoration: none; }
+    footer a:hover { color: var(--text); }
+
+    @media (max-width: 640px) {
+      .nav-links { display: none; }
+      .hero-stats { gap: 1.5rem; }
+      .selfhosted-card { flex-direction: column; }
+      .selfhosted-card .actions { margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <a class="nav-logo" href="/">
+    <span class="grape">🍇</span> GrapeRoot Review
+  </a>
+  <div class="nav-links">
+    <a href="#how">How it works</a>
+    <a href="#compare">vs CodeRabbit</a>
+    <a href="#pricing">Pricing</a>
+    <a href="https://github.com/kunal12203/graperoot-review" target="_blank">GitHub</a>
+  </div>
+  <a class="nav-cta" href="https://github.com/apps/graperoot-review/installations/new" target="_blank">
+    Install Free →
+  </a>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="badge"><span class="badge-dot"></span> Now in beta — free for open source</div>
+  <h1>AI code review that<br/><span class="highlight">proves every finding</span></h1>
+  <p class="hero-sub">
+    GrapeRoot traces the actual import graph before posting a comment.
+    No hallucinated blast-radius claims — every CRITICAL finding cites the real call chain.
+  </p>
+  <div class="hero-actions">
+    <a class="btn-primary" href="https://github.com/apps/graperoot-review/installations/new" target="_blank">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+      Install GitHub App
+    </a>
+    <a class="btn-secondary" href="#compare">See vs CodeRabbit →</a>
+  </div>
+  <div class="hero-stats">
+    <div class="stat"><div class="stat-val">$0.05</div><div class="stat-label">avg cost per review</div></div>
+    <div class="stat"><div class="stat-val">~60s</div><div class="stat-label">time to first comment</div></div>
+    <div class="stat"><div class="stat-val">$19</div><div class="stat-label">per user / month</div></div>
+    <div class="stat"><div class="stat-val">0</div><div class="stat-label">graph-fabricated findings</div></div>
+  </div>
+</section>
+
+<!-- DEMO COMMENT -->
+<div class="demo-wrap">
+  <div class="demo-card">
+    <div class="demo-header">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <strong>GrapeRoot Review</strong> left a review on <strong>grafana/loki #21931</strong>
+      <span style="margin-left:auto">just now</span>
+    </div>
+    <div class="demo-body">
+      <div class="review-summary">
+        <strong>🍇 GrapeRoot Review</strong>
+        <div class="sev-line">🔴 <strong>CRITICAL</strong> (1): ingestedAt hardcoded to 0 &nbsp;·&nbsp; 🟠 <strong>HIGH</strong> (2): metrics registered before ring init, missing rollback on schema migration</div>
+        <div style="margin-top:6px;font-size:0.8rem;color:var(--muted)">
+          <em>Powered by <a href="https://review.graperoot.dev" style="color:var(--purple2)">GrapeRoot</a> — graph-aware AI review</em>
+        </div>
+      </div>
+
+      <div class="comment-block">
+        <div class="comment-file">
+          <span>pkg/compactor/index_set.go · line 232</span>
+          <span class="sev-badge sev-critical">CRITICAL</span>
+        </div>
+        <div class="comment-body">
+          <div class="comment-title">ingestedAt hardcoded to 0 destroys ingestion ordering</div>
+          <div class="comment-text">
+            Every chunk will have <code style="color:var(--purple2)">ingestedAt=0</code>, making time-based compaction queries return results in undefined order. This affects all downstream consumers that rely on ingestion sequence.
+          </div>
+          <div class="graph-citation">
+            <div class="graph-citation-label">📊 Graph-proven blast radius</div>
+            index_set.go → compactor.go → shipper.go → <strong>store/chunk_store.go</strong> (3 callers affected)
+          </div>
+          <div class="suggestion-block">
+            <div class="suggestion-label">COMMITTABLE SUGGESTION</div>
+            <div class="suggestion-code">- ingestedAt: 0,
++ ingestedAt: time.Now().UnixNano(),</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="comment-block">
+        <div class="comment-file">
+          <span>pkg/compactor/compactor.go · line 150</span>
+          <span class="sev-badge sev-high">HIGH</span>
+        </div>
+        <div class="comment-body">
+          <div class="comment-title">Metrics registered before ring/KV initialisation</div>
+          <div class="comment-text">
+            If ring init fails, registered metrics are leaked and a subsequent restart will panic on duplicate metric registration.
+          </div>
+          <div class="graph-citation">
+            <div class="graph-citation-label">📊 Graph-proven blast radius</div>
+            compactor.go:New() → ring.New() → prometheus.MustRegister() — registration happens before error path
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- HOW IT WORKS -->
+<section id="how">
+  <div class="section-label">How it works</div>
+  <h2>Installs in 2 minutes. Reviews every PR automatically.</h2>
+  <p class="section-sub">No YAML to write. No CLI to run. Just install the GitHub App and open a PR.</p>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <h3>Install the GitHub App</h3>
+      <p>One click. Choose which repos to enable. No tokens to paste, no scripts to run.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <h3>Open a pull request</h3>
+      <p>GrapeRoot receives the webhook, fetches the diff, and starts reviewing in seconds.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <h3>Graph traces blast radius</h3>
+      <p>The AST graph maps every import chain touched by the PR — across files and repos.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <h3>Get proven comments</h3>
+      <p>Each finding cites the real import path. One-click committable suggestions for every fix.</p>
+    </div>
+  </div>
+</section>
+
+<!-- COMPARE -->
+<section id="compare" style="background:var(--bg2)">
+  <div class="section-label">Comparison</div>
+  <h2>Built different from CodeRabbit and CodeAnt</h2>
+  <p class="section-sub">Not just cheaper — fundamentally more trustworthy.</p>
+  <div class="vs-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:35%">Feature</th>
+          <th class="highlight-col" style="width:22%">🍇 GrapeRoot</th>
+          <th style="width:22%">CodeRabbit</th>
+          <th style="width:21%">CodeAnt</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Graph-proven findings</td>
+          <td class="highlight-col"><span class="check">✓ Real edges</span></td>
+          <td><span class="cross">✗ LLM guess</span></td>
+          <td><span class="cross">✗ LLM guess</span></td>
+        </tr>
+        <tr>
+          <td>Cross-repo blast radius</td>
+          <td class="highlight-col"><span class="check">✓</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Committable suggestions</td>
+          <td class="highlight-col"><span class="check">✓</span></td>
+          <td><span class="check">✓</span></td>
+          <td><span class="check">✓</span></td>
+        </tr>
+        <tr>
+          <td>Rate limits</td>
+          <td class="highlight-col"><span class="check">✓ None</span></td>
+          <td><span class="cross">✗ 5–10/hr</span></td>
+          <td><span class="check">✓ None</span></td>
+        </tr>
+        <tr>
+          <td>Self-hosted (Pro tier)</td>
+          <td class="highlight-col"><span class="check">✓ Pro+</span></td>
+          <td><span class="cross">✗ Enterprise only</span></td>
+          <td><span class="cross">✗ Enterprise only</span></td>
+        </tr>
+        <tr>
+          <td>Free for open source</td>
+          <td class="highlight-col"><span class="check">✓ 50 reviews/mo</span></td>
+          <td><span class="check">✓ Unlimited</span></td>
+          <td><span class="check">✓ 100%</span></td>
+        </tr>
+        <tr>
+          <td>Price (Pro)</td>
+          <td class="highlight-col"><span class="price-tag price-lower">$19 / user</span></td>
+          <td><span class="price-tag">$24 / user</span></td>
+          <td><span class="price-tag">$24–30 / user</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- PRICING -->
+<section id="pricing">
+  <div class="section-label">Pricing</div>
+  <h2>Simple pricing. No surprises.</h2>
+  <p class="section-sub">~$0.05 API cost per review. We pass most of those savings to you.</p>
+  <div class="plans">
+
+    <div class="plan">
+      <div class="plan-name">Free</div>
+      <div class="plan-price"><span class="amount">$0</span></div>
+      <div class="plan-desc">Open source repos only</div>
+      <div class="plan-features">
+        <div class="plan-feature"><span class="icon">✓</span> 50 reviews / month</div>
+        <div class="plan-feature"><span class="icon">✓</span> Public repos</div>
+        <div class="plan-feature"><span class="icon">✓</span> Graph-proven findings</div>
+        <div class="plan-feature"><span class="icon">✓</span> Committable suggestions</div>
+        <div class="plan-feature dim"><span class="icon">–</span> Private repos</div>
+        <div class="plan-feature dim"><span class="icon">–</span> Custom rules</div>
+      </div>
+      <a class="plan-cta outline" href="https://github.com/apps/graperoot-review/installations/new" target="_blank">Install Free</a>
+    </div>
+
+    <div class="plan featured">
+      <div class="plan-badge">MOST POPULAR</div>
+      <div class="plan-name">Pro</div>
+      <div class="plan-price"><span class="amount">$19</span><span class="period"> / user / mo</span></div>
+      <div class="plan-desc">For active teams</div>
+      <div class="plan-features">
+        <div class="plan-feature"><span class="icon">✓</span> 300 reviews / month</div>
+        <div class="plan-feature"><span class="icon">✓</span> Private repos</div>
+        <div class="plan-feature"><span class="icon">✓</span> Graph-proven findings</div>
+        <div class="plan-feature"><span class="icon">✓</span> Cross-repo blast radius</div>
+        <div class="plan-feature"><span class="icon">✓</span> Custom rules (graperoot.yml)</div>
+        <div class="plan-feature"><span class="icon">✓</span> @graperoot PR chat</div>
+      </div>
+      <a class="plan-cta primary" href="https://github.com/apps/graperoot-review/installations/new" target="_blank">Start Free Trial</a>
+    </div>
+
+    <div class="plan">
+      <div class="plan-name">Pro+</div>
+      <div class="plan-price"><span class="amount">$32</span><span class="period"> / user / mo</span></div>
+      <div class="plan-desc">Unlimited everything</div>
+      <div class="plan-features">
+        <div class="plan-feature"><span class="icon">✓</span> Unlimited reviews</div>
+        <div class="plan-feature"><span class="icon">✓</span> All Pro features</div>
+        <div class="plan-feature"><span class="icon">✓</span> Self-hosted option (BYOK)</div>
+        <div class="plan-feature"><span class="icon">✓</span> Session memory across PRs</div>
+        <div class="plan-feature"><span class="icon">✓</span> Priority support</div>
+        <div class="plan-feature"><span class="icon">✓</span> SSO / SAML</div>
+      </div>
+      <a class="plan-cta outline" href="mailto:hello@graperoot.dev">Contact Sales</a>
+    </div>
+
+  </div>
+
+  <div class="selfhosted-card">
+    <div class="icon">🏢</div>
+    <div>
+      <h3>Enterprise self-hosted</h3>
+      <p>Run on your own infrastructure. Your Claude API key. Your network. Code never leaves your servers. Air-gapped mode available.</p>
+    </div>
+    <div class="actions">
+      <a class="btn-secondary" style="padding:.6rem 1.2rem;font-size:.875rem" href="mailto:hello@graperoot.dev">Book a demo</a>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="cta-section">
+  <div class="section-label">Get started</div>
+  <h2>Your next PR deserves a graph-proven review.</h2>
+  <p>Install in 2 minutes. No credit card required. Free for open source.</p>
+  <a class="btn-primary" href="https://github.com/apps/graperoot-review/installations/new" target="_blank">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+    Install GitHub App — Free
+  </a>
+</section>
+
+<footer>
+  <p>© 2026 GrapeRoot · <a href="/privacy">Privacy</a> · <a href="mailto:hello@graperoot.dev">hello@graperoot.dev</a> · <a href="https://github.com/kunal12203/graperoot-review" target="_blank">GitHub</a></p>
+</footer>
+
+</body>
+</html>

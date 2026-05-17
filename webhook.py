@@ -163,6 +163,10 @@ def health():
 
 @app.route("/")
 def index():
+    from pathlib import Path
+    landing = Path(__file__).parent / "landing" / "index.html"
+    if landing.exists():
+        return landing.read_text(), 200, {"Content-Type": "text/html"}
     return jsonify({
         "service": "GrapeRoot Review",
         "docs":    "https://review.graperoot.dev",
