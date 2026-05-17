@@ -365,14 +365,29 @@ def _anthropic_review(user_msg: str) -> str:
 
 
 def _openai_review(user_msg: str) -> str:
-    payload = {
-        "model": MODEL,
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_msg},
-        ],
-    }
+    # o1 / o3 reasoning models: no system role, max_completion_tokens, optional reasoning_effort
+    is_reasoning = MODEL.startswith(("o1", "o3", "o4"))
+    if is_reasoning:
+        payload = {
+            "model": MODEL,
+            "max_completion_tokens": 8192,
+            "messages": [
+                # Merge system prompt into user message for reasoning models
+                {"role": "user", "content": f"{SYSTEM_PROMPT}\n\n---\n\n{user_msg}"},
+            ],
+        }
+        # reasoning_effort supported on o1 and newer
+        if MODEL in ("o1", "o3", "o3-mini", "o4-mini"):
+            payload["reasoning_effort"] = "high"
+    else:
+        payload = {
+            "model": MODEL,
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
+            ],
+        }
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
         data=json.dumps(payload).encode(), method="POST",
@@ -381,9 +396,14 @@ def _openai_review(user_msg: str) -> str:
             "Content-Type":  "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        resp = json.loads(r.read())
-    return resp["choices"][0]["message"]["content"]
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            resp = json.loads(r.read())
+        return resp["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"OpenAI API error {e.code}: {body[:500]}", file=sys.stderr)
+        raise
 
 
 # ── Post comments to GitHub ────────────────────────────────────────────────────

@@ -565,7 +565,8 @@ def _within_limit(login: str) -> bool:
     is_pg = bool(DATABASE_URL and _HAS_PG)
     ph = "%s" if is_pg else "?"
     user_row = _query(f"SELECT monthly_limit FROM users WHERE login = {ph}", (login,), one=True)
-    limit = user_row.get("monthly_limit") if user_row.get("github_id") else 5
+    # Check for any key to confirm row was found (github_id not in SELECT)
+    limit = user_row.get("monthly_limit") if user_row else 5
     if limit is None:  # NULL = unlimited (Pro / Enterprise)
         return True
     if is_pg:
@@ -856,7 +857,7 @@ def api_stats():
         (login,), one=True,
     )
     user_row = _query(f"SELECT monthly_limit, plan FROM users WHERE login = {ph}", (login,), one=True)
-    limit   = user_row.get("monthly_limit", 5) if user_row.get("github_id") else 5
+    limit   = user_row.get("monthly_limit", 5) if user_row else 5
 
     return jsonify({
         "reviews_this_month": monthly.get("cnt") or 0,
