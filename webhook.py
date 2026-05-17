@@ -49,6 +49,22 @@ DB_PATH         = os.environ.get("DB_PATH", "/app/data/reviews.db")  # SQLite fa
 app = Flask(__name__)
 app.secret_key = SESSION_SECRET
 
+FRONTEND_ORIGIN = "https://review.graperoot.dev"
+
+@app.after_request
+def _cors(response):
+    origin = request.headers.get("Origin", "")
+    if origin in (FRONTEND_ORIGIN, "http://localhost:3000"):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Vary"] = "Origin"
+    return response
+
+@app.route("/api/<path:path>", methods=["OPTIONS"])
+def _api_preflight(path):
+    return "", 204
+
 # ── Database ───────────────────────────────────────────────────────────────────
 # Uses PostgreSQL (NeonDB) when DATABASE_URL is set, SQLite otherwise.
 
@@ -72,11 +88,14 @@ CREATE TABLE IF NOT EXISTS reviews (
     installed_by TEXT
 );
 CREATE TABLE IF NOT EXISTS users (
-    github_id    BIGINT PRIMARY KEY,
-    login        TEXT NOT NULL,
-    avatar_url   TEXT,
-    access_token TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    github_id     BIGINT PRIMARY KEY,
+    login         TEXT NOT NULL,
+    avatar_url    TEXT,
+    access_token  TEXT,
+    session_token TEXT,
+    monthly_limit INTEGER DEFAULT 5,
+    plan          TEXT DEFAULT 'free',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_repo     ON reviews(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_reviews_created  ON reviews(created_at DESC);
@@ -102,11 +121,14 @@ CREATE TABLE IF NOT EXISTS reviews (
     installed_by TEXT
 );
 CREATE TABLE IF NOT EXISTS users (
-    github_id   INTEGER PRIMARY KEY,
-    login       TEXT NOT NULL,
-    avatar_url  TEXT,
-    access_token TEXT,
-    created_at  TEXT NOT NULL
+    github_id     INTEGER PRIMARY KEY,
+    login         TEXT NOT NULL,
+    avatar_url    TEXT,
+    access_token  TEXT,
+    session_token TEXT,
+    monthly_limit INTEGER DEFAULT 5,
+    plan          TEXT DEFAULT 'free',
+    created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_repo ON reviews(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at DESC);
@@ -161,6 +183,35 @@ def init_db():
         con.executescript(SCHEMA_SQLITE)
         con.commit(); con.close()
         print(f"[db] SQLite fallback at {DB_PATH}", flush=True)
+    _migrate_db()
+
+
+def _migrate_db():
+    """Add columns introduced after initial schema deploy."""
+    new_cols_pg = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_limit INTEGER DEFAULT 5",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free'",
+    ]
+    new_cols_sq = [
+        "ALTER TABLE users ADD COLUMN session_token TEXT",
+        "ALTER TABLE users ADD COLUMN monthly_limit INTEGER DEFAULT 5",
+        "ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'",
+    ]
+    if DATABASE_URL and _HAS_PG:
+        con = _pg_conn()
+        cur = con.cursor()
+        for sql in new_cols_pg:
+            try: cur.execute(sql)
+            except Exception: pass
+        con.commit(); cur.close(); con.close()
+    else:
+        import sqlite3 as _sq
+        con = _sq.connect(DB_PATH)
+        for sql in new_cols_sq:
+            try: con.execute(sql)
+            except Exception: pass
+        con.commit(); con.close()
 
 
 def save_review(owner, repo, pr_num, pr_title, pr_url, head_sha,
@@ -354,6 +405,44 @@ def _gh_api(path, token):
 def current_user():
     return session.get("user")
 
+
+def _token_user():
+    """Validate Bearer token from Authorization header; return user row or None."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:].strip()
+    if not token:
+        return None
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph = "%s" if is_pg else "?"
+    row = _query(f"SELECT * FROM users WHERE session_token = {ph}", (token,), one=True)
+    return row if row.get("github_id") else None
+
+
+def _within_limit(login: str) -> bool:
+    """Return True if this GitHub login hasn't hit their monthly review limit."""
+    if not login:
+        return True
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph = "%s" if is_pg else "?"
+    user_row = _query(f"SELECT monthly_limit FROM users WHERE login = {ph}", (login,), one=True)
+    limit = user_row.get("monthly_limit") if user_row.get("github_id") else 5
+    if limit is None:  # NULL = unlimited (Pro / Enterprise)
+        return True
+    if is_pg:
+        count = _query(
+            f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND created_at >= date_trunc('month', NOW())",
+            (login,), one=True,
+        )
+    else:
+        count = _query(
+            f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND created_at >= strftime('%Y-%m-01','now')",
+            (login,), one=True,
+        )
+    return (count.get("cnt") or 0) < limit
+
+
 def login_required(f):
     from functools import wraps
     @wraps(f)
@@ -413,29 +502,36 @@ def auth_callback():
     }
     session["gh_token"] = access_token
 
-    db    = get_db()
-    is_pg = getattr(g, "_is_pg", False)
-    ph    = "%s" if is_pg else "?"
-    now   = datetime.now(timezone.utc).isoformat()
+    db           = get_db()
+    is_pg        = getattr(g, "_is_pg", False)
+    ph           = "%s" if is_pg else "?"
+    now          = datetime.now(timezone.utc).isoformat()
+    sess_token   = secrets.token_urlsafe(32)
+
     if is_pg:
         upsert = f"""
-            INSERT INTO users (github_id, login, avatar_url, access_token, created_at)
-            VALUES ({ph},{ph},{ph},{ph},{ph})
+            INSERT INTO users (github_id, login, avatar_url, access_token, session_token, monthly_limit, plan, created_at)
+            VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})
             ON CONFLICT(github_id) DO UPDATE SET
-              login=EXCLUDED.login, avatar_url=EXCLUDED.avatar_url, access_token=EXCLUDED.access_token
+              login=EXCLUDED.login, avatar_url=EXCLUDED.avatar_url,
+              access_token=EXCLUDED.access_token, session_token=EXCLUDED.session_token
         """
         cur = db.cursor()
-        cur.execute(upsert, (user["id"], user["login"], user.get("avatar_url",""), access_token, now))
+        cur.execute(upsert, (user["id"], user["login"], user.get("avatar_url",""),
+                             access_token, sess_token, 5, "free", now))
         db.commit(); cur.close()
     else:
         db.execute(f"""
-            INSERT INTO users (github_id, login, avatar_url, access_token, created_at)
-            VALUES ({ph},{ph},{ph},{ph},{ph})
+            INSERT INTO users (github_id, login, avatar_url, access_token, session_token, monthly_limit, plan, created_at)
+            VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})
             ON CONFLICT(github_id) DO UPDATE SET
-              login=excluded.login, avatar_url=excluded.avatar_url, access_token=excluded.access_token
-        """, (user["id"], user["login"], user.get("avatar_url",""), access_token, now))
+              login=excluded.login, avatar_url=excluded.avatar_url,
+              access_token=excluded.access_token, session_token=excluded.session_token
+        """, (user["id"], user["login"], user.get("avatar_url",""),
+              access_token, sess_token, 5, "free", now))
         db.commit()
-    return redirect("/dashboard")
+
+    return redirect(f"{FRONTEND_ORIGIN}/auth?user={user['login']}&token={sess_token}")
 
 @app.route("/logout")
 def logout():
@@ -585,10 +681,63 @@ def _render_dashboard(user, stats, recent, repos):
 
 # ── API ────────────────────────────────────────────────────────────────────────
 
+@app.route("/api/stats")
+def api_stats():
+    token_u = _token_user()
+    sess_u  = current_user()
+    if not token_u and not sess_u:
+        return jsonify({"error": "unauthorized"}), 401
+    login = (token_u or sess_u)["login"]
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph    = "%s" if is_pg else "?"
+
+    if is_pg:
+        month_filter = f"AND created_at >= date_trunc('month', NOW())"
+    else:
+        month_filter = f"AND created_at >= strftime('%Y-%m-01','now')"
+
+    monthly = _query(
+        f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND error IS NULL {month_filter}",
+        (login,), one=True,
+    )
+    total   = _query(
+        f"SELECT COUNT(*) AS cnt FROM reviews WHERE installed_by = {ph} AND error IS NULL",
+        (login,), one=True,
+    )
+    repos   = _query(
+        f"SELECT COUNT(DISTINCT owner||'/'||repo) AS cnt FROM reviews WHERE installed_by = {ph}",
+        (login,), one=True,
+    )
+    user_row = _query(f"SELECT monthly_limit, plan FROM users WHERE login = {ph}", (login,), one=True)
+    limit   = user_row.get("monthly_limit", 5) if user_row.get("github_id") else 5
+
+    return jsonify({
+        "reviews_this_month": monthly.get("cnt") or 0,
+        "monthly_limit":      limit,
+        "total_reviews":      total.get("cnt") or 0,
+        "repos_count":        repos.get("cnt") or 0,
+    })
+
+
 @app.route("/api/reviews")
-@login_required
 def api_reviews():
-    rows = _query("SELECT * FROM reviews ORDER BY created_at DESC LIMIT 200")
+    token_u = _token_user()
+    sess_u  = current_user()
+    if not token_u and not sess_u:
+        return jsonify({"error": "unauthorized"}), 401
+    login = (token_u or sess_u)["login"]
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph    = "%s" if is_pg else "?"
+
+    rows = _query(
+        f"""SELECT id, pr_title, owner||'/'||repo AS repo, pr_url,
+                   num_findings AS findings,
+                   CASE WHEN error IS NOT NULL THEN 'failed' ELSE 'completed' END AS status,
+                   created_at
+            FROM reviews WHERE installed_by = {ph}
+            ORDER BY created_at DESC LIMIT 50""",
+        (login,),
+    )
     return jsonify(rows)
 
 
@@ -658,6 +807,10 @@ def webhook():
 
     if not github_token:
         return jsonify({"ok": False, "error": "no_token"}), 500
+
+    if not _within_limit(installed_by):
+        print(f"[webhook] {installed_by} monthly limit reached — skipping {owner}/{repo}#{pr_num}", flush=True)
+        return jsonify({"ok": True, "skipped": "monthly_limit_reached"})
 
     Thread(
         target=_run_review,
