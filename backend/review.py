@@ -42,7 +42,7 @@ MAX_DIFF_CHARS   = 24_000
 MAX_COMMENTS     = 25
 
 USE_OPENAI = bool(OPENAI_KEY and not ANTHROPIC_KEY)
-MODEL          = "gpt-4o" if USE_OPENAI else os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+MODEL          = os.environ.get("OPENAI_MODEL", "gpt-4o") if USE_OPENAI else os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
 
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────────
