@@ -262,49 +262,40 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
     print(f"[review] {owner}/{repo}#{pr_num}", flush=True)
     t0 = time.time()
 
-    # ── Ensure graph is built (clone + build if needed) ───────────────────────
+    # ── Graph context (self-hosted only — hosted service uses diff only) ────────
+    # On the hosted service we never clone repos. Code stays on GitHub.
+    # Full graph analysis is available for self-hosted deployments (BYOK + Docker).
     graph_available = False
     graph_ctx = ""
-    if _HAS_GRAPH_SVC:
+    if _HAS_GRAPH_SVC and os.environ.get("ENABLE_GRAPH_CLONE") == "1":
+        # Only enabled when operator explicitly opts in (self-hosted deployments)
         try:
             graph_available = ensure_graph(owner, repo, github_token, head_sha)
         except Exception as e:
             print(f"[graph] ensure failed: {e}", flush=True)
 
-    # ── Fetch diff to get changed files for blast-radius ──────────────────────
-    if graph_available:
-        try:
-            diff_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}"
-            req = urllib.request.Request(
-                diff_url,
-                headers={"Authorization": f"Bearer {github_token}",
-                         "Accept": "application/vnd.github.diff",
-                         "User-Agent": "graperoot-review/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                diff_text = r.read().decode("utf-8", errors="replace")
-
-            import re as _re
-            changed_files = _re.findall(r"diff --git a/.+ b/(.+)", diff_text)
-
-            impact = graph_impact(owner, repo, changed_files)
-            if impact.get("ok"):
-                summary = impact.get("summary", "")
-                affected = impact.get("affected_files", [])[:8]
-                recommended = impact.get("recommended_reads", changed_files[:3])
-
-                graph_ctx = f"### Blast Radius\n{summary}\n"
-                excerpts = []
-                for ref in recommended[:4]:
-                    text = graph_read_symbol(owner, repo, ref)
-                    if text:
-                        excerpts.append(f"### {ref}\n{text[:600]}")
-                if excerpts:
-                    graph_ctx += "\n### Key Symbol Excerpts\n" + "\n\n".join(excerpts)
-
-                print(f"[graph] blast-radius: {len(affected)} affected files", flush=True)
-        except Exception as e:
-            print(f"[graph] context failed: {e}", flush=True)
+        if graph_available:
+            try:
+                diff_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}"
+                req = urllib.request.Request(
+                    diff_url,
+                    headers={"Authorization": f"Bearer {github_token}",
+                             "Accept": "application/vnd.github.diff",
+                             "User-Agent": "graperoot-review/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    diff_text = r.read().decode("utf-8", errors="replace")
+                import re as _re
+                changed_files = _re.findall(r"diff --git a/.+ b/(.+)", diff_text)
+                impact = graph_impact(owner, repo, changed_files)
+                if impact.get("ok"):
+                    graph_ctx = f"### Blast Radius\n{impact.get('summary','')}\n"
+                    for ref in impact.get("recommended_reads", changed_files[:3])[:4]:
+                        text = graph_read_symbol(owner, repo, ref)
+                        if text:
+                            graph_ctx += f"\n### {ref}\n{text[:600]}"
+            except Exception as e:
+                print(f"[graph] context failed: {e}", flush=True)
 
     # ── Run review subprocess ─────────────────────────────────────────────────
     json_out = f"/tmp/review-{owner}-{repo}-{pr_num}.json"
@@ -628,29 +619,24 @@ def webhook():
     event = request.headers.get("X-GitHub-Event", "")
     data  = request.get_json(force=True) or {}
 
-    # ── App installed on a repo → pre-build graph ────────────────────────────
+    # ── App installed → just log it (no cloning on hosted service) ───────────
     if event == "installation" and data.get("action") == "created":
-        token = _get_token(data)
-        for repo_info in data.get("repositories", []):
-            parts = repo_info.get("full_name", "").split("/", 1)
-            if len(parts) == 2:
-                owner, repo = parts
-                Thread(target=_build_graph_bg, args=(owner, repo, token), daemon=True).start()
-                print(f"[webhook] queued graph build for {owner}/{repo}", flush=True)
-        return jsonify({"ok": True, "action": "graph_build_queued"})
+        repos = [r.get("full_name","") for r in data.get("repositories", [])]
+        print(f"[webhook] app installed by {data.get('installation',{}).get('account',{}).get('login','')} on {repos}", flush=True)
+        return jsonify({"ok": True, "action": "installation_noted"})
 
-    # ── Push to default branch → rebuild graph ───────────────────────────────
+    # ── Push: only rebuild graph if self-hosted mode enabled ─────────────────
     if event == "push":
-        ref     = data.get("ref", "")
-        default = data.get("repository", {}).get("default_branch", "main")
-        if ref == f"refs/heads/{default}":
-            owner    = data["repository"]["owner"]["login"]
-            repo     = data["repository"]["name"]
-            head_sha = data.get("after", "")
-            token    = _get_token(data)
-            Thread(target=_build_graph_bg, args=(owner, repo, token, head_sha), daemon=True).start()
-            print(f"[webhook] push → queued graph rebuild for {owner}/{repo}@{head_sha[:7]}", flush=True)
-        return jsonify({"ok": True, "action": "graph_rebuild_queued"})
+        if os.environ.get("ENABLE_GRAPH_CLONE") == "1":
+            ref     = data.get("ref", "")
+            default = data.get("repository", {}).get("default_branch", "main")
+            if ref == f"refs/heads/{default}":
+                owner    = data["repository"]["owner"]["login"]
+                repo     = data["repository"]["name"]
+                head_sha = data.get("after", "")
+                token    = _get_token(data)
+                Thread(target=_build_graph_bg, args=(owner, repo, token, head_sha), daemon=True).start()
+        return jsonify({"ok": True})
 
     # ── Pull request → review ────────────────────────────────────────────────
     if event != "pull_request":
