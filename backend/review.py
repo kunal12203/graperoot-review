@@ -658,15 +658,16 @@ def claude_review(
             f"### Intent\n{linked_issue or '(none)'}\n"
         )
         if pat:
-            # Filter BOTH the diff and file content to only pattern-relevant sections
-            # This keeps the model focused on the specific pattern being checked
-            filtered_diff  = _filter_diff(diff_text, pat, window=win)
-            filtered_files = _extract_relevant(file_context, pat, win)
-            diff_part  = f"### Changed lines matching this check's pattern\n```diff\n{filtered_diff[:8000]}\n```\n"
-            file_part  = f"### File sections matching this check's pattern\n{filtered_files[:5000]}\n"
+            # Tight filter: extract ONLY pattern-matching lines + small window.
+            # Target total context: 2-4k chars — same ballpark as the 251-char
+            # snippet where gpt-4o reliably found the bug. More = noise = [].
+            filtered_diff  = _filter_diff(diff_text, pat, window=min(win, 5))
+            filtered_files = _extract_relevant(file_context, pat, min(win, 5))
+            diff_part  = f"### Changed lines (filtered to this check's pattern)\n```diff\n{filtered_diff[:2500]}\n```\n"
+            file_part  = f"### File sections (filtered)\n{filtered_files[:1500]}\n"
         else:
-            diff_part  = f"### Diff\n```diff\n{diff_text[:8000]}\n```\n"
-            file_part  = f"### File content\n{file_context[:3000]}\n"
+            diff_part  = f"### Diff\n```diff\n{diff_text[:4000]}\n```\n"
+            file_part  = f"### File content\n{file_context[:2000]}\n"
         return header + diff_part + file_part
 
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
