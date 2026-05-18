@@ -435,12 +435,17 @@ DO NOT report guarded divisions. A guard 2 lines above is protection, not a bug.
     ("n_plus_one", _check_prompt("n-plus-one",
         "N+1 query pattern — ORM/DB calls inside loops",
         """For every loop (for, while, forEach, map) in the diff:
-- Does the loop body call an ORM/DB query? (Model.objects.filter/get/exists,
-  session.query, findMany, db.execute, SELECT inside loop)
-- If yes: this is N+1. Report as HIGH with the loop + inner query.
-  Suggest: fetch the full set before the loop using filter(id__in=ids) or equivalent.
-Also check: custom list/retrieve that calls get_queryset() without filter_queryset() —
-this silently bypasses all filter backends. Report as HIGH.""")),
+- Does the loop body call an ORM/DB query? (Model.objects.filter/get/exists/create,
+  session.query, findMany, db.execute, executeQuery, SELECT inside loop)
+- If yes: THIS IS N+1. Report as HIGH with the exact loop line AND inner query line.
+  It does not matter if it's for validation, checking, or processing — any ORM call
+  inside a for-loop is N+1 by definition. The fix is always to fetch the full set
+  before the loop: filter(id__in=ids).exists() or filter(uuid__in=uuids).
+Example of N+1 to catch:
+  for uuid in submission_uuids:
+      if Model.objects.filter(uuid=uuid).exists():  ← N+1: 1 query per iteration
+Also check: custom list()/retrieve() that calls self.get_queryset() directly without
+self.filter_queryset() wrapper — this silently bypasses all filter backends. HIGH.""")),
 
     ("falsy_traps", _check_prompt("falsy-trap",
         "boolean / falsy evaluation traps on collections",
@@ -632,24 +637,36 @@ def claude_review(
         extracted = "\n".join(lines[i] for i in sorted(keep))
         return extracted
 
+    def _filter_diff(raw_diff: str, pattern: re.Pattern, window: int) -> str:
+        """Extract only diff lines (+/-) matching pattern plus surrounding context."""
+        lines = raw_diff.splitlines()
+        keep: set[int] = set()
+        for i, line in enumerate(lines):
+            # Only match added/removed lines (not context lines starting with space)
+            if (line.startswith("+") or line.startswith("-") or line.startswith("@@") or line.startswith("diff")) and pattern.search(line):
+                for j in range(max(0, i - window), min(len(lines), i + window + 1)):
+                    keep.add(j)
+        if not keep:
+            return raw_diff[:4000]  # fallback: first 4k
+        return "\n".join(lines[i] for i in sorted(keep))
+
     def _build_check_context(check_name: str) -> str:
         pat, win = _CHECK_CFG.get(check_name, (None, 5))
         header = (
             f"## PR: {pr_title}\n\n"
-            f"### Description\n{pr_body[:400] or '(none)'}\n\n"
+            f"### Description\n{pr_body[:300] or '(none)'}\n\n"
             f"### Intent\n{linked_issue or '(none)'}\n"
         )
-        # checks that need more diff coverage (bugs deeper in large diffs)
-        big_diff = ("security", "arch", "n_plus_one", "falsy_traps", "api_compat")
-        diff_limit = 16000 if check_name in big_diff else 9000
-        file_limit = 3000 if check_name in big_diff else 7000
-
-        diff_part = f"### Diff (exactly what changed)\n```diff\n{diff_text[:diff_limit]}\n```\n"
-        if pat and file_context:
-            raw = _extract_relevant(file_context, pat, win)
-            file_part = f"### Relevant code sections\n{raw[:file_limit]}\n"
+        if pat:
+            # Filter BOTH the diff and file content to only pattern-relevant sections
+            # This keeps the model focused on the specific pattern being checked
+            filtered_diff  = _filter_diff(diff_text, pat, window=win)
+            filtered_files = _extract_relevant(file_context, pat, win)
+            diff_part  = f"### Changed lines matching this check's pattern\n```diff\n{filtered_diff[:8000]}\n```\n"
+            file_part  = f"### File sections matching this check's pattern\n{filtered_files[:5000]}\n"
         else:
-            file_part = f"### File content\n{file_context[:3000]}\n"
+            diff_part  = f"### Diff\n```diff\n{diff_text[:8000]}\n```\n"
+            file_part  = f"### File content\n{file_context[:3000]}\n"
         return header + diff_part + file_part
 
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
