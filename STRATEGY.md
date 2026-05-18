@@ -67,7 +67,7 @@ The frame:
 Every public asset (landing page, README, launch post, ads) should hit these three claims in this order:
 
 1. **Sovereignty.** Your code never leaves your machine. No OpenAI, no Anthropic-cloud, no vendor seeing your IP.
-2. **Determinism.** Every finding is tagged `AST-FACT` (proven from the dependency graph) or `LLM-HEURISTIC` (model guess, flagged as such). Trust is built by showing your work.
+2. **Determinism.** Every finding carries one of three provenance tags: `[AST-FACT]` (zero false positives by construction), `[AST-HEURISTIC]` (graph-derived, known FP modes disclosed), or `[LLM-HEURISTIC]` (model guess, explicitly flagged). Trust is built by showing your work.
 3. **Economics.** No per-seat pricing. No per-PR inference cost. Pay once for GrapeRoot; review is free.
 
 ### 2.3 Tone
@@ -80,21 +80,38 @@ Every public asset (landing page, README, launch post, ads) should hit these thr
 
 ## 3. The Product — What We Are Actually Building
 
-### 3.1 The two-tier output model (the core feature)
+### 3.1 The three-tier output model (the core feature)
 
-Every comment GrapeRoot Review posts on a PR is tagged with provenance:
+Every comment GrapeRoot Review posts on a PR carries exactly one provenance tag. No exceptions.
 
-**Tier 1: `[AST-FACT]`** — Deterministic graph queries. Zero false positives by construction.
-- "This signature change breaks 11 callers: [list with file:line]"
-- "This new function has no callers from any entry point"
-- "This exported symbol has no test coverage"
-- "This module now imports from X for the first time — coupling change"
+**Tier 1: `[AST-FACT: <check-name>]`** — Derived purely from the dependency graph by deterministic traversal. Zero false positives by construction.
 
-**Tier 2: `[LLM-HEURISTIC]`** — Model-generated suggestions. Explicitly marked as guesses.
+Contract: if any input to the check is uncertain — dynamic dispatch detected, parse failure in a caller, missing or incomplete graph edge, import aliasing that cannot be statically resolved — the check returns **no finding** rather than an uncertain one. A silent miss is acceptable; an incorrect `[AST-FACT]` is not.
+
+Examples of valid [AST-FACT] findings:
+- "This signature change has 11 static callers: [list with file:line]" ← only after dynamic dispatch is ruled out per caller
+- "This new function has zero callers in the static call graph" ← only if graph coverage for this module is confirmed complete
+
+Examples that are NOT [AST-FACT]:
+- "This function probably has no callers" — the word "probably" disqualifies it
+- Dead-code in Python/TypeScript — dynamic import, `__all__`, decorators, and monkey patching create too many undetectable call paths
+- Untested public API in Python/TypeScript — test detection relies on file-name heuristics, not CFG
+
+**Tier 2: `[AST-HEURISTIC: <check-name>]`** — Derived from the graph but with known false-positive modes that cannot be eliminated by construction. The graph provides the signal; uncertainty is inherent in the check.
+
+Examples:
+- "This module now imports X for the first time" — coupling drift. FP mode: transitive re-export may have existed before.
+- "These files import from the changed module and may be affected" — blast radius when dynamic dispatch cannot be confirmed absent per caller.
+- "This exported symbol has no references in `*test*` files" — FP mode: tests may be in a different repo or use dynamic test generation.
+
+**Tier 3: `[LLM-HEURISTIC: <check-name>]`** — Model-generated. Explicitly marked as a guess. Can be wrong. Must still cite the exact code from context to be posted.
+
+Examples:
 - "This loop may be O(n²) on input size N"
-- "This naming is inconsistent with the rest of the file"
+- "make_null_session body never references app — asymmetric with sansio siblings"
+- "accessed default changed False→True: behavioral change for callers"
 
-Competitors blend these. GrapeRoot separates them. The provenance label is the single most defensible UX feature, because it solves the #1 user complaint in the entire category (false positives).
+Competitors blend all three. GrapeRoot separates them. The provenance tag is the single most defensible UX feature — it solves the #1 complaint across the entire category (false positives) by making uncertainty explicit rather than hiding it.
 
 ### 3.2 The 10 deterministic graph checks (v1 scope)
 
@@ -276,7 +293,7 @@ The review bot is a **free feature** of GrapeRoot in v1. Goal: user acquisition 
 - **No silent failures.** Log clearly on the user's machine.
 - **No telemetry by default.** Opt-in only.
 - **No external network calls in the deterministic tier.** Airgapped must work.
-- **Every comment posted to a PR is tagged.** `[AST-FACT: <check-name>]` or `[LLM-HEURISTIC: <check-name>]`. No exceptions.
+- **Every comment posted to a PR carries exactly one tier tag.** Format: `[AST-FACT: <check-name>]`, `[AST-HEURISTIC: <check-name>]`, or `[LLM-HEURISTIC: <check-name>]`. A comment with no tag or an ambiguous tag must not be posted. No exceptions.
 - **Error messages help, not embarrass.**
 - **Tests live next to code.** `checks/blast_radius.py` → `checks/blast_radius_test.py`
 - **Every check has 3 tests:** happy path, edge case, false-positive-prevention.
