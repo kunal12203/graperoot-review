@@ -744,7 +744,12 @@ def claude_review(
     for t in threads: t.join(timeout=200)
 
     # ── Run static detectors (no LLM, deterministic) ─────────────────────────
-    static = detect_n_plus_one(diff_text) + detect_falsy_traps(diff_text)
+    static = (
+        detect_n_plus_one(diff_text) +
+        detect_falsy_traps(diff_text) +
+        detect_rust_index_panics(diff_text) +
+        detect_rust_unwrap_panics(diff_text)
+    )
     for f in static:
         print(f"  [static:{f['check']}] {f['title'][:60]}")
 
@@ -911,6 +916,94 @@ def detect_falsy_traps(diff_text: str) -> list[dict]:
                     "check": "falsy_traps",
                 })
                 break  # one finding per line
+    return findings
+
+
+# ── Rust-specific static detectors ────────────────────────────────────────────
+
+def detect_rust_index_panics(diff_text: str) -> list[dict]:
+    """Detect direct Vec/slice indexing in Rust that can panic at runtime.
+
+    Rust panics when index >= len(). The safe alternative is .get(i) which
+    returns Option<T>. We flag direct indexing where no bounds check precedes it.
+
+    Catches Greptile-class findings like:
+      plan.hashes[pos as usize]     ← panics if pos >= plan.hashes.len()
+      plan.new_contents[i]          ← panics if i >= plan.new_contents.len()
+    """
+    findings: list[dict] = []
+    lines = diff_text.splitlines()
+    # Match direct indexing: anything[expr] on an added line
+    index_re = re.compile(r'^\+.*\b(\w+)\[([^\]]+)\]', re.I)
+    # Patterns that constitute a valid bounds check
+    bounds_re = re.compile(r'\.get\(|\.len\(\)|< \w+\.len|>= \w+\.len|\bif\b.*\blen\b|\bpanic\b|\bassert\b', re.I)
+
+    for i, line in enumerate(lines):
+        if not line.startswith("+"):
+            continue
+        m = index_re.match(line)
+        if not m:
+            continue
+        container, expr = m.group(1), m.group(2).strip()
+        # Skip: integer literals, string keys, simple constants — only flag dynamic expressions
+        if re.match(r'^["\'\d]', expr) or expr.isupper():
+            continue
+        # Skip if there's a bounds check in the preceding 12 added lines
+        preceding = [lines[j] for j in range(max(0, i-12), i) if lines[j].startswith("+")]
+        if any(bounds_re.search(l) for l in preceding):
+            continue
+        # Also skip if the line itself uses .get() pattern
+        if ".get(" in line:
+            continue
+        findings.append({
+            "file":     _detect_file_from_diff(lines, i),
+            "line":     i,
+            "severity": "HIGH",
+            "title":    f"[LLM-HEURISTIC: rust-bounds] `{container}[{expr[:30]}]` panics if index out of bounds",
+            "comment":  f"Direct indexing panics at runtime when `{expr}` >= `{container}.len()`.\n"
+                        f"Fix: use `{container}.get({expr})` which returns `Option<_>`, then handle `None`.\n\n"
+                        f"Code: `{line.strip()[1:].strip()}`",
+            "check": "rust_bounds",
+        })
+    return findings
+
+
+def detect_rust_unwrap_panics(diff_text: str) -> list[dict]:
+    """Detect .unwrap() on Result/Option in production Rust code.
+
+    .unwrap() panics on Err/None. In production paths this causes silent
+    crashes. Use ? operator, expect("reason"), or proper error handling.
+    Skips test files (tests are allowed to unwrap).
+    """
+    findings: list[dict] = []
+    lines = diff_text.splitlines()
+    unwrap_re = re.compile(r'^\+.*\b(unwrap|expect)\s*\(', re.I)
+
+    for i, line in enumerate(lines):
+        if not line.startswith("+"):
+            continue
+        m = unwrap_re.search(line)
+        if not m:
+            continue
+        file_path = _detect_file_from_diff(lines, i)
+        # Skip test files
+        if any(x in file_path for x in ("test", "spec", "mock", "fixture")):
+            continue
+        # Skip if it's in a comment
+        stripped = line.strip()
+        if stripped.startswith("+//") or stripped.startswith("+#"):
+            continue
+        method = m.group(1)
+        findings.append({
+            "file":     file_path,
+            "line":     i,
+            "severity": "MEDIUM",
+            "title":    f"[LLM-HEURISTIC: rust-unwrap] `.{method}()` panics on None/Err in production code",
+            "comment":  f"`.{method}()` causes a runtime panic when the value is `None` or `Err`.\n"
+                        f"In production paths, use `?` to propagate errors, or handle the failure explicitly.\n\n"
+                        f"Code: `{line.strip()[1:].strip()}`",
+            "check": "rust_unwrap",
+        })
     return findings
 
 
