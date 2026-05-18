@@ -483,6 +483,109 @@ def _ast_fact_blast_radius(
     }
 
 
+def _graph_semantic_examples(
+    owner: str,
+    repo: str,
+    changed_files: list[str],
+    head_sha: str,
+    github_token: str,
+    max_examples: int = 4,
+) -> str:
+    """
+    Find existing (non-diff) files in the repo that use the same frameworks/patterns
+    as the changed files. Read them and return as 'correct pattern examples from codebase'.
+
+    This is the graph_read equivalent for the hosted service — instead of reading symbols
+    from a local MCP server, we query the graph edges to find sibling files (same framework,
+    not in diff) and fetch their content via GitHub API.
+
+    Example: if views.py is changed and uses DRF, find other views.py files in the repo
+    that correctly call filter_queryset. Pre-inject those as semantic context so the model
+    can compare the new code against proven correct patterns.
+    """
+    if not _HAS_GRAPH_SVC:
+        return ""
+
+    try:
+        from graph_service import _load_graph
+        g = _load_graph(owner, repo)
+        if not g:
+            return ""
+    except Exception:
+        return ""
+
+    # Extract third-party imports from changed files (what frameworks are being used)
+    changed_imports: set[str] = set()
+    for cf in changed_files[:4]:
+        source = _gh_file_content(owner, repo, cf, head_sha, github_token)
+        if not source:
+            continue
+        # Find import statements
+        for m in re.findall(r'(?:from|import)\s+([\w.]+)', source):
+            top = m.split('.')[0]
+            # Only third-party (not stdlib, not relative, not the repo's own packages)
+            if top and top not in ('os','sys','re','json','time','typing','collections',
+                                   'pathlib','datetime','abc','functools','itertools',
+                                   'threading','subprocess','urllib','base64','hashlib'):
+                changed_imports.add(top)
+
+    if not changed_imports:
+        return ""
+
+    # Walk the graph's file nodes to find files NOT in the diff that share imports
+    changed_set = set(changed_files)
+    nodes = g.get("nodes", [])
+    edges = g.get("edges", [])
+
+    # Build: file → set of modules it imports (from graph edges)
+    file_imports: dict[str, set[str]] = {}
+    for edge in edges:
+        frm = str(edge.get("from", ""))
+        to  = str(edge.get("to",  ""))
+        if frm and to:
+            file_imports.setdefault(frm, set()).add(to.split(".")[0])
+
+    # Candidate files: share at least one third-party import, not in diff
+    candidates: list[tuple[int, str]] = []  # (overlap_count, path)
+    for file_path, imports in file_imports.items():
+        if file_path in changed_set:
+            continue
+        if not file_path.endswith((".py", ".ts", ".js", ".go")):
+            continue
+        overlap = len(imports & changed_imports)
+        if overlap > 0:
+            candidates.append((overlap, file_path))
+
+    # Prefer files with more framework overlap + similar basename
+    changed_basenames = {cf.rsplit("/", 1)[-1] for cf in changed_files}
+    candidates.sort(key=lambda x: (
+        -x[0],  # more overlap first
+        0 if x[1].rsplit("/", 1)[-1] in changed_basenames else 1,  # same basename preferred
+    ))
+
+    examples: list[str] = []
+    for _, file_path in candidates[:max_examples]:
+        content = _gh_file_content(owner, repo, file_path, head_sha, github_token)
+        if not content:
+            continue
+        # Trim to the most relevant section (first 1200 chars captures class/function defs)
+        snippet = content[:1200]
+        examples.append(
+            f"### {file_path}  [existing file — same framework, NOT in diff]\n"
+            f"```\n{snippet}\n```"
+        )
+        print(f"[semantic] pre-injected example: {file_path}", flush=True)
+
+    if not examples:
+        return ""
+
+    return (
+        "### Codebase pattern examples (how this framework is used correctly elsewhere)\n"
+        "Use these to understand expected contracts and compare against the new code in the diff.\n\n"
+        + "\n\n".join(examples)
+    )
+
+
 def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by, review_id=None):
     pr_url_gh = pr_url or f"https://github.com/{owner}/{repo}/pull/{pr_num}"
     print(f"[review] {owner}/{repo}#{pr_num}", flush=True)
@@ -525,6 +628,15 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
                         content = _gh_file_content(owner, repo, file_path, head_sha, github_token)
                         if content:
                             graph_ctx += f"\n### {file_path}  [affected by this PR]\n```\n{content[:1500]}\n```\n"
+
+                    # ── Semantic pre-injection: correct pattern examples from codebase ──
+                    # Finds existing files using the same frameworks (not in diff),
+                    # reads them to show the model how contracts are correctly fulfilled.
+                    semantic_examples = _graph_semantic_examples(
+                        owner, repo, changed_files_for_graph, head_sha, github_token
+                    )
+                    if semantic_examples:
+                        graph_ctx += f"\n{semantic_examples}\n"
 
                     # [AST-FACT: blast-radius] — hard invariant: emit nothing on uncertainty
                     ast_fact_finding = _ast_fact_blast_radius(

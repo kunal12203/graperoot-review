@@ -393,9 +393,12 @@ def _check_prompt(tag: str, focus: str, rules: str) -> str:
 {rules}
 
 IMPORTANT:
-- Find ALL instances of the pattern — scan the entire diff and file content provided.
+- Find ALL instances of the pattern — scan the entire diff and file content.
 - Do not stop after the first finding. Report every distinct issue you see.
 - Quote the exact problematic line(s) from the provided code in your comment.
+- If "How this framework is correctly used in this codebase" section is present,
+  USE IT to understand what correct code looks like, then compare against the diff.
+  A discrepancy between the existing codebase pattern and the new code is a finding.
 - Do not invent code that is not in the context — if the pattern is absent, return [].
 - If you DO find the pattern, report it. Do not suppress real findings.
 
@@ -668,7 +671,20 @@ def claude_review(
         else:
             diff_part  = f"### Diff\n```diff\n{diff_text[:4000]}\n```\n"
             file_part  = f"### File content\n{file_context[:2000]}\n"
-        return header + diff_part + file_part
+
+        # Semantic pre-injection: correct pattern examples from the graph
+        # This is the key to catching semantic bugs — the model sees how the
+        # same framework/library is correctly used elsewhere in THIS codebase,
+        # then compares against the new code. Same as graph_read in GrapeRoot Pro.
+        if impact_summary and "existing file" in impact_summary:
+            # impact_summary contains codebase pattern examples from _graph_semantic_examples
+            semantic_part = f"### How this framework is correctly used in this codebase\n{impact_summary[:3000]}\n"
+        elif impact_summary and "Blast Radius" in impact_summary:
+            semantic_part = f"### Graph context\n{impact_summary[:1500]}\n"
+        else:
+            semantic_part = ""
+
+        return header + diff_part + file_part + semantic_part
 
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
     notes: dict[str, list[dict]] = {}
