@@ -585,17 +585,23 @@ def claude_review(
     # Solution: each check gets the diff (most important — shows what changed)
     # plus a filtered subset of file content containing lines relevant to it.
 
-    _CHECK_PATTERNS: dict[str, re.Pattern] = {
-        "arithmetic":  re.compile(r'[*/%.]\s|Number\(|BigInt\(|Math\.|NaN|Infinity', re.I),
-        "mutation":    re.compile(r'Object\.assign|\.update\(|\.merge\(|\.\.\.|spread', re.I),
-        "n_plus_one":  re.compile(r'for |while |forEach|\.map\(|\.filter\(|\.objects\.|session\.query|\.find\(|SELECT', re.I),
-        "falsy_traps": re.compile(r'\bor\b|\bif not\b|\bif !\b|\|\||\?\?|\.length|is None|is not None', re.I),
-        "arch":        re.compile(r'def |class |function |export |import |from ', re.I),
-        "quality":     re.compile(r'for |while |def |function |TODO|FIXME|docstring|"""', re.I),
+    # Patterns per check — extract only lines relevant to that check + surrounding context.
+    # Tight patterns = less noise = gpt-4o finds the actual bug.
+    # None = no pattern filter (use first N chars of file content as fallback).
+    _CHECK_CFG: dict[str, tuple[re.Pattern | None, int]] = {
+        # (pattern, context_window_lines)
+        "arithmetic":  (re.compile(r'[*/%.]\s|Number\(|BigInt\(|Math\.\w|NaN\b|Infinity\b', re.I), 6),
+        "mutation":    (re.compile(r'Object\.assign|\.update\s*\(|\.merge\s*\(|spread', re.I), 6),
+        "n_plus_one":  (re.compile(r'\bfor\b|\bwhile\b|\bforEach\b|\.objects\.\w|session\.query|executemany|\.find\s*\(|\.filter\s*\(', re.I), 8),
+        "falsy_traps": (re.compile(r'\bor\s+\w|\bif\s+not\b|\|\|\s|\?\?\s|page\s+or\b|\bnot\s+isinstance\b|is\s+None\b|is\s+not\s+None\b', re.I), 8),
+        # arch: ONLY class-level declarations (no imports/from — too noisy)
+        "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function )', re.M), 8),
+        # security: broad — auth, roles, errors, redirects, limits, secrets
+        "security":    (re.compile(r'auth|role|permiss|admin\b|error\b|redirect|limit\b|session\b|token\b|secret|password|notFound|guard\b|login|logout|signup|register|removeUser|deleteUser|banUser|currentUser', re.I), 12),
+        "quality":     (re.compile(r'\bfor\b|\bwhile\b|TODO|FIXME|"""|\'\'\'\s', re.I), 6),
     }
 
-    def _extract_relevant(content: str, pattern: re.Pattern, window: int = 5) -> str:
-        """Extract lines matching pattern plus window lines of context."""
+    def _extract_relevant(content: str, pattern: re.Pattern, window: int) -> str:
         lines = content.splitlines()
         keep: set[int] = set()
         for i, line in enumerate(lines):
@@ -603,19 +609,26 @@ def claude_review(
                 for j in range(max(0, i - window), min(len(lines), i + window + 1)):
                     keep.add(j)
         if not keep:
-            return content[:3000]   # fallback: first 3k if no matches
-        return "\n".join(lines[i] for i in sorted(keep))
+            return content[:2000]
+        extracted = "\n".join(lines[i] for i in sorted(keep))
+        return extracted
 
     def _build_check_context(check_name: str) -> str:
-        pat = _CHECK_PATTERNS.get(check_name)
-        header = f"## PR: {pr_title}\n\n### Description\n{pr_body[:500] or '(none)'}\n"
-        diff_part = f"\n### Diff (what changed)\n```diff\n{diff_text[:10000]}\n```\n"
+        pat, win = _CHECK_CFG.get(check_name, (None, 5))
+        header = (
+            f"## PR: {pr_title}\n\n"
+            f"### Description\n{pr_body[:400] or '(none)'}\n\n"
+            f"### Intent\n{linked_issue or '(none)'}\n"
+        )
+        diff_part = f"### Diff (exactly what changed)\n```diff\n{diff_text[:9000]}\n```\n"
         if pat and file_context:
-            filtered = _extract_relevant(file_context, pat, window=5)
-            file_part = f"\n### Relevant file sections (lines matching check pattern)\n{filtered[:8000]}\n"
+            raw = _extract_relevant(file_context, pat, win)
+            # Cap at 7k so total stays under 17k
+            file_part = f"### Relevant code sections\n{raw[:7000]}\n"
         else:
-            file_part = f"\n### File content\n{file_context[:4000]}\n"
-        return header + diff_part + file_part
+            file_part = f"### File content\n{file_context[:3000]}\n"
+        ctx = header + diff_part + file_part
+        return ctx
 
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
     notes: dict[str, list[dict]] = {}
