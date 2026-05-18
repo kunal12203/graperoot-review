@@ -483,6 +483,21 @@ Any change (False→True, None→value) is a behavioral change → report MEDIUM
 - Hard-coded limits silently truncating: `limit: 500` with no pagination cursor → data loss.
 - Exposed secrets or insecure defaults in the diff.""")),
 
+    ("api_compat", _check_prompt("api-compat",
+        "API/response shape changes that break existing callers",
+        """Compare the BASE version of each changed file with its HEAD version.
+Look for:
+1. FIELD MOVED: a field that was at the top level of a response/object is now nested inside another field.
+   Pattern: BASE has `{ error: "...", fieldName: value }`, HEAD has `{ error: "...", details: { fieldName: value } }`.
+   This breaks any caller that reads `response.fieldName` directly.
+2. FIELD RENAMED: a key was renamed without a compatibility alias.
+3. FIELD REMOVED: a key present in BASE is absent in HEAD.
+4. TYPE CHANGED: a field changed from string to array, from optional to required, etc.
+
+For each finding, cite the BASE line showing the old shape AND the HEAD line showing the new shape.
+Report as HIGH if existing callers will break silently (no error, wrong data).
+Report as MEDIUM if callers will get an explicit error (missing field, type mismatch).""")),
+
     ("quality", _check_prompt("quality-check",
         "algorithmic complexity, test gaps, dead code, documentation",
         """Check 1 — ALGORITHMIC COMPLEXITY:
@@ -598,9 +613,11 @@ def claude_review(
         "falsy_traps": (re.compile(r'\bor\s+\w|\bif\s+not\b|\|\|\s|\?\?\s|page\s+or\b|\bnot\s+isinstance\b|is\s+None\b|is\s+not\s+None\b', re.I), 8),
         # arch: ONLY class-level declarations (no imports/from — too noisy)
         "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function )', re.M), 8),
+        # api_compat: response/request shapes, field names, return values
+        "api_compat":  (re.compile(r'return\s*\{|response\.|\.json\(|body\s*=|\bdetails\b|\berror\b|\bmessage\b|\bdata\b|\bstatus\b|\btype\b.*:\s*\w', re.I), 8),
         # security: broad — auth, roles, errors, redirects, limits, secrets
         "security":    (re.compile(r'auth|role|permiss|admin\b|error\b|redirect|limit\b|session\b|token\b|secret|password|notFound|guard\b|login|logout|signup|register|removeUser|deleteUser|banUser|currentUser', re.I), 12),
-        "quality":     (re.compile(r'\bfor\b|\bwhile\b|TODO|FIXME|"""|\'\'\'\s', re.I), 6),
+        "quality":     (re.compile(r'\bfor\b|\bwhile\b|TODO|FIXME|"""|console\.\w|logger\.\w|\.log\(|\bprint\(', re.I), 6),
     }
 
     def _extract_relevant(content: str, pattern: re.Pattern, window: int) -> str:
