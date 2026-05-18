@@ -380,141 +380,107 @@ Rules:
 
 # ── Specialized agent prompts ─────────────────────────────────────────────────
 
-ARCH_PROMPT = """You are a senior architect. Your ONLY job: find what is MISSING, INCOMPLETE, or ASYMMETRIC in this PR.
+# ── Check pipeline ────────────────────────────────────────────────────────────
+# Each check has ONE job. All receive the same assembled context (graph + diff +
+# file content). Each returns a JSON array of findings (notes) or [].
+# The aggregator merges all notes into the final structured report.
+#
+# Adding a new check = add one entry to CHECKS list below. No other changes needed.
 
-ANTI-HALLUCINATION: Quote exact lines from the provided context. Do not invent code.
+def _check_prompt(tag: str, focus: str, rules: str) -> str:
+    return f"""You are doing ONE specific code review check: {focus}
 
-You MUST do these checks in order and report findings for EACH:
+ANTI-HALLUCINATION: Every finding must cite exact code from the provided context. Do not invent code.
+If you cannot find the exact code in the context, return [].
 
-STEP 1 — REFACTOR INVENTORY: List every class and public method/function in the BASE version of changed files.
-Then for each symbol NOT present in the HEAD or the new module:
-  - Read its BODY. Does the body actually use framework/platform-specific APIs, or does it only call
-    other methods that were already moved?
-  - If the body is framework-agnostic and the helpers it calls were moved → it's an ORPHAN, report HIGH.
-  - Do NOT apply Python/Flask terminology (sansio, SessionMixin, etc.) to non-Python projects.
-    Use the project's own language: for TypeScript use "shared module" or "utility layer".
+{rules}
 
-STEP 2 — SIBLING ASYMMETRY: Find methods moved to the new module. Find their sibling methods.
-If sibling A moved but sibling B did not, and B has no framework dependency in its body → flag B.
+Return a JSON ARRAY of findings (empty [] if nothing found):
+[{{
+  "file": "path/to/file",
+  "line": 0,
+  "severity": "CRITICAL|HIGH|MEDIUM|LOW",
+  "title": "[LLM-HEURISTIC: {tag}] one-line summary",
+  "comment": "explanation — quote the exact problematic line(s), then give the fix",
+  "suggestion": "corrected code if applicable"
+}}]
 
-STEP 3 — DEFAULT VALUE CHANGES: Compare class-level attribute defaults between BASE and HEAD.
-Any change (False→True, None→value) is a behavioral change → report as MEDIUM.
+Return ONLY the JSON array. No prose outside the array."""
 
-STEP 4 — MISSING FILES: Based on blast radius, which files that import changed modules are NOT in diff?
 
-Every inline comment title MUST begin with `[LLM-HEURISTIC: arch-check]`. Example:
-  "title": "[LLM-HEURISTIC: arch-check] make_null_session not moved to sansio"
+CHECKS = [
+    ("arithmetic", _check_prompt("arithmetic",
+        "arithmetic safety — division by zero, BigInt overflow, NaN propagation",
+        """For every division, modulo, and numeric conversion:
+- Division: read the 1-10 lines BEFORE the division. If there is an if(x===0){break/return/throw}
+  guard on the same code path, the division is protected — DO NOT REPORT IT.
+- BigInt←→float: Number(bigint) can be Infinity if bigint is large.
+  BigInt(Math.round(Infinity)) throws RangeError. Report only if no guard exists.
+- NaN propagation: where NaN silently replaces a numeric value.
+DO NOT report guarded divisions. A guard 2 lines above is protection, not a bug.""")),
 
-Return ONLY JSON:
-{
-  "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
-    "category":"refactor|contract","title":"[LLM-HEURISTIC: arch-check] ...","comment":"cite exact line","suggestion":"","graph_proven":false}],
-  "missing_from_diff": ["file paths that should have been in this PR"],
-  "jira_intent_check": {"matches_description":true,"gaps":[],"missing_files":[]}
-}"""
+    ("mutation", _check_prompt("mutation",
+        "mutation traps — Object.assign / spread / dict.update overwriting already-set keys",
+        """For every Object.assign(target, source), {...target, ...source}, dict.update(extra):
+- List keys already written to target (error, message, details, etc.)
+- Check if source (user input, options bag, extra param) can contain those same keys
+- If yes: source silently overwrites target — report as HIGH
+- Include the exact line and which key(s) can be overwritten.""")),
 
-SEC_PROMPT = """You are a security engineer reviewing a PR for bugs, vulnerabilities, and data integrity issues.
-Your ONLY job: find things that will crash, corrupt data, or behave incorrectly at runtime.
+    ("n_plus_one", _check_prompt("n-plus-one",
+        "N+1 query pattern — ORM/DB calls inside loops",
+        """For every loop (for, while, forEach, map) in the diff:
+- Does the loop body call an ORM/DB query? (Model.objects.filter/get/exists,
+  session.query, findMany, db.execute, SELECT inside loop)
+- If yes: this is N+1. Report as HIGH with the loop + inner query.
+  Suggest: fetch the full set before the loop using filter(id__in=ids) or equivalent.
+Also check: custom list/retrieve that calls get_queryset() without filter_queryset() —
+this silently bypasses all filter backends. Report as HIGH.""")),
 
-ANTI-HALLUCINATION: Every finding must cite the exact line(s) from the provided context. Do not invent code.
+    ("falsy_traps", _check_prompt("falsy-trap",
+        "boolean / falsy evaluation traps on collections",
+        """Look for these patterns:
+- `x or fallback` where x is a list, queryset, or paginator result:
+  empty list [] is falsy in Python/JS/Ruby, so [] or fallback returns fallback
+  even when the correct answer IS the empty result.
+  Classic: `page = paginator.paginate_queryset(...); data = page or queryset`
+  → if page=[], data becomes full queryset instead of empty page. Report CRITICAL.
+- `if not collection` that should distinguish None (absent) from [] (empty).
+- Any truthy check on a queryset object (QuerySets are always truthy even when empty).""")),
 
-Run these checks IN ORDER. Do not skip any.
+    ("arch", _check_prompt("arch-check",
+        "refactoring completeness — missing moves, orphaned methods, behavioral defaults",
+        """Check 1 — REFACTOR INVENTORY:
+List every class and public method in the BASE version of changed files.
+For each one NOT in the HEAD or the new module:
+  Read its body — does it call framework-specific APIs, or only helpers that were moved?
+  If body is framework-agnostic and its helpers moved → ORPHAN, report HIGH.
+  Use the project's own terminology (not Python/Flask-specific words for non-Python code).
 
-STEP 1 — ARITHMETIC SAFETY (highest priority):
-For every division, modulo, and numeric conversion in the diff:
-  a. Division/modulo: can the denominator ever be zero?
-     IMPORTANT: Before reporting, read the 1-10 lines immediately before the division.
-     If there is an `if (denominator === 0) { break/return/throw }` guard, the division
-     is protected — do NOT report it. Only report if NO guard exists on the code path
-     leading to the division.
-  b. BigInt↔float traps: `Number(bigint)` where bigint is large → Infinity.
-     Then `BigInt(Math.round(Infinity))` or `BigInt(Math.ceil(Infinity))` throws RangeError.
-     Again: check for guards before reporting.
-  c. NaN propagation: any place where NaN can silently replace a numeric value.
-Do NOT report false positives — a guarded division is not a bug.
+Check 2 — SIBLING ASYMMETRY:
+If method A moved to a new module but its sibling B (same class, related purpose) did not,
+and B has no framework dependency in its body → report HIGH.
 
-STEP 2 — MUTATION TRAPS (Object.assign, spread, merge):
-For every `Object.assign(target, source)` or `{...target, ...source}`:
-  a. List the keys already written to target before the assign.
-  b. Check if source can contain any of those same keys (user input, `extra` param, options bag).
-  c. If yes: source silently overwrites target's values — report as HIGH.
-     Exact pattern: `body = { error: code, message: msg }; Object.assign(body, extra)` →
-     if extra has `error` or `message`, they are overwritten.
+Check 3 — DEFAULT VALUE CHANGES:
+Compare class-level attribute defaults between BASE and HEAD.
+Any change (False→True, None→value) is a behavioral change → report MEDIUM with exact values.""")),
 
-STEP 3 — REDUNDANT / RACY OPERATIONS AND ORM ANTI-PATTERNS:
-  a. N+1 queries: a loop that calls Model.objects.filter/get/exists() once per iteration.
-     Any ORM query inside a for-loop is N+1 unless the full set was prefetched before the loop.
-     Fix: use filter(id__in=ids) or select_related/prefetch_related before the loop.
-  b. Same data fetched from network/DB/API twice in the same request — double fetch.
-  c. Missing filter application: a custom list/retrieve that calls get_queryset() directly
-     without wrapping in filter_queryset() — this silently bypasses all filter backends.
+    ("quality", _check_prompt("quality-check",
+        "algorithmic complexity, test gaps, dead code, documentation",
+        """Check 1 — ALGORITHMIC COMPLEXITY:
+For every loop, check if the loop body calls a helper that iterates over a collection.
+Pattern: for x in list → helper(x) where helper does list.find/filter/index/loop → O(n²).
+Report as HIGH with both the outer loop line and the inner scan line.
 
-STEP 4 — BOOLEAN / FALSY TRAPS (applies to Python, JS, Ruby):
-  a. `x or y` where x is a collection: empty list [] is falsy in Python/JS.
-     If x is a paginator result or queryset slice, `[] or fallback` silently returns
-     the full fallback when the correct answer is an empty result.
-     Pattern: `page = paginator.paginate_queryset(...); result = page or queryset`
-     → if page is [], result becomes queryset (wrong: returns everything instead of empty page).
-  b. Any `if not collection:` check that should distinguish "empty" from "absent".
+Check 2 — TEST GAPS:
+Risky code paths (error handling, edge cases, new business logic) with no visible test.
 
-STEP 4 — SECURITY (original focus):
-  - Injection, auth bypass, privilege escalation, insecure defaults, exposed secrets.
-  - Behavioral changes that affect callers (key ordering, default values, field semantics).
+Check 3 — DEAD CODE:
+Exported symbols with no importers according to the graph context.
 
-Every inline comment title MUST begin with `[LLM-HEURISTIC: security-check]`.
-
-Return ONLY JSON:
-{
-  "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
-    "category":"security|logic|performance|reliability","title":"[LLM-HEURISTIC: security-check] ...",
-    "comment":"cite exact line","suggestion":"","graph_proven":false}],
-  "sast_findings": [{"severity":"","rule":"","file":"","line":0,"detail":""}],
-  "secrets_found": [{"file":"","line":0,"type":"","value_preview":""}],
-  "attack_surface_delta": {"increased":[],"decreased":[],"net_risk":"NEUTRAL"}
-}"""
-
-QUAL_PROMPT = """You are a quality engineer reviewing a PR for reliability, performance, testability, and maintainability.
-Your ONLY job: find quality gaps.
-
-ANTI-HALLUCINATION: Every finding must cite exact code from the provided context.
-
-Run these checks IN ORDER:
-
-STEP 1 — ALGORITHMIC COMPLEXITY (often overlooked, high impact):
-For every loop in the diff:
-  a. Does the loop body call a function that itself iterates over a collection?
-     Pattern: `for x of list { list2.find(y => y.id === x.id) }` → O(n²).
-  b. Is there a helper function called on EVERY iteration that does a linear scan internally?
-     Look at the helper's body — does it contain `.find()`, `.filter()`, `.indexOf()`, or a for-loop?
-  c. If yes → report as HIGH with the outer loop + the inner scan, plus the O(n²) impact at scale.
-     Suggest: build a Map/Set once before the loop, look up in O(1) per iteration.
-
-STEP 2 — REDUNDANT COMPUTATIONS:
-  a. Is the same value computed or fetched more than once within a loop or function?
-  b. Could it be cached/memoized before the loop?
-  Report as MEDIUM.
-
-STEP 3 — TEST GAPS — risky code paths with no test coverage
-STEP 4 — DEAD CODE — exported symbols with no importers (use graph context)
-STEP 5 — COMPLEXITY — functions that are too long or deeply nested
-STEP 6 — DOCUMENTATION — docstring typos, missing spaces, run-on words
-STEP 7 — DUPLICATION — similar logic in multiple places
-
-Every inline comment title MUST begin with `[LLM-HEURISTIC: quality-check]`. Example:
-  "title": "[LLM-HEURISTIC: quality-check] Docstring missing space before backtick"
-
-Return ONLY JSON:
-{
-  "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
-    "category":"test|reliability|documentation","title":"[LLM-HEURISTIC: quality-check] ...",
-    "comment":"cite exact line","suggestion":"","graph_proven":false}],
-  "test_coverage_gaps": [{"file":"","function_or_class":"","risk":""}],
-  "dead_code": ["exported symbols with zero importers"],
-  "complex_functions": [{"file":"","function":"","cyclomatic_complexity":"high|very_high","reason":""}],
-  "duplicate_code": [{"files":[],"pattern":""}],
-  "quality_score": 0,
-  "security_grade": "A"
-}"""
+Check 4 — DOCUMENTATION:
+Docstring typos, missing spaces, run-on words. Cite the exact malformed text.""")),
+]
 
 
 def _parse_json(text: str) -> dict:
@@ -563,100 +529,96 @@ def claude_review(
     symbol_excerpts: str,
     file_context: str = "",
 ) -> dict:
-    """Run 3 specialized AI agents in parallel, verify findings, merge into one report."""
+    """
+    Pipeline: assemble context ONCE from graph, pass it through each focused check,
+    collect notes from all checks, aggregate into one structured report.
+    """
     import threading
 
     if not ANTHROPIC_KEY and not OPENAI_KEY:
         print("Set ANTHROPIC_API_KEY or OPENAI_API_KEY", file=sys.stderr)
         return {}
 
-    full_context = f"""## PR: {pr_title}
+    # ── Assemble context once ─────────────────────────────────────────────────
+    context = f"""## PR: {pr_title}
 
 ### Description
 {pr_body[:2000] or "(no description)"}
 
-### Linked Issue / Intent
+### Intent / Linked issue
 {linked_issue or "(none)"}
 
-### Diff (what changed)
+### Diff
 ```diff
 {diff_text[:MAX_DIFF_CHARS]}
 {"... (truncated)" if len(diff_text) > MAX_DIFF_CHARS else ""}
 ```
 
-### Full file content — BASE and HEAD versions + affected files
+### File content — BASE (before PR) and HEAD (after PR) of changed files
 {file_context or "(not available)"}
 
-### Blast radius — files connected to changed modules (graph)
+### Blast radius — files that import the changed modules (graph-derived)
 {impact_summary or "(not available)"}
 
 ### Key symbol excerpts
 {symbol_excerpts or "(none)"}"""
 
-    results: dict[str, dict] = {}
-    errors:  dict[str, str]  = {}
+    # ── Run all checks in parallel, each writing notes on ONE thing ───────────
+    notes: dict[str, list[dict]] = {}
 
-    def run_agent(name: str, system: str) -> None:
+    def run_check(name: str, system: str) -> None:
         try:
             if USE_OPENAI:
-                text = _openai_review(full_context, system_override=system)
+                raw = _openai_review(context, system_override=system)
             else:
-                text = _anthropic_review(full_context, system_override=system)
-            parsed = _parse_json(text)
-            print(f"  [{name}] {len(text)} chars → {len(parsed.get('inline_comments', []))} inline")
-            results[name] = parsed
+                raw = _anthropic_review(context, system_override=system)
+            # Each check returns a flat JSON array
+            raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
+            raw = re.sub(r"\n?```$", "", raw)
+            try:
+                parsed = json.loads(raw)
+                findings = parsed if isinstance(parsed, list) else parsed.get("inline_comments", [])
+            except json.JSONDecodeError:
+                m = re.search(r"\[.*\]", raw, re.DOTALL)
+                findings = json.loads(m.group(0)) if m else []
+            verified = _verify_findings(findings, context)
+            print(f"  [{name}] {len(raw)} chars → {len(verified)} findings")
+            notes[name] = verified
         except Exception as e:
-            errors[name] = str(e)
             print(f"  [{name}] FAILED: {e}", file=sys.stderr)
-            results[name] = {}
+            notes[name] = []
 
-    agents = [
-        ("arch", ARCH_PROMPT),
-        ("sec",  SEC_PROMPT),
-        ("qual", QUAL_PROMPT),
+    threads = [
+        threading.Thread(target=run_check, args=(name, prompt), daemon=True)
+        for name, prompt in CHECKS
     ]
-    threads = [threading.Thread(target=run_agent, args=(n, s), daemon=True) for n, s in agents]
     for t in threads: t.start()
     for t in threads: t.join(timeout=200)
 
-    # Merge all results
-    report: dict = {"pr_summary": f"PR: {pr_title}"}
-    all_inline: list[dict] = []
-    for name, result in results.items():
-        inline = result.get("inline_comments", [])
-        # Verify: only keep findings grounded in actual context
-        verified = _verify_findings(inline, full_context + diff_text)
-        all_inline.extend(verified)
-        # Merge list fields
-        for key in ("sast_findings","iac_findings","secrets_found","dead_code",
-                    "duplicate_code","complex_functions","test_coverage_gaps","missing_from_diff"):
-            if result.get(key):
-                report.setdefault(key, [])
-                report[key].extend(result[key])
-        # Merge dict fields
-        for key in ("blast_radius","attack_surface_delta","jira_intent_check","quality_gates"):
-            if result.get(key) and key not in report:
-                report[key] = result[key]
-        # Scalars
-        if result.get("quality_score") and "quality_score" not in report:
-            report["quality_score"] = result["quality_score"]
-        if result.get("security_grade") and "security_grade" not in report:
-            report["security_grade"] = result["security_grade"]
+    # ── Aggregate: merge all notes, dedup by title, sort by severity ──────────
+    all_findings: list[dict] = []
+    for name, findings in notes.items():
+        for f in findings:
+            f.setdefault("check", name)  # provenance
+        all_findings.extend(findings)
 
-    # Deduplicate inline comments by title
-    seen_titles: set[str] = set()
-    deduped: list[dict] = []
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    all_inline.sort(key=lambda c: sev_order.get(c.get("severity", "LOW"), 4))
-    for c in all_inline:
-        t = c.get("title", "").lower().strip()
-        if t not in seen_titles:
-            seen_titles.add(t)
-            deduped.append(c)
+    all_findings.sort(key=lambda c: sev_order.get(c.get("severity", "LOW"), 4))
 
-    report["inline_comments"] = deduped
-    print(f"  Total: {len(deduped)} inline after dedup+verify ({len(all_inline)} raw)")
-    return report
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for f in all_findings:
+        key = f.get("title", "").lower().strip()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+
+    print(f"  Total: {len(deduped)} findings after dedup ({len(all_findings)} raw across {len(CHECKS)} checks)")
+
+    return {
+        "pr_summary":      f"PR: {pr_title}",
+        "inline_comments": deduped,
+    }
 
 
 def _anthropic_review(user_msg: str, system_override: str = "") -> str:
