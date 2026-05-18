@@ -252,7 +252,10 @@ def parse_diff(diff: str) -> tuple[list[str], dict[str, str]]:
         if line.startswith("diff --git"):
             if current:
                 hunks[current] = "\n".join(current_lines[-80:])  # last 80 lines
-            m = re.search(r"b/(.+)$", line)
+            # `diff --git a/<old> b/<new>` — always take the rightmost b/ segment.
+            # For renamed/moved files the line has two paths; taking the last
+            # b/<path> correctly gives the new (HEAD) file path.
+            m = re.search(r" b/(.+)$", line)
             if m:
                 current = m.group(1)
                 files.append(current)
