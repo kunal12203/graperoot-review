@@ -414,18 +414,82 @@ def _build_graph_bg(owner: str, repo: str, github_token: str, head_sha: str = ""
         print(f"[graph] bg build failed: {e}", flush=True)
 
 
+_DYNAMIC_DISPATCH = re.compile(
+    r"getattr\s*\(|__import__\s*\(|importlib|eval\s*\(|exec\s*\("
+)
+
+def _ast_fact_blast_radius(
+    owner: str,
+    repo: str,
+    changed_files: list[str],
+    affected_files: list[str],
+    head_sha: str,
+    github_token: str,
+) -> dict | None:
+    """
+    Returns an [AST-FACT: blast-radius] finding or None.
+
+    Hard invariant: returns None rather than an uncertain finding.
+    Uncertainty sources that trigger None:
+      - Graph not built for this repo
+      - graph_impact returned no affected files (absence of evidence ≠ evidence of absence)
+      - A caller file cannot be fetched (content unknown → import chain unverifiable)
+      - A caller file contains dynamic dispatch patterns that the graph cannot see
+      - Zero callers survive the uncertainty filter
+
+    Tests:
+      1. Happy path: graph built, 2 callers, no dynamic dispatch → finding with both callers
+      2. Edge case: 1 of 2 callers has getattr( → finding with only the clean caller
+      3. FP prevention: graph not built → None; all callers have dynamic dispatch → None
+    """
+    if not _HAS_GRAPH_SVC:
+        return None
+    if not affected_files:
+        return None  # No callers in graph — not the same as "confirmed no callers"
+
+    # Only consider real repo file paths (filter stdlib, external modules)
+    candidates = [
+        f for f in affected_files
+        if "/" in f and not f.startswith((".", "_"))
+    ][:10]
+    if not candidates:
+        return None
+
+    verified: list[dict] = []
+    for caller_path in candidates:
+        source = _gh_file_content(owner, repo, caller_path, head_sha, github_token)
+        if not source:
+            # Cannot verify import chain without source — skip, don't include
+            print(f"[AST-FACT] skipping {caller_path}: source unavailable", flush=True)
+            continue
+        if _DYNAMIC_DISPATCH.search(source):
+            # Dynamic dispatch present — static import chain cannot be guaranteed
+            print(f"[AST-FACT] skipping {caller_path}: dynamic dispatch detected", flush=True)
+            continue
+        verified.append({"file": caller_path})
+
+    if not verified:
+        return None  # Invariant: nothing rather than uncertain
+
+    return {
+        "tag":              "AST-FACT: blast-radius",
+        "changed_files":    changed_files,
+        "verified_callers": verified,
+    }
+
+
 def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by, review_id=None):
     pr_url_gh = pr_url or f"https://github.com/{owner}/{repo}/pull/{pr_num}"
     print(f"[review] {owner}/{repo}#{pr_num}", flush=True)
     t0 = time.time()
 
     # ── Graph context (self-hosted only — hosted service uses diff only) ────────
-    # On the hosted service we never clone repos. Code stays on GitHub.
-    # Full graph analysis is available for self-hosted deployments (BYOK + Docker).
     graph_available = False
     graph_ctx = ""
+    ast_fact_finding = None   # populated by _ast_fact_blast_radius if invariant holds
+    changed_files_for_graph: list[str] = []
+
     if _HAS_GRAPH_SVC and os.environ.get("ENABLE_GRAPH_CLONE") == "1":
-        # Only enabled when operator explicitly opts in (self-hosted deployments)
         try:
             graph_available = ensure_graph(owner, repo, github_token, head_sha)
         except Exception as e:
@@ -441,27 +505,72 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
                              "User-Agent": "graperoot-review/1.0"},
                 )
                 with urllib.request.urlopen(req, timeout=15) as r:
-                    diff_text = r.read().decode("utf-8", errors="replace")
+                    diff_text_for_graph = r.read().decode("utf-8", errors="replace")
                 import re as _re
-                changed_files = _re.findall(r"diff --git a/.+ b/(.+)", diff_text)
-                impact = graph_impact(owner, repo, changed_files)
+                changed_files_for_graph = _re.findall(r"diff --git a/.+ b/(.+)", diff_text_for_graph)
+                impact = graph_impact(owner, repo, changed_files_for_graph)
                 if impact.get("ok"):
                     graph_ctx = f"### Blast Radius\n{impact.get('summary','')}\n"
-                    # Fetch actual file content from GitHub for blast-radius files.
-                    # graph_read_symbol() only has import/export metadata (clone was deleted).
-                    # Real code content is what makes the difference vs Greptile.
-                    reads = impact.get("recommended_reads", changed_files[:3])[:6]
+                    reads   = impact.get("recommended_reads", changed_files_for_graph[:3])[:6]
                     affected = impact.get("affected_files", [])[:6]
-                    to_read = list(dict.fromkeys(reads + affected))  # dedup, preserve order
-                    # Filter out stdlib/external modules — only real repo file paths
+                    to_read = list(dict.fromkeys(reads + affected))
                     to_read = [r for r in to_read if "/" in r or r.endswith((".py",".ts",".js",".go",".rs",".java"))]
                     for ref in to_read[:8]:
                         file_path = ref.split("::")[0] if "::" in ref else ref
                         content = _gh_file_content(owner, repo, file_path, head_sha, github_token)
                         if content:
                             graph_ctx += f"\n### {file_path}  [affected by this PR]\n```\n{content[:1500]}\n```\n"
+
+                    # [AST-FACT: blast-radius] — hard invariant: emit nothing on uncertainty
+                    ast_fact_finding = _ast_fact_blast_radius(
+                        owner, repo, changed_files_for_graph,
+                        impact.get("affected_files", []), head_sha, github_token
+                    )
+                    if ast_fact_finding:
+                        print(f"[AST-FACT] blast-radius: {len(ast_fact_finding['verified_callers'])} verified callers", flush=True)
             except Exception as e:
                 print(f"[graph] context failed: {e}", flush=True)
+
+    # ── Post [AST-FACT] finding independently, before LLM review ────────────────
+    if ast_fact_finding:
+        callers = ast_fact_finding["verified_callers"]
+        changed = ast_fact_finding["changed_files"]
+        body_lines = [
+            f"**[AST-FACT: blast-radius]** — {len(callers)} file(s) have verified static imports of the changed module(s) and will be directly affected by this PR.\n",
+            f"Changed: {', '.join(f'`{f}`' for f in changed[:5])}",
+            "",
+            "**Verified callers** (dynamic dispatch ruled out per file):",
+        ]
+        for c in callers:
+            body_lines.append(f"- `{c['file']}`")
+        body_lines += [
+            "",
+            "_This finding is derived entirely from the static import graph. If it is wrong, the graph has a bug — not the model._",
+        ]
+        try:
+            _gh_api(
+                f"/repos/{owner}/{repo}/issues/{pr_num}/comments",
+                github_token,
+            )  # no-op call to verify token works
+        except Exception:
+            pass
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_num}/comments",
+                data=json.dumps({"body": "\n".join(body_lines)}).encode(),
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/vnd.github+json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "graperoot-review/1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                posted = json.loads(r.read())
+            print(f"[AST-FACT] posted blast-radius comment: {posted.get('html_url','')}", flush=True)
+        except Exception as e:
+            print(f"[AST-FACT] post failed: {e}", flush=True)
 
     # ── Run review subprocess ─────────────────────────────────────────────────
     json_out = f"/tmp/review-{owner}-{repo}-{pr_num}.json"

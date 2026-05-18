@@ -383,10 +383,13 @@ Any change (False→True, None→value) is a behavioral change → report as MED
 
 STEP 4 — MISSING FILES: Based on blast radius, which files that import changed modules are NOT in diff?
 
+Every inline comment title MUST begin with `[LLM-HEURISTIC: arch-check]`. Example:
+  "title": "[LLM-HEURISTIC: arch-check] make_null_session not moved to sansio"
+
 Return ONLY JSON:
 {
   "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
-    "category":"refactor|contract","title":"","comment":"cite exact line","suggestion":"","graph_proven":false}],
+    "category":"refactor|contract","title":"[LLM-HEURISTIC: arch-check] ...","comment":"cite exact line","suggestion":"","graph_proven":false}],
   "missing_from_diff": ["file paths that should have been in this PR"],
   "jira_intent_check": {"matches_description":true,"gaps":[],"missing_files":[]}
 }"""
@@ -402,11 +405,14 @@ Focus on:
 3. DATA INTEGRITY — incorrect default values, missing validation, undefined behavior
 4. BEHAVIORAL CHANGES — anything that changes observable behavior for callers
 
+Every inline comment title MUST begin with `[LLM-HEURISTIC: security-check]`. Example:
+  "title": "[LLM-HEURISTIC: security-check] Reversed secret key order changes signing"
+
 Return ONLY JSON:
 {
   "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
-    "category":"security|logic|performance|reliability","title":"","comment":"cite exact line",
-    "suggestion":"","graph_proven":false}],
+    "category":"security|logic|performance|reliability","title":"[LLM-HEURISTIC: security-check] ...",
+    "comment":"cite exact line","suggestion":"","graph_proven":false}],
   "sast_findings": [{"severity":"","rule":"","file":"","line":0,"detail":""}],
   "secrets_found": [{"file":"","line":0,"type":"","value_preview":""}],
   "attack_surface_delta": {"increased":[],"decreased":[],"net_risk":"NEUTRAL"}
@@ -424,11 +430,14 @@ Focus on:
 4. DOCUMENTATION — missing or wrong docstrings, typos, missing space in docstrings
 5. DUPLICATION — similar logic in multiple places
 
+Every inline comment title MUST begin with `[LLM-HEURISTIC: quality-check]`. Example:
+  "title": "[LLM-HEURISTIC: quality-check] Docstring missing space before backtick"
+
 Return ONLY JSON:
 {
   "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
-    "category":"test|reliability|documentation","title":"","comment":"cite exact line",
-    "suggestion":"","graph_proven":false}],
+    "category":"test|reliability|documentation","title":"[LLM-HEURISTIC: quality-check] ...",
+    "comment":"cite exact line","suggestion":"","graph_proven":false}],
   "test_coverage_gaps": [{"file":"","function_or_class":"","risk":""}],
   "dead_code": ["exported symbols with zero importers"],
   "complex_functions": [{"file":"","function":"","cyclomatic_complexity":"high|very_high","reason":""}],
@@ -939,51 +948,9 @@ def main() -> None:
         compare_mode(title, body, diff_text, impact_summary, symbol_excerpts)
         return
 
-    # ── Deterministic pre-checks (graph-proven, no AI needed) ─────────────────
-    det_missing: list[str] = []
-    det_secrets: list[dict] = []
-
-    # 1. Missing from diff: files that import changed files but aren't in the diff
-    if impact_summary:
-        import re as _re2
-        # Extract file paths mentioned in blast radius that aren't in the PR diff
-        mentioned = _re2.findall(r'[\w./\-]+\.(?:py|ts|js|go|java|rs|rb|cs)', impact_summary)
-        for f in mentioned:
-            if f not in changed_files and f not in det_missing:
-                det_missing.append(f)
-
-    # 2. Secrets scan: regex over the diff (deterministic, no AI)
-    SECRET_PATTERNS = [
-        (r'(?i)(api[_-]?key|secret|password|token|auth)["\s:=]+["\']?([A-Za-z0-9+/]{20,})["\']?', "Potential secret"),
-        (r'sk-[A-Za-z0-9]{32,}', "OpenAI API key"),
-        (r'ghp_[A-Za-z0-9]{36}', "GitHub PAT"),
-        (r'AKIA[A-Z0-9]{16}', "AWS Access Key"),
-        (r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', "Private key"),
-    ]
-    for i, line in enumerate(diff_text.splitlines(), 1):
-        if not line.startswith("+"):
-            continue
-        for pat, label in SECRET_PATTERNS:
-            if _re2.search(pat, line):
-                det_secrets.append({"file": "diff", "line": i, "type": label,
-                                    "value_preview": line[1:50].strip()})
-                break
-
-    if det_missing:
-        print(f"  Deterministic: {len(det_missing)} files may be missing from diff")
-    if det_secrets:
-        print(f"  Deterministic: {len(det_secrets)} potential secret(s) detected")
-
     print("  Reviewing with AI...")
     report = claude_review(title, body, linked_issue, diff_text,
                            impact_summary, symbol_excerpts, file_context)
-
-    # Merge deterministic findings into report
-    if det_missing:
-        existing_missing = report.get("missing_from_diff", [])
-        report["missing_from_diff"] = list(dict.fromkeys(existing_missing + det_missing))
-    if det_secrets:
-        report.setdefault("secrets_found", []).extend(det_secrets)
 
     inline = report.get("inline_comments", [])
     total = (len(inline) + len(report.get("sast_findings", [])) +
