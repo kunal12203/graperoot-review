@@ -393,8 +393,10 @@ def _check_prompt(tag: str, focus: str, rules: str) -> str:
 {rules}
 
 IMPORTANT:
+- Find ALL instances of the pattern — scan the entire diff and file content provided.
+- Do not stop after the first finding. Report every distinct issue you see.
 - Quote the exact problematic line(s) from the provided code in your comment.
-- Do not invent code that is not in the context — if you cannot find the pattern, return [].
+- Do not invent code that is not in the context — if the pattern is absent, return [].
 - If you DO find the pattern, report it. Do not suppress real findings.
 
 Return a JSON ARRAY of findings:
@@ -620,15 +622,17 @@ def claude_review(
             f"### Description\n{pr_body[:400] or '(none)'}\n\n"
             f"### Intent\n{linked_issue or '(none)'}\n"
         )
-        diff_part = f"### Diff (exactly what changed)\n```diff\n{diff_text[:9000]}\n```\n"
+        # security/arch need more diff coverage; others need more file context
+        diff_limit = 14000 if check_name in ("security", "arch") else 9000
+        file_limit = 4000 if check_name in ("security", "arch") else 7000
+
+        diff_part = f"### Diff (exactly what changed)\n```diff\n{diff_text[:diff_limit]}\n```\n"
         if pat and file_context:
             raw = _extract_relevant(file_context, pat, win)
-            # Cap at 7k so total stays under 17k
-            file_part = f"### Relevant code sections\n{raw[:7000]}\n"
+            file_part = f"### Relevant code sections\n{raw[:file_limit]}\n"
         else:
             file_part = f"### File content\n{file_context[:3000]}\n"
-        ctx = header + diff_part + file_part
-        return ctx
+        return header + diff_part + file_part
 
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
     notes: dict[str, list[dict]] = {}
