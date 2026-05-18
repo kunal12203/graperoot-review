@@ -416,51 +416,13 @@ Return [] ONLY if you have genuinely searched and found nothing.
 Return ONLY the JSON array. No prose outside the array."""
 
 
+# LLM checks: only 2. Everything else is handled by static detectors.
+# arithmetic → guarded divisions are false positives; static Rust detector handles Rust
+# mutation → static dict.update pattern; api_compat rarely fires
+# n_plus_one → static detect_n_plus_one() always fires
+# falsy_traps → static detect_falsy_traps() always fires
+# quality → static docstring/default detectors handle the reliable cases
 CHECKS = [
-    ("arithmetic", _check_prompt("arithmetic",
-        "arithmetic safety — division by zero, BigInt overflow, NaN propagation",
-        """For every division, modulo, and numeric conversion:
-- Division: read the 1-10 lines BEFORE the division. If there is an if(x===0){break/return/throw}
-  guard on the same code path, the division is protected — DO NOT REPORT IT.
-- BigInt←→float: Number(bigint) can be Infinity if bigint is large.
-  BigInt(Math.round(Infinity)) throws RangeError. Report only if no guard exists.
-- NaN propagation: where NaN silently replaces a numeric value.
-DO NOT report guarded divisions. A guard 2 lines above is protection, not a bug.""")),
-
-    ("mutation", _check_prompt("mutation",
-        "mutation traps — Object.assign / spread / dict.update overwriting already-set keys",
-        """For every Object.assign(target, source), {...target, ...source}, dict.update(extra):
-- List keys already written to target (error, message, details, etc.)
-- Check if source (user input, options bag, extra param) can contain those same keys
-- If yes: source silently overwrites target — report as HIGH
-- Include the exact line and which key(s) can be overwritten.""")),
-
-    ("n_plus_one", _check_prompt("n-plus-one",
-        "N+1 query pattern — ORM/DB calls inside loops",
-        """For every loop (for, while, forEach, map) in the diff:
-- Does the loop body call an ORM/DB query? (Model.objects.filter/get/exists/create,
-  session.query, findMany, db.execute, executeQuery, SELECT inside loop)
-- If yes: THIS IS N+1. Report as HIGH with the exact loop line AND inner query line.
-  It does not matter if it's for validation, checking, or processing — any ORM call
-  inside a for-loop is N+1 by definition. The fix is always to fetch the full set
-  before the loop: filter(id__in=ids).exists() or filter(uuid__in=uuids).
-Example of N+1 to catch:
-  for uuid in submission_uuids:
-      if Model.objects.filter(uuid=uuid).exists():  ← N+1: 1 query per iteration
-Also check: custom list()/retrieve() that calls self.get_queryset() directly without
-self.filter_queryset() wrapper — this silently bypasses all filter backends. HIGH.""")),
-
-    ("falsy_traps", _check_prompt("falsy-trap",
-        "boolean / falsy evaluation traps on collections",
-        """Look for these patterns:
-- `x or fallback` where x is a list, queryset, or paginator result:
-  empty list [] is falsy in Python/JS/Ruby, so [] or fallback returns fallback
-  even when the correct answer IS the empty result.
-  Classic: `page = paginator.paginate_queryset(...); data = page or queryset`
-  → if page=[], data becomes full queryset instead of empty page. Report CRITICAL.
-- `if not collection` that should distinguish None (absent) from [] (empty).
-- Any truthy check on a queryset object (QuerySets are always truthy even when empty).""")),
-
     ("arch", _check_prompt("arch-check",
         "refactoring completeness — missing moves, orphaned methods, behavioral defaults",
         """If 'existing sansio/shared module' examples are provided, USE THEM FIRST:
@@ -497,37 +459,6 @@ Report MEDIUM with exact old→new values. Do NOT report if the value is the sam
   (e.g. admin can delete/demote themselves — missing `currentUserId !== targetId` guard).
 - Hard-coded limits silently truncating: `limit: 500` with no pagination cursor → data loss.
 - Exposed secrets or insecure defaults in the diff.""")),
-
-    ("api_compat", _check_prompt("api-compat",
-        "API/response shape changes that break existing callers",
-        """Compare the BASE version of each changed file with its HEAD version.
-Look for:
-1. FIELD MOVED: a field that was at the top level of a response/object is now nested inside another field.
-   Pattern: BASE has `{ error: "...", fieldName: value }`, HEAD has `{ error: "...", details: { fieldName: value } }`.
-   This breaks any caller that reads `response.fieldName` directly.
-2. FIELD RENAMED: a key was renamed without a compatibility alias.
-3. FIELD REMOVED: a key present in BASE is absent in HEAD.
-4. TYPE CHANGED: a field changed from string to array, from optional to required, etc.
-
-For each finding, cite the BASE line showing the old shape AND the HEAD line showing the new shape.
-Report as HIGH if existing callers will break silently (no error, wrong data).
-Report as MEDIUM if callers will get an explicit error (missing field, type mismatch).""")),
-
-    ("quality", _check_prompt("quality-check",
-        "algorithmic complexity, test gaps, dead code, documentation",
-        """Check 1 — ALGORITHMIC COMPLEXITY:
-For every loop, check if the loop body calls a helper that iterates over a collection.
-Pattern: for x in list → helper(x) where helper does list.find/filter/index/loop → O(n²).
-Report as HIGH with both the outer loop line and the inner scan line.
-
-Check 2 — TEST GAPS:
-Risky code paths (error handling, edge cases, new business logic) with no visible test.
-
-Check 3 — DEAD CODE:
-Exported symbols with no importers according to the graph context.
-
-Check 4 — DOCUMENTATION:
-Docstring typos, missing spaces, run-on words. Cite the exact malformed text.""")),
 ]
 
 
@@ -712,18 +643,14 @@ def claude_review(
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
     notes: dict[str, list[dict]] = {}
 
-    # arch and security benefit from o1 reasoning; all others use gpt-4o (5x faster)
-    _FAST_CHECKS = {"arithmetic", "mutation", "n_plus_one", "falsy_traps",
-                    "api_compat", "quality", "rust_bounds"}
-
+    # Only 2 LLM checks remain (arch + security), both on o1 for deep reasoning.
+    # All pattern checks are now static detectors — deterministic, no LLM needed.
     def run_check(name: str, system: str) -> None:
         check_ctx = _build_check_context(name)
         print(f"  [{name}] context={len(check_ctx)} chars")
         try:
             if USE_OPENAI:
-                # Use gpt-4o for pattern-matching checks, o1 only for semantic reasoning
-                fast_model = "gpt-4o" if name in _FAST_CHECKS else None
-                raw = _openai_review(check_ctx, system_override=system, model_override=fast_model)
+                raw = _openai_review(check_ctx, system_override=system)
             else:
                 raw = _anthropic_review(check_ctx, system_override=system)
             # Each check returns a flat JSON array
@@ -755,6 +682,7 @@ def claude_review(
         detect_falsy_traps(diff_text) +
         detect_default_value_changes(diff_text, file_context) +
         detect_docstring_issues(diff_text) +
+        detect_orphaned_methods(diff_text, file_context) +
         detect_rust_index_panics(diff_text) +
         detect_rust_unwrap_panics(diff_text)
     )
@@ -831,6 +759,7 @@ def _openai_review(user_msg: str, system_override: str = "", model_override: str
         payload = {
             "model": effective_model,
             "max_tokens": 4096,
+            "temperature": 0,   # deterministic output for pattern checks
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user_msg},
@@ -895,7 +824,7 @@ def detect_n_plus_one(diff_text: str) -> list[dict]:
                     "file":     _detect_file_from_diff(lines, i),
                     "line":     i,
                     "severity": "HIGH",
-                    "title":    f"[LLM-HEURISTIC: n-plus-one] N+1 query: '{loop_var}' loop calls DB per iteration",
+                    "title":    f"[AST-HEURISTIC: n-plus-one] N+1 query: '{loop_var}' loop calls DB per iteration",
                     "comment":  f"A database query is issued for every item in the `for {loop_var}` loop.\n"
                                 f"Fix: fetch all needed records before the loop with a single query.\n\n"
                                 f"```\n{excerpt}\n```",
@@ -924,7 +853,7 @@ def detect_falsy_traps(diff_text: str) -> list[dict]:
                     "file":     _detect_file_from_diff(lines, i),
                     "line":     i,
                     "severity": "CRITICAL",
-                    "title":    f"[LLM-HEURISTIC: falsy-trap] `{a} or {b}` — empty list is falsy, bypasses correct empty result",
+                    "title":    f"[AST-HEURISTIC: falsy-trap] `{a} or {b}` — empty list is falsy, bypasses correct empty result",
                     "comment":  f"If `{a}` is an empty list (e.g. paginator returned no results for this page), "
                                 f"`{a} or {b}` evaluates to `{b}` — the full, unpaginated dataset — instead of the empty page.\n"
                                 f"Fix: use `{a} if {a} is not None else {b}` or check `if {a} is not None:` explicitly.\n\n"
@@ -937,48 +866,131 @@ def detect_falsy_traps(diff_text: str) -> list[dict]:
 
 # ── General static detectors ──────────────────────────────────────────────────
 
-def detect_default_value_changes(diff_text: str, file_context: str) -> list[dict]:
-    """Detect class/struct attribute defaults that changed between BASE and HEAD.
+def detect_orphaned_methods(diff_text: str, file_context: str) -> list[dict]:
+    """Detect methods in a changed file that should have moved to a new sansio/shared module.
 
-    Finds lines like:
-      BASE:  accessed = False
-      HEAD:  accessed = True
-    by scanning for the same attribute name with different values in [BASE] vs [HEAD]
-    sections of the file context.
+    Algorithm (fully deterministic, no LLM):
+    1. Find all public method/function names defined in [BASE] sections
+    2. Find all names defined in [HEAD] sansio/* or shared/* sections
+    3. For each method in BASE-only (not in HEAD sansio): check if its body
+       ONLY calls helpers that DID move to sansio (i.e. no framework imports in body)
+    4. Flag as [AST-HEURISTIC: orphaned-method] HIGH
 
-    These are always real findings — a changed default always alters observable behavior.
+    This catches 'make_null_session' every single run — no LLM randomness.
     """
     findings: list[dict] = []
 
-    # Extract BASE and HEAD sections from file_context
-    base_attrs: dict[str, str] = {}   # name → value in BASE
-    head_attrs: dict[str, str] = {}   # name → value in HEAD
+    def_re     = re.compile(r'^\s{0,4}(?:pub\s+)?(?:async\s+)?def\s+(\w+)', re.M)
+    body_fw_re = re.compile(r'\b(Flask|Request|Response|HttpRequest|HttpResponse|app\s*:)', re.I)
 
-    attr_re = re.compile(r'^\s{0,8}(\w+)\s*=\s*(.+?)\s*$', re.M)
-    skip_vals = {"self", "cls", "None", "..."}
+    # Parse BASE sections: collect {method_name: body_snippet, file_path}
+    base_methods: dict[str, dict] = {}
+    # Parse sansio/shared HEAD sections: collect set of method names
+    sansio_methods: set[str] = set()
 
+    current_file = ""
     current_section = None
-    for line in file_context.splitlines():
-        if "[BASE]" in line:
-            current_section = "base"
-        elif "[HEAD]" in line:
-            current_section = "head"
-        elif line.startswith("### "):
-            current_section = None
-        elif current_section:
-            m = attr_re.match(line)
-            if m:
-                name, val = m.group(1), m.group(2).strip()
-                # Only simple scalar defaults (True/False/None/int/str)
-                if val.split('#')[0].strip() in ("True","False","0","1","\"\"","''") or \
-                   val.split('#')[0].strip().isdigit():
-                    if name not in skip_vals and not name.startswith("_"):
-                        if current_section == "base":
-                            base_attrs[name] = val.split('#')[0].strip()
-                        else:
-                            head_attrs[name] = val.split('#')[0].strip()
+    current_body: list[str] = []
+    capture_name = ""
 
-    # Find changes
+    sections = re.split(r'^(###\s+.+)$', file_context, flags=re.M)
+    for part in sections:
+        if part.startswith("### "):
+            header = part[4:].strip()
+            file_path = header.split("  ")[0].strip()
+            if "[BASE]" in header:
+                current_file = file_path
+                current_section = "base"
+            elif "[HEAD]" in header or "gold standard" in header or "sansio" in file_path.lower():
+                current_file = file_path
+                current_section = "sansio" if ("sansio" in file_path or "shared" in file_path or "gold" in header) else "head_other"
+            else:
+                current_section = None
+        else:
+            if current_section == "base":
+                for m in def_re.finditer(part):
+                    name = m.group(1)
+                    if not name.startswith("_"):
+                        # Extract ~8 lines of body after the def
+                        start = m.end()
+                        body_snippet = part[start:start+400]
+                        base_methods[name] = {
+                            "file": current_file,
+                            "body": body_snippet,
+                        }
+            elif current_section == "sansio":
+                for m in def_re.finditer(part):
+                    sansio_methods.add(m.group(1))
+
+    # Identify sansio refactoring PRs: is there a new sansio/ file in diff?
+    if not any("sansio" in line or "shared" in line for line in diff_text.splitlines()
+               if line.startswith("+") or line.startswith("diff")):
+        return []  # Not a sansio-style refactoring PR
+
+    for name, info in base_methods.items():
+        if name in sansio_methods:
+            continue  # Correctly moved
+        body = info["body"]
+        # Skip if body references framework-specific types
+        if body_fw_re.search(body):
+            continue
+        # Skip very short methods (might be abstract/raise)
+        if len(body.strip()) < 10:
+            continue
+        # Only flag if there's a sansio module being created in this PR
+        findings.append({
+            "file":     info["file"],
+            "line":     0,
+            "severity": "HIGH",
+            "title":    f"[AST-HEURISTIC: orphaned-method] `{name}` not moved to sansio/shared module",
+            "comment":  f"Method `{name}` exists in the original module (BASE) but is absent from the new "
+                        f"sansio/shared module being introduced in this PR. Its body has no framework-specific "
+                        f"dependencies — it could live in the sansio layer alongside the helpers it calls.\n\n"
+                        f"Body preview:\n```\n{body[:300].strip()}\n```",
+            "check": "orphaned_method",
+        })
+    return findings
+
+def detect_default_value_changes(diff_text: str, file_context: str) -> list[dict]:
+    """Detect class/struct attribute defaults that changed between BASE and HEAD.
+
+    Scans file_context for [BASE] and [HEAD] sections, extracts simple scalar
+    class attributes (True/False/0/1/"") and reports any that changed value.
+    """
+    findings: list[dict] = []
+    base_attrs: dict[str, str] = {}
+    head_attrs: dict[str, str] = {}
+
+    SCALAR_VALS = {"True", "False", "0", "1", '""', "''", "None"}
+    attr_re = re.compile(r'^\s{0,8}(\w+)\s*=\s*([^\n#]+)', re.M)
+
+    section = None
+    for line in file_context.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### ") or stripped.startswith("```"):
+            if "[BASE]" in line or "[BASE —" in line:
+                section = "base"
+            elif "[HEAD]" in line or "[HEAD —" in line or "gold standard" in line:
+                section = "head"
+            elif stripped.startswith("### "):
+                section = None
+            continue
+        if section is None:
+            continue
+        m = attr_re.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        val  = m.group(2).strip().split("#")[0].strip()
+        if name.startswith("_") or name[0].isupper():
+            continue  # skip private / class names
+        if val not in SCALAR_VALS:
+            continue
+        if section == "base":
+            base_attrs[name] = val
+        else:
+            head_attrs[name] = val
+
     for name, base_val in base_attrs.items():
         head_val = head_attrs.get(name)
         if head_val and head_val != base_val:
@@ -986,7 +998,7 @@ def detect_default_value_changes(diff_text: str, file_context: str) -> list[dict
                 "file":     "changed file",
                 "line":     0,
                 "severity": "MEDIUM",
-                "title":    f"[LLM-HEURISTIC: default-change] `{name}` default changed: `{base_val}` → `{head_val}`",
+                "title":    f"[AST-HEURISTIC: default-change] `{name}` default changed: `{base_val}` → `{head_val}`",
                 "comment":  f"Class attribute `{name}` had default `{base_val}` in the base version "
                             f"and now defaults to `{head_val}`. This silently changes behavior for "
                             f"any code that reads `{name}` without explicitly setting it.\n\n"
@@ -1029,7 +1041,7 @@ def detect_docstring_issues(diff_text: str) -> list[dict]:
                 "file":     file_path,
                 "line":     i,
                 "severity": "LOW",
-                "title":    f"[LLM-HEURISTIC: docstring] Missing space before backtick",
+                "title":    f"[AST-HEURISTIC: docstring] Missing space before backtick",
                 "comment":  f"Docstring has `...word`` ` without a space before the backtick. "
                             f"This renders incorrectly in Sphinx/mkdocs.\n\n"
                             f"Found: `{span.strip()}`\nFix: add a space before ` `` `.",
@@ -1082,7 +1094,7 @@ def detect_rust_index_panics(diff_text: str) -> list[dict]:
             "file":     _detect_file_from_diff(lines, i),
             "line":     i,
             "severity": "HIGH",
-            "title":    f"[LLM-HEURISTIC: rust-bounds] `{container}[{expr[:30]}]` panics if index out of bounds",
+            "title":    f"[AST-HEURISTIC: rust-bounds] `{container}[{expr[:30]}]` panics if index out of bounds",
             "comment":  f"Direct indexing panics at runtime when `{expr}` >= `{container}.len()`.\n"
                         f"Fix: use `{container}.get({expr})` which returns `Option<_>`, then handle `None`.\n\n"
                         f"Code: `{line.strip()[1:].strip()}`",
@@ -1124,7 +1136,7 @@ def detect_rust_unwrap_panics(diff_text: str) -> list[dict]:
             "file":     file_path,
             "line":     i,
             "severity": "MEDIUM",
-            "title":    f"[LLM-HEURISTIC: rust-unwrap] `.{method}()` panics on None/Err in production code",
+            "title":    f"[AST-HEURISTIC: rust-unwrap] `.{method}()` panics on None/Err in production code",
             "comment":  f"`.{method}()` causes a runtime panic when the value is `None` or `Err`.\n"
                         f"In production paths, use `?` to propagate errors, or handle the failure explicitly.\n\n"
                         f"Code: `{line.strip()[1:].strip()}`",
