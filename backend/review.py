@@ -609,7 +609,7 @@ def claude_review(
         # (pattern, context_window_lines)
         "arithmetic":  (re.compile(r'[*/%.]\s|Number\(|BigInt\(|Math\.\w|NaN\b|Infinity\b', re.I), 6),
         "mutation":    (re.compile(r'Object\.assign|\.update\s*\(|\.merge\s*\(|spread', re.I), 6),
-        "n_plus_one":  (re.compile(r'\bfor\b|\bwhile\b|\bforEach\b|\.objects\.\w|session\.query|executemany|\.find\s*\(|\.filter\s*\(', re.I), 8),
+        "n_plus_one":  (re.compile(r'\bfor\b|\bwhile\b|\bforEach\b|\.objects\.\w|session\.query|executemany|\.find\s*\(|\.filter\s*\(', re.I), 16),
         "falsy_traps": (re.compile(r'\bor\s+\w|\bif\s+not\b|\|\|\s|\?\?\s|page\s+or\b|\bnot\s+isinstance\b|is\s+None\b|is\s+not\s+None\b', re.I), 8),
         # arch: ONLY class-level declarations (no imports/from — too noisy)
         "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function )', re.M), 8),
@@ -639,9 +639,10 @@ def claude_review(
             f"### Description\n{pr_body[:400] or '(none)'}\n\n"
             f"### Intent\n{linked_issue or '(none)'}\n"
         )
-        # security/arch need more diff coverage; others need more file context
-        diff_limit = 14000 if check_name in ("security", "arch") else 9000
-        file_limit = 4000 if check_name in ("security", "arch") else 7000
+        # checks that need more diff coverage (bugs deeper in large diffs)
+        big_diff = ("security", "arch", "n_plus_one", "falsy_traps", "api_compat")
+        diff_limit = 16000 if check_name in big_diff else 9000
+        file_limit = 3000 if check_name in big_diff else 7000
 
         diff_part = f"### Diff (exactly what changed)\n```diff\n{diff_text[:diff_limit]}\n```\n"
         if pat and file_context:
