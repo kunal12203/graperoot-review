@@ -335,12 +335,65 @@ import chain that proves the blast radius. No other tool does this.
 
 ---
 
+## Hosted service — how review.graperoot.dev works
+
+The hosted service (`review.graperoot.dev`) runs a different stack from the
+local benchmark. Key differences:
+
+### What's the same
+- Same `graph_builder_v6.2.py` — shallow-clones the repo, builds the AST graph, deletes clone
+- Same MASTER_SYSTEM prompt with 14 output categories
+- Same graph blast-radius traversal to find `missing_from_diff` candidates
+- Same `graph_proven` flag on inline comments
+
+### What's different
+
+**File content via GitHub API (no MCP)**
+The local benchmark reads file content from disk via the MCP server. The hosted
+service has no persistent disk clone. Instead, `build_file_context()` fetches
+full file content at base SHA (before PR) and head SHA (after PR) from the
+GitHub contents API. Budget: 15,000 chars per file, 40,000 total.
+
+This is what lets it catch incomplete refactors: it sees the FULL original file,
+not just the diff lines.
+
+**Deterministic pre-checks (no AI)**
+Before calling the model, the hosted service runs deterministic scans:
+1. **Missing from diff** — extracts file paths from the blast-radius summary,
+   flags files that import the changed modules but aren't in the PR diff.
+2. **Secrets scan** — regex over `+` lines in the diff for API key patterns
+   (OpenAI `sk-`, GitHub `ghp_`, AWS `AKIA`, RSA private key headers).
+
+These findings are graph-proven facts merged into the report alongside AI findings.
+
+**Model: OpenAI o1**
+The hosted service uses `o1` (reasoning model) with `max_completion_tokens=16000`.
+No `reasoning_effort` parameter — o1 uses all available tokens for output.
+
+**Anti-hallucination rules**
+The system prompt explicitly forbids inventing code: every finding must be traced
+to an exact line in the provided context or it must not be reported.
+
+### Greptile comparison — flask sansio PR
+
+| Finding | Greptile | GrapeRoot Hosted |
+|---------|---------|-----------------|
+| `make_null_session` not moved to sansio | ✅ P1 | ✅ HIGH — body analysis + asymmetry check |
+| `is_null_session` sibling asymmetry | ❌ | ✅ HIGH — explicit sibling comparison |
+| `accessed` default changed False→True | ❌ | ✅ MEDIUM — BASE vs HEAD diff |
+| Docstring missing space | ✅ P2 | ✅ LOW |
+| **Total** | **2** | **4** |
+
+GrapeRoot hosted found 4 real issues vs Greptile's 2, with no hallucinations.
+
+---
+
 ## Files to read
 
 | File | What |
 |------|------|
 | `benchmark_codeant.py` | Full benchmark — MASTER_SYSTEM prompt, all categories, graph_context() |
-| `review.py` | Live review engine — simplified prompt, posts to GitHub |
+| `review.py` | Live review engine — MASTER_SYSTEM prompt + deterministic pre-checks, posts to GitHub |
 | `graph_builder_v6.2.py` | AST graph builder — scans repo, builds edges |
 | `graph_service.py` | Hosted service graph manager — clone, build, cache |
 | `codeant_benchmark.json` | Raw benchmark results — 3 PRs × GrapeRoot + Plain |
