@@ -468,6 +468,19 @@ Check 3 — DEFAULT VALUE CHANGES:
 Compare class-level attribute defaults between BASE and HEAD.
 Any change (False→True, None→value) is a behavioral change → report MEDIUM with exact values.""")),
 
+    ("security", _check_prompt("security-check",
+        "security vulnerabilities — auth bypass, unhandled errors, access control, exposed secrets",
+        """Look for these patterns:
+- Auth bypass: code that grants access based on a condition that can be bypassed.
+  Check: does unauthenticated state lead to a 404/error instead of a login redirect?
+  Check: does a default role or fallback value grant elevated privilege (e.g. default='admin')?
+- Missing error handling: async/await call where the error return value is never checked.
+  Pattern: `const result = await api.doSomething()` with no `if (result.error)` check.
+- Privilege escalation: action that should be blocked for the actor's own account
+  (e.g. admin can delete/demote themselves — missing `currentUserId !== targetId` guard).
+- Hard-coded limits silently truncating: `limit: 500` with no pagination cursor → data loss.
+- Exposed secrets or insecure defaults in the diff.""")),
+
     ("quality", _check_prompt("quality-check",
         "algorithmic complexity, test gaps, dead code, documentation",
         """Check 1 — ALGORITHMIC COMPLEXITY:
