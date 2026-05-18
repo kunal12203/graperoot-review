@@ -422,13 +422,16 @@ Run these checks IN ORDER. Do not skip any.
 
 STEP 1 — ARITHMETIC SAFETY (highest priority):
 For every division, modulo, and numeric conversion in the diff:
-  a. Division/modulo: can the denominator ever be zero? Check every call site and data source.
-     Look for: `x / y`, `x % y`, `Number(bigint) / Number(other)` where other could be 0n.
+  a. Division/modulo: can the denominator ever be zero?
+     IMPORTANT: Before reporting, read the 1-10 lines immediately before the division.
+     If there is an `if (denominator === 0) { break/return/throw }` guard, the division
+     is protected — do NOT report it. Only report if NO guard exists on the code path
+     leading to the division.
   b. BigInt↔float traps: `Number(bigint)` where bigint is large → Infinity.
      Then `BigInt(Math.round(Infinity))` or `BigInt(Math.ceil(Infinity))` throws RangeError.
-     Pattern to find: any chain of `Number(bigint)` → arithmetic → `BigInt(result)`.
+     Again: check for guards before reporting.
   c. NaN propagation: any place where NaN can silently replace a numeric value.
-Report each as HIGH or CRITICAL with the exact expression and the input value that causes failure.
+Do NOT report false positives — a guarded division is not a bug.
 
 STEP 2 — MUTATION TRAPS (Object.assign, spread, merge):
 For every `Object.assign(target, source)` or `{...target, ...source}`:
