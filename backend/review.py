@@ -463,20 +463,27 @@ self.filter_queryset() wrapper — this silently bypasses all filter backends. H
 
     ("arch", _check_prompt("arch-check",
         "refactoring completeness — missing moves, orphaned methods, behavioral defaults",
-        """Check 1 — REFACTOR INVENTORY:
+        """If 'existing sansio/shared module' examples are provided, USE THEM FIRST:
+  Those show what the target module SHOULD contain. Compare against the diff to find
+  methods present in changed files that are ABSENT from the sansio module examples
+  despite having no framework-specific logic in their bodies.
+
+Check 1 — REFACTOR INVENTORY:
 List every class and public method in the BASE version of changed files.
-For each one NOT in the HEAD or the new module:
-  Read its body — does it call framework-specific APIs, or only helpers that were moved?
-  If body is framework-agnostic and its helpers moved → ORPHAN, report HIGH.
-  Use the project's own terminology (not Python/Flask-specific words for non-Python code).
+For each method still in the original module (not moved to sansio/shared):
+  a. Read its COMPLETE body (not just signature).
+  b. Does the body reference framework types (Flask, Request, Response)?
+     OR does it ONLY call self.X() where X is already in the sansio module?
+  c. If ONLY calls already-moved helpers → ORPHAN → report HIGH.
+     Quote the body: "body is `return self.null_session_class()` — calls only moved helpers"
 
 Check 2 — SIBLING ASYMMETRY:
-If method A moved to a new module but its sibling B (same class, related purpose) did not,
-and B has no framework dependency in its body → report HIGH.
+Methods A, B, C in same class. A moved to sansio, C did not.
+If C's body has no framework dependency → report HIGH.
 
 Check 3 — DEFAULT VALUE CHANGES:
-Compare class-level attribute defaults between BASE and HEAD.
-Any change (False→True, None→value) is a behavioral change → report MEDIUM with exact values.""")),
+Compare class-level attribute defaults: BASE `accessed = False`, HEAD `accessed = True`.
+Report MEDIUM with exact old→new values. Do NOT report if the value is the same.""")),
 
     ("security", _check_prompt("security-check",
         "security vulnerabilities — auth bypass, unhandled errors, access control, exposed secrets",
@@ -542,17 +549,31 @@ def _parse_json(text: str) -> dict:
 
 _CODE_RE = re.compile(r'[=\(\)\[\]{}<>:;,\.\+\-\*\/]|def |class |return |import |self\.')
 
+def _snippet_in_context(snippet: str, context: str) -> bool:
+    """Check snippet exists in context with word-boundary awareness.
+    Prevents 'modified = T' from matching 'modified = True' as a substring."""
+    if snippet not in context:
+        return False
+    # Find all occurrences and ensure none is followed immediately by an alphanumeric char
+    # that would extend it to a longer token (e.g. 'T' followed by 'rue' → True)
+    last_char = snippet[-1] if snippet else ""
+    if last_char.isalnum() or last_char == "_":
+        # Snippet ends with an identifier char — require word boundary after it
+        pattern = re.escape(snippet) + r"(?![a-zA-Z0-9_])"
+        return bool(re.search(pattern, context))
+    return True
+
+
 def _verify_findings(findings: list[dict], context: str) -> list[dict]:
     """Filter hallucinations: only check snippets that look like actual code, not prose."""
     verified = []
     for f in findings:
         comment = f.get("comment", f.get("body", ""))
-        # Only extract snippets that contain programming syntax (not prose explanation)
         all_snippets = re.findall(r"`([^`\n]{4,120})`", comment)
         code_snippets = [s for s in all_snippets if _CODE_RE.search(s)]
         ok = True
         for snippet in code_snippets[:3]:
-            if snippet not in context:
+            if not _snippet_in_context(snippet, context):
                 ok = False
                 print(f"  [verify] filtered: '{snippet[:50]}' not in context")
                 break
@@ -620,7 +641,9 @@ def claude_review(
         "n_plus_one":  (re.compile(r'\bfor\b|\bwhile\b|\bforEach\b|\.objects\.\w|session\.query|executemany|\.find\s*\(|\.filter\s*\(', re.I), 16),
         "falsy_traps": (re.compile(r'\bor\s+\w|\bif\s+not\b|\|\|\s|\?\?\s|page\s+or\b|\bnot\s+isinstance\b|is\s+None\b|is\s+not\s+None\b', re.I), 8),
         # arch: ONLY class-level declarations (no imports/from — too noisy)
-        "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function )', re.M), 8),
+        # arch: class/function defs + window=12 to capture full method bodies
+        # (make_null_session body is 2-3 lines below def → needs enough window)
+        "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function |\+class |\+def )', re.M), 12),
         # api_compat: response/request shapes, field names, return values
         "api_compat":  (re.compile(r'return\s*\{|response\.|\.json\(|body\s*=|\bdetails\b|\berror\b|\bmessage\b|\bdata\b|\bstatus\b|\btype\b.*:\s*\w', re.I), 8),
         # security: broad — auth, roles, errors, redirects, limits, secrets

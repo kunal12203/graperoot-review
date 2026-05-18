@@ -556,19 +556,54 @@ def _graph_semantic_examples(
         if overlap > 0:
             candidates.append((overlap, file_path))
 
-    # Prefer files with more framework overlap + similar basename
+    # Detect refactoring patterns: if diff adds files under sansio/, shared/, core/, base/
+    # those are the target modules — find existing files in SAME directory as the gold standard
+    sansio_dirs: set[str] = set()
+    for cf in changed_files:
+        parts = cf.split("/")
+        for i, part in enumerate(parts):
+            if part in ("sansio", "shared", "core", "base", "abstract"):
+                sansio_dirs.add("/".join(parts[:i+1]))
+
+    # Pull existing files from those sansio directories first (they show correct refactoring)
+    sansio_examples: list[str] = []
+    if sansio_dirs:
+        for file_path, _ in file_imports.items():
+            if file_path in changed_set:
+                continue
+            if any(file_path.startswith(d + "/") for d in sansio_dirs):
+                content = _gh_file_content(owner, repo, file_path, head_sha, github_token)
+                if content:
+                    sansio_examples.append((file_path, content))
+                    print(f"[semantic] sansio gold standard: {file_path}", flush=True)
+                if len(sansio_examples) >= 2:
+                    break
+
+    # General: sort remaining candidates by framework overlap + same basename
     changed_basenames = {cf.rsplit("/", 1)[-1] for cf in changed_files}
     candidates.sort(key=lambda x: (
-        -x[0],  # more overlap first
-        0 if x[1].rsplit("/", 1)[-1] in changed_basenames else 1,  # same basename preferred
+        -x[0],
+        0 if x[1].rsplit("/", 1)[-1] in changed_basenames else 1,
     ))
 
     examples: list[str] = []
-    for _, file_path in candidates[:max_examples]:
+
+    # Sansio examples first (highest signal for refactoring checks)
+    for file_path, content in sansio_examples[:2]:
+        snippet = content[:1500]
+        label = "existing sansio/shared module — gold standard for what should be here"
+        examples.append(
+            f"### {file_path}  [{label}]\n```\n{snippet}\n```"
+        )
+
+    # General framework examples
+    remaining = max_examples - len(examples)
+    for _, file_path in candidates[:remaining + 2]:
+        if len(examples) >= max_examples:
+            break
         content = _gh_file_content(owner, repo, file_path, head_sha, github_token)
         if not content:
             continue
-        # Trim to the most relevant section (first 1200 chars captures class/function defs)
         snippet = content[:1200]
         examples.append(
             f"### {file_path}  [existing file — same framework, NOT in diff]\n"
@@ -580,8 +615,10 @@ def _graph_semantic_examples(
         return ""
 
     return (
-        "### Codebase pattern examples (how this framework is used correctly elsewhere)\n"
-        "Use these to understand expected contracts and compare against the new code in the diff.\n\n"
+        "### Codebase pattern examples — how this framework is correctly used HERE\n"
+        "CRITICAL FOR ARCH CHECK: compare these patterns against the new code in the diff.\n"
+        "A method that exists in changed files but is ABSENT from sansio/shared examples\n"
+        "when it should be there is an incomplete refactor. Report it.\n\n"
         + "\n\n".join(examples)
     )
 
