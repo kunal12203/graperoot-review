@@ -563,15 +563,23 @@ def claude_review(
 ### Key symbol excerpts
 {symbol_excerpts or "(none)"}"""
 
+    # ── Trim context per check so o1 has room to output findings ─────────────
+    # o1 splits max_completion_tokens between reasoning and output.
+    # With 40k input, all tokens go to reasoning → empty output.
+    # Each check gets: diff (first 12k) + file context (first 8k) = ~20k.
+    diff_section   = diff_text[:12000]
+    file_section   = file_context[:8000]
+    check_context  = f"{context[:2000]}\n\n### Diff\n```diff\n{diff_section}\n```\n\n### Key file content\n{file_section}"
+
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
     notes: dict[str, list[dict]] = {}
 
     def run_check(name: str, system: str) -> None:
         try:
             if USE_OPENAI:
-                raw = _openai_review(context, system_override=system)
+                raw = _openai_review(check_context, system_override=system)
             else:
-                raw = _anthropic_review(context, system_override=system)
+                raw = _anthropic_review(check_context, system_override=system)
             # Each check returns a flat JSON array
             raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
             raw = re.sub(r"\n?```$", "", raw)
