@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Mulish, JetBrains_Mono } from "next/font/google";
+import { Analytics } from "@vercel/analytics/next";
 import SiteBackground from "@/components/SiteBackground";
 import "./globals.css";
 
@@ -28,6 +29,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="font-mono">
         <SiteBackground />
         <div className="relative z-10">{children}</div>
+        <Analytics />
       </body>
     </html>
   );
