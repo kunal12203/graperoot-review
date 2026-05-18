@@ -360,6 +360,109 @@ Rules:
 - Return ONLY the JSON, no markdown wrapper, no explanation outside JSON"""
 
 
+# ── Specialized agent prompts ─────────────────────────────────────────────────
+
+ARCH_PROMPT = """You are a senior architect reviewing a PR for completeness and structural correctness.
+Your ONLY job: find what's MISSING, INCOMPLETE, or ASYMMETRIC.
+
+ANTI-HALLUCINATION: Every finding must cite exact code from the provided context.
+
+Focus on:
+1. REFACTOR COMPLETENESS — inventory every class/method in the BASE file. For each one left
+   behind: does its body actually reference framework types, or could it have moved? Flag orphans.
+2. ASYMMETRY — if sibling methods A and B moved to a shared module but C did not, flag C.
+3. MISSING FROM DIFF — what files should have changed based on the blast radius but didn't?
+4. BROKEN CONTRACTS — re-exports, API compatibility, callers that will break.
+
+Return ONLY JSON:
+{
+  "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
+    "category":"refactor|contract","title":"","comment":"cite exact line","suggestion":"","graph_proven":false}],
+  "missing_from_diff": ["file paths that should have been in this PR"],
+  "jira_intent_check": {"matches_description":true,"gaps":[],"missing_files":[]}
+}"""
+
+SEC_PROMPT = """You are a security engineer reviewing a PR for vulnerabilities and correctness bugs.
+Your ONLY job: find bugs, security issues, and data integrity problems.
+
+ANTI-HALLUCINATION: Every finding must cite exact code from the provided context.
+
+Focus on:
+1. SECURITY — injection, auth bypass, privilege escalation, insecure defaults, exposed secrets
+2. CORRECTNESS — logic bugs that cause wrong behavior, silent data loss, race conditions
+3. DATA INTEGRITY — incorrect default values, missing validation, undefined behavior
+4. BEHAVIORAL CHANGES — anything that changes observable behavior for callers
+
+Return ONLY JSON:
+{
+  "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
+    "category":"security|logic|performance|reliability","title":"","comment":"cite exact line",
+    "suggestion":"","graph_proven":false}],
+  "sast_findings": [{"severity":"","rule":"","file":"","line":0,"detail":""}],
+  "secrets_found": [{"file":"","line":0,"type":"","value_preview":""}],
+  "attack_surface_delta": {"increased":[],"decreased":[],"net_risk":"NEUTRAL"}
+}"""
+
+QUAL_PROMPT = """You are a quality engineer reviewing a PR for reliability, testability, and maintainability.
+Your ONLY job: find quality gaps.
+
+ANTI-HALLUCINATION: Every finding must cite exact code from the provided context.
+
+Focus on:
+1. TEST GAPS — risky code paths with no test coverage
+2. DEAD CODE — exported symbols with no importers (use graph context)
+3. COMPLEXITY — functions that are too long, deeply nested, or have too many responsibilities
+4. DOCUMENTATION — missing or wrong docstrings, typos, missing space in docstrings
+5. DUPLICATION — similar logic in multiple places
+
+Return ONLY JSON:
+{
+  "inline_comments": [{"file":"","line":0,"severity":"CRITICAL|HIGH|MEDIUM|LOW",
+    "category":"test|reliability|documentation","title":"","comment":"cite exact line",
+    "suggestion":"","graph_proven":false}],
+  "test_coverage_gaps": [{"file":"","function_or_class":"","risk":""}],
+  "dead_code": ["exported symbols with zero importers"],
+  "complex_functions": [{"file":"","function":"","cyclomatic_complexity":"high|very_high","reason":""}],
+  "duplicate_code": [{"files":[],"pattern":""}],
+  "quality_score": 0,
+  "security_grade": "A"
+}"""
+
+
+def _parse_json(text: str) -> dict:
+    text = re.sub(r"^```(?:json)?\n?", "", text.strip())
+    text = re.sub(r"\n?```$", "", text)
+    try:
+        r = json.loads(text)
+        return r if isinstance(r, dict) else {"inline_comments": r}
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    return {}
+
+
+def _verify_findings(findings: list[dict], context: str) -> list[dict]:
+    """Filter out hallucinations: keep only findings whose cited code appears in context."""
+    verified = []
+    for f in findings:
+        comment = f.get("comment", f.get("body", ""))
+        cited = re.findall(r"`([^`\n]{4,80})`", comment)
+        ok = True
+        for snippet in cited[:3]:
+            # Allow short snippets (names) but verify longer code fragments
+            if len(snippet) > 10 and snippet not in context:
+                ok = False
+                print(f"  [verify] filtered hallucination: '{snippet[:40]}' not in context")
+                break
+        if ok:
+            verified.append(f)
+    return verified
+
+
 def claude_review(
     pr_title: str,
     pr_body: str,
@@ -369,12 +472,14 @@ def claude_review(
     symbol_excerpts: str,
     file_context: str = "",
 ) -> dict:
-    """Call the model and return the full 14-category structured report."""
+    """Run 3 specialized AI agents in parallel, verify findings, merge into one report."""
+    import threading
+
     if not ANTHROPIC_KEY and not OPENAI_KEY:
         print("Set ANTHROPIC_API_KEY or OPENAI_API_KEY", file=sys.stderr)
         return {}
 
-    user_msg = f"""## PR: {pr_title}
+    full_context = f"""## PR: {pr_title}
 
 ### Description
 {pr_body[:2000] or "(no description)"}
@@ -397,36 +502,77 @@ def claude_review(
 ### Key symbol excerpts
 {symbol_excerpts or "(none)"}"""
 
-    if USE_OPENAI:
-        text = _openai_review(user_msg)
-    else:
-        text = _anthropic_review(user_msg)
+    results: dict[str, dict] = {}
+    errors:  dict[str, str]  = {}
 
-    text = re.sub(r"^```(?:json)?\n?", "", text.strip())
-    text = re.sub(r"\n?```$", "", text)
-    print(f"  Model response ({len(text)} chars): {text[:300]}")
-    try:
-        result = json.loads(text)
-        if isinstance(result, list):
-            # Backwards-compat: model returned old flat array format
-            return {"inline_comments": result}
-        return result
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
-        print(f"  Model returned non-JSON:\n{text[:400]}", file=sys.stderr)
-        return {}
+    def run_agent(name: str, system: str) -> None:
+        try:
+            if USE_OPENAI:
+                text = _openai_review(full_context, system_override=system)
+            else:
+                text = _anthropic_review(full_context, system_override=system)
+            parsed = _parse_json(text)
+            print(f"  [{name}] {len(text)} chars → {len(parsed.get('inline_comments', []))} inline")
+            results[name] = parsed
+        except Exception as e:
+            errors[name] = str(e)
+            print(f"  [{name}] FAILED: {e}", file=sys.stderr)
+            results[name] = {}
+
+    agents = [
+        ("arch", ARCH_PROMPT),
+        ("sec",  SEC_PROMPT),
+        ("qual", QUAL_PROMPT),
+    ]
+    threads = [threading.Thread(target=run_agent, args=(n, s), daemon=True) for n, s in agents]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=200)
+
+    # Merge all results
+    report: dict = {"pr_summary": f"PR: {pr_title}"}
+    all_inline: list[dict] = []
+    for name, result in results.items():
+        inline = result.get("inline_comments", [])
+        # Verify: only keep findings grounded in actual context
+        verified = _verify_findings(inline, full_context + diff_text)
+        all_inline.extend(verified)
+        # Merge list fields
+        for key in ("sast_findings","iac_findings","secrets_found","dead_code",
+                    "duplicate_code","complex_functions","test_coverage_gaps","missing_from_diff"):
+            if result.get(key):
+                report.setdefault(key, [])
+                report[key].extend(result[key])
+        # Merge dict fields
+        for key in ("blast_radius","attack_surface_delta","jira_intent_check","quality_gates"):
+            if result.get(key) and key not in report:
+                report[key] = result[key]
+        # Scalars
+        if result.get("quality_score") and "quality_score" not in report:
+            report["quality_score"] = result["quality_score"]
+        if result.get("security_grade") and "security_grade" not in report:
+            report["security_grade"] = result["security_grade"]
+
+    # Deduplicate inline comments by title
+    seen_titles: set[str] = set()
+    deduped: list[dict] = []
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    all_inline.sort(key=lambda c: sev_order.get(c.get("severity", "LOW"), 4))
+    for c in all_inline:
+        t = c.get("title", "").lower().strip()
+        if t not in seen_titles:
+            seen_titles.add(t)
+            deduped.append(c)
+
+    report["inline_comments"] = deduped
+    print(f"  Total: {len(deduped)} inline after dedup+verify ({len(all_inline)} raw)")
+    return report
 
 
-def _anthropic_review(user_msg: str) -> str:
+def _anthropic_review(user_msg: str, system_override: str = "") -> str:
     payload = {
         "model": MODEL,
         "max_tokens": 4096,
-        "system": SYSTEM_PROMPT,
+        "system": system_override or SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_msg}],
     }
     req = urllib.request.Request(
@@ -448,21 +594,17 @@ def _anthropic_review(user_msg: str) -> str:
         raise
 
 
-def _openai_review(user_msg: str) -> str:
-    # o1 / o3 reasoning models: no system role, max_completion_tokens, optional reasoning_effort
+def _openai_review(user_msg: str, system_override: str = "") -> str:
+    system = system_override or SYSTEM_PROMPT
     is_reasoning = MODEL.startswith(("o1", "o3", "o4"))
     if is_reasoning:
         payload = {
             "model": MODEL,
-            # Large budget: o1 uses some tokens for internal reasoning,
-            # the rest goes to output. Don't use reasoning_effort on o1 —
-            # it spends all budget on reasoning with 0 output tokens left.
-            "max_completion_tokens": 16000,
+            "max_completion_tokens": 8000,
             "messages": [
-                {"role": "user", "content": f"{SYSTEM_PROMPT}\n\n---\n\n{user_msg}"},
+                {"role": "user", "content": f"{system}\n\n---\n\n{user_msg}"},
             ],
         }
-        # reasoning_effort is an o3/o4 parameter — NOT for o1
         if MODEL.startswith(("o3", "o4")):
             payload["reasoning_effort"] = "high"
     else:
@@ -470,7 +612,7 @@ def _openai_review(user_msg: str) -> str:
             "model": MODEL,
             "max_tokens": 4096,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user",   "content": user_msg},
             ],
         }
