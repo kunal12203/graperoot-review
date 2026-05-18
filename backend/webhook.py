@@ -447,11 +447,16 @@ def _ast_fact_blast_radius(
     if not affected_files:
         return None  # No callers in graph — not the same as "confirmed no callers"
 
-    # Only consider real repo file paths (filter stdlib, external modules)
-    candidates = [
-        f for f in affected_files
-        if "/" in f and not f.startswith((".", "_"))
-    ][:10]
+    # Strip file::symbol notation → keep only the file path
+    stripped = [f.split("::")[0] for f in affected_files]
+    # Deduplicate (multiple symbols from same file) and filter stdlib/external
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for f in stripped:
+        if f not in seen and "/" in f and not f.startswith((".", "_")):
+            seen.add(f)
+            candidates.append(f)
+    candidates = candidates[:10]
     if not candidates:
         return None
 
