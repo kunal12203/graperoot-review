@@ -489,7 +489,9 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
     else:
         try:
             out      = json.loads(Path(json_out).read_text())
-            findings = out.get("findings", [])
+            # report is the full 14-category dict; findings = inline_comments
+            report   = out.get("report", {})
+            findings = (report.get("inline_comments") or out.get("findings", []))
             cost     = out.get("cost_usd", 0)
         except Exception:
             pass

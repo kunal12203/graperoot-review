@@ -251,50 +251,113 @@ def parse_diff(diff: str) -> tuple[list[str], dict[str, str]]:
     return files, hunks
 
 
-# ── Claude review ──────────────────────────────────────────────────────────────
+# ── Master prompt (14-category structured output) ─────────────────────────────
 
-SYSTEM_PROMPT = """You are a world-class staff engineer doing an exhaustive, precise code review.
-You have the diff, the full content of changed files BEFORE and AFTER the PR, and the
-content of files that import from the changed modules.
-
-Return a JSON array of review comments. Each comment:
-{
-  "path": "src/file.ts",
-  "line": 42,                  // line number in the NEW file
-  "severity": "CRITICAL|HIGH|MEDIUM|LOW",
-  "title": "one-line summary",
-  "body": "explanation. Quote the EXACT problematic line(s) from the provided context, then give the fix."
-}
+SYSTEM_PROMPT = """You are an expert code reviewer with deep knowledge of security, distributed
+systems, and production reliability. Analyse this PR and produce a structured JSON report.
 
 ANTI-HALLUCINATION RULES — violating these is worse than finding nothing:
-- NEVER invent code that is not in the provided context. If you say 'the code has X', X must appear verbatim in the diff or file content above.
-- Before reporting a bug, locate the exact line in the provided code. If you cannot find it, do not report it.
-- Do not assume code exists outside what is shown. Only reason about what you can see.
+- NEVER invent code that is not in the provided context. Quote exact lines verbatim.
+- Before reporting a bug, find the exact line in the diff or file content. If absent, skip it.
+- Do not assume code exists outside what is shown.
 
-Severity guide:
-- CRITICAL: correctness bug, data loss, security vulnerability, broken public API
-- HIGH: logic error, missing error handling, race condition, incomplete refactor that breaks callers
-- MEDIUM: behavioral change vs the base, missing re-export, asymmetry in a refactor
-- LOW: code smell, unclear naming, non-obvious side effect
+Return ONLY valid JSON with this exact shape:
 
-For refactoring PRs that move code to a sansio/shared layer — do ALL of these:
+{
+  "pr_summary": "2-3 sentence summary: what it does, production risk level, key concern",
 
-1. INVENTORY: List every class and public method in the BASE version of each changed file.
+  "inline_comments": [
+    {
+      "file": "path/to/file",
+      "line": 42,
+      "severity": "CRITICAL|HIGH|MEDIUM|LOW",
+      "category": "logic|security|performance|reliability|test|contract|refactor",
+      "title": "one-line summary",
+      "comment": "detailed explanation with WHY this is a problem. Quote the EXACT line(s) from context.",
+      "suggestion": "```suggestion\\n// corrected code\\n```",
+      "graph_proven": true
+    }
+  ],
 
-2. PLACEMENT CHECK: For each method LEFT in the original module (not moved):
-   - Read the method BODY carefully (not just its signature/parameters).
-   - Does the body actually reference framework-specific types? (e.g. Flask, Request, Response)
-   - If the body only calls self.X() or other methods that WERE moved, flag it — it's an orphaned method that could have moved.
-   - Report: "Method X has parameter type Flask but its body never uses it — it only calls self.Y() which is now in sansio."
+  "sast_findings": [
+    {
+      "severity": "CRITICAL|HIGH|MEDIUM",
+      "rule": "rule-id or CWE or OWASP category",
+      "file": "path", "line": 0,
+      "detail": "specific explanation with exploit scenario"
+    }
+  ],
 
-3. ASYMMETRY CHECK: If sibling methods (is_null_session, null_session_class) moved to sansio but make_null_session did not, that's an asymmetry. Report it.
+  "iac_findings": [
+    {
+      "severity": "HIGH",
+      "file": "path to .tf / .yaml / Dockerfile",
+      "rule": "e.g. missing resource limits, hardcoded secret",
+      "detail": "specific risk and fix"
+    }
+  ],
 
-4. DEFAULT CHANGES: Compare class-level attribute defaults between BASE and HEAD. Any change to a default (False → True) is a behavioral change — report it with the exact attribute name and both values.
+  "secrets_found": [
+    {"file": "path", "line": 0, "type": "API key / token", "value_preview": "sk-a..."}
+  ],
 
-5. DOCSTRING CHECK: Read docstrings for obvious typos (run-on words, missing spaces).
+  "dead_code": ["exported symbols with no importers — only if graph context confirms"],
 
-Return ONLY the JSON array, no markdown wrapper, no explanation outside the array.
-If nothing is wrong, return []."""
+  "duplicate_code": [
+    {"files": ["file1", "file2"], "pattern": "description of duplicated logic"}
+  ],
+
+  "complex_functions": [
+    {"file": "path", "function": "name", "cyclomatic_complexity": "high|very_high", "reason": "why"}
+  ],
+
+  "test_coverage_gaps": [
+    {"file": "path", "function_or_class": "name", "risk": "why missing test is dangerous here"}
+  ],
+
+  "blast_radius": {
+    "direct_callers": ["files that import the changed files — from graph context"],
+    "cross_repo_risk": "description if this change breaks other repos or configs",
+    "risk": "CRITICAL|HIGH|MEDIUM|LOW",
+    "explanation": "specific production scenario if this PR ships with bugs"
+  },
+
+  "attack_surface_delta": {
+    "increased": ["new endpoints, new data access paths, new auth flows added"],
+    "decreased": ["removed attack surface"],
+    "net_risk": "INCREASED|DECREASED|NEUTRAL"
+  },
+
+  "jira_intent_check": {
+    "matches_description": true,
+    "gaps": ["things the PR description promises but the diff does not implement"],
+    "missing_files": ["files that MUST change for this PR to be complete but are absent"]
+  },
+
+  "missing_from_diff": [
+    "files that should have been changed but were not, based on what the PR claims to do"
+  ],
+
+  "quality_gates": {
+    "pass": false,
+    "blocking_issues": ["CRITICAL/HIGH issues that must be fixed before merge"]
+  },
+
+  "security_grade": "A|B|C|D|F",
+  "quality_score": 0,
+  "review_confidence": "HIGH|MEDIUM|LOW"
+}
+
+Rules:
+- inline_comments: no hard cap, sorted by severity (CRITICAL first), include suggestion when possible
+- graph_proven=true only when blast_radius context was used to derive the finding
+- iac_findings: check .tf, .yaml (k8s/helm), Dockerfile, .github/workflows in diff
+- missing_from_diff: THE MOST IMPORTANT CHECK — what SHOULD be in diff but isn't
+- For refactoring PRs: inventory every class/method in BASE, check if each is in HEAD or new module.
+  For methods left behind: read the BODY (not just signature) — does it actually use framework types?
+  Flag orphaned methods whose body only calls self.X() methods that were already moved.
+- quality_score: 0–100 (100=perfect, 0=do not merge)
+- Return ONLY the JSON, no markdown wrapper, no explanation outside JSON"""
 
 
 def claude_review(
@@ -305,11 +368,11 @@ def claude_review(
     impact_summary: str,
     symbol_excerpts: str,
     file_context: str = "",
-) -> list[dict]:
-    """Call Claude or GPT-4o with all context and return structured review comments."""
+) -> dict:
+    """Call the model and return the full 14-category structured report."""
     if not ANTHROPIC_KEY and not OPENAI_KEY:
         print("Set ANTHROPIC_API_KEY or OPENAI_API_KEY", file=sys.stderr)
-        return []
+        return {}
 
     user_msg = f"""## PR: {pr_title}
 
@@ -326,18 +389,13 @@ def claude_review(
 ```
 
 ### Full file content — BASE and HEAD versions + affected files
-Use this to find: omissions (things in BASE not in HEAD), incomplete refactors,
-missing re-exports, broken import chains, and behavioral changes.
-Every issue you report MUST be traceable to specific lines in this content or the diff above.
 {file_context or "(not available)"}
 
-### Blast radius — files connected to the changed modules (graph)
+### Blast radius — files connected to changed modules (graph)
 {impact_summary or "(not available)"}
 
 ### Key symbol excerpts
-{symbol_excerpts or "(none)"}
-
-Review this PR. Apply the anti-hallucination rules strictly. Return JSON array only."""
+{symbol_excerpts or "(none)"}"""
 
     if USE_OPENAI:
         text = _openai_review(user_msg)
@@ -346,12 +404,22 @@ Review this PR. Apply the anti-hallucination rules strictly. Return JSON array o
 
     text = re.sub(r"^```(?:json)?\n?", "", text.strip())
     text = re.sub(r"\n?```$", "", text)
-    print(f"  Model response ({len(text)} chars): {text[:500]}")
+    print(f"  Model response ({len(text)} chars): {text[:300]}")
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, list):
+            # Backwards-compat: model returned old flat array format
+            return {"inline_comments": result}
+        return result
     except json.JSONDecodeError:
-        print(f"  Model returned non-JSON:\n{text[:600]}", file=sys.stderr)
-        return []
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+        print(f"  Model returned non-JSON:\n{text[:400]}", file=sys.stderr)
+        return {}
 
 
 def _anthropic_review(user_msg: str) -> str:
@@ -426,46 +494,132 @@ def _openai_review(user_msg: str) -> str:
 
 # ── Post comments to GitHub ────────────────────────────────────────────────────
 
+def _sev_emoji(s: str) -> str:
+    return {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}.get(s.upper(), "·")
+
+
 def post_review(
     owner: str, repo: str, pr_num: int,
-    comments: list[dict],
+    report: dict,
     pr_head_sha: str,
     dry_run: bool = False,
 ) -> None:
-    if not comments:
+    inline   = report.get("inline_comments", [])
+    sast     = report.get("sast_findings", [])
+    iac      = report.get("iac_findings", [])
+    secrets  = report.get("secrets_found", [])
+    missing  = report.get("missing_from_diff", [])
+    blast    = report.get("blast_radius", {})
+    gates    = report.get("quality_gates", {})
+    summary  = report.get("pr_summary", "")
+    score    = report.get("quality_score")
+    grade    = report.get("security_grade", "")
+    gaps     = report.get("test_coverage_gaps", [])
+    dead     = report.get("dead_code", [])
+    attack   = report.get("attack_surface_delta", {})
+
+    total_findings = len(inline) + len(sast) + len(iac) + len(secrets) + len(missing)
+
+    if total_findings == 0 and not gates.get("blocking_issues"):
         print("  No issues found — PR looks clean.")
         gh(f"/repos/{owner}/{repo}/issues/{pr_num}/comments",
            method="POST",
            body={"body": "**GrapeRoot Review** — No issues found. This PR looks clean.\n\n_Powered by [GrapeRoot](https://graperoot.dev) — graph-aware AI review_"})
         return
 
-    # Build GitHub review body (summary at top)
-    by_sev: dict[str, list[dict]] = {}
-    for c in comments:
-        by_sev.setdefault(c["severity"], []).append(c)
+    lines: list[str] = ["**GrapeRoot Review**\n"]
 
-    summary_lines = ["**GrapeRoot Review**\n"]
+    if summary:
+        lines.append(f"> {summary}\n")
+
+    # Score / grade
+    score_parts = []
+    if score is not None:
+        score_parts.append(f"Quality: **{score}/100**")
+    if grade:
+        score_parts.append(f"Security: **{grade}**")
+    if not gates.get("pass", True):
+        score_parts.append("**❌ Do not merge**")
+    if score_parts:
+        lines.append(" · ".join(score_parts) + "\n")
+
+    # Inline comment summary
+    by_sev: dict[str, list] = {}
+    for c in inline:
+        by_sev.setdefault(c.get("severity", "LOW"), []).append(c)
     for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
         items = by_sev.get(sev, [])
         if items:
-            emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}[sev]
-            summary_lines.append(f"{emoji} **{sev}** ({len(items)}): " +
-                                  ", ".join(c["title"] for c in items))
+            emoji = _sev_emoji(sev)
+            lines.append(f"{emoji} **{sev}** ({len(items)}): " + ", ".join(c.get("title","") for c in items))
 
-    summary_lines += [
-        "",
-        "_Powered by [GrapeRoot](https://graperoot.dev) — graph-aware AI review_",
-    ]
-    body = "\n".join(summary_lines)
+    # SAST
+    if sast:
+        lines.append(f"\n**SAST findings ({len(sast)})**")
+        for f in sast[:5]:
+            lines.append(f"- `{f.get('rule','')}` [{f.get('severity','')}] — {f.get('detail','')[:120]}")
 
-    # Build inline comments (GitHub requires position in diff or line + side)
+    # IaC
+    if iac:
+        lines.append(f"\n**IaC findings ({len(iac)})**")
+        for f in iac[:5]:
+            lines.append(f"- `{f.get('file','')}` — {f.get('rule','')} — {f.get('detail','')[:100]}")
+
+    # Secrets
+    if secrets:
+        lines.append(f"\n**⚠️ Secrets detected ({len(secrets)})**")
+        for s in secrets:
+            lines.append(f"- `{s.get('file','')}:{s.get('line','')}` — {s.get('type','')} (`{s.get('value_preview','')}`)")
+
+    # Missing from diff
+    if missing:
+        lines.append(f"\n**Missing from diff** (files that should have changed)")
+        for m in missing[:8]:
+            lines.append(f"- `{m}`")
+
+    # Blast radius
+    if blast and blast.get("risk") in ("CRITICAL", "HIGH"):
+        lines.append(f"\n**Blast radius: {blast.get('risk','')}**")
+        lines.append(blast.get("explanation", "")[:200])
+        callers = blast.get("direct_callers", [])
+        if callers:
+            lines.append("Affected files: " + ", ".join(f"`{c}`" for c in callers[:6]))
+
+    # Test gaps
+    if gaps:
+        lines.append(f"\n**Test coverage gaps ({len(gaps)})**")
+        for g in gaps[:4]:
+            lines.append(f"- `{g.get('function_or_class','')}` in `{g.get('file','')}` — {g.get('risk','')[:80]}")
+
+    # Dead code
+    if dead:
+        lines.append(f"\n**Dead exports** (graph-confirmed): " + ", ".join(f"`{d}`" for d in dead[:5]))
+
+    # Attack surface
+    if attack.get("net_risk") == "INCREASED" and attack.get("increased"):
+        lines.append(f"\n**Attack surface increased:** " + ", ".join(attack["increased"][:3]))
+
+    # Blocking issues
+    if gates.get("blocking_issues"):
+        lines.append("\n**Blocking issues**")
+        for b in gates["blocking_issues"][:5]:
+            lines.append(f"- {b}")
+
+    lines.append("\n_Powered by [GrapeRoot](https://graperoot.dev) — graph-aware AI review_")
+    body = "\n".join(lines)
+
+    # Build inline comments from the inline_comments field
     gh_comments = []
-    for c in comments[:MAX_COMMENTS]:
+    for c in inline[:MAX_COMMENTS]:
+        sug = c.get("suggestion", "")
+        comment_body = f"**[{c.get('severity','?')}] {c.get('title','')}**\n\n{c.get('comment', c.get('body',''))}"
+        if sug:
+            comment_body += f"\n\n{sug}"
         gh_comments.append({
-            "path":     c["path"],
-            "line":     c.get("line", 1),
-            "side":     "RIGHT",
-            "body":     f"**[{c['severity']}] {c['title']}**\n\n{c['body']}",
+            "path": c.get("file", c.get("path", "")),
+            "line": c.get("line", 1),
+            "side": "RIGHT",
+            "body": comment_body,
         })
 
     review_payload = {
@@ -489,21 +643,10 @@ def post_review(
     except urllib.error.HTTPError as e:
         if e.code != 422:
             raise
-        # Inline comment line numbers didn't match diff positions — fall back to
-        # a single body-only review that lists all findings inline as text.
         print("  422 on inline comments — falling back to body-only review", file=sys.stderr)
-        fallback_lines = ["**GrapeRoot Review**\n"]
-        for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
-            items = by_sev.get(sev, [])
-            for c in items:
-                emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}.get(sev, "·")
-                fallback_lines.append(
-                    f"{emoji} **[{sev}]** `{c['path']}` — **{c['title']}**\n\n{c['body']}\n"
-                )
-        fallback_lines.append("\n_Powered by [GrapeRoot](https://graperoot.dev) — graph-aware AI review_")
         fallback_payload = {
             "commit_id": pr_head_sha,
-            "body":      "\n".join(fallback_lines),
+            "body":      body,
             "event":     "COMMENT",
             "comments":  [],
         }
@@ -642,28 +785,69 @@ def main() -> None:
         compare_mode(title, body, diff_text, impact_summary, symbol_excerpts)
         return
 
-    print("  Reviewing with Claude...")
-    comments = claude_review(title, body, linked_issue, diff_text,
-                             impact_summary, symbol_excerpts, file_context)
+    # ── Deterministic pre-checks (graph-proven, no AI needed) ─────────────────
+    det_missing: list[str] = []
+    det_secrets: list[dict] = []
 
-    # Print summary
-    print(f"\n  Found {len(comments)} issue(s):\n")
-    for c in comments:
-        sev_icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","STYLE":"⚪"}.get(c["severity"],"·")
-        print(f"  {sev_icon} [{c['severity']:8}] {c['path']}:{c.get('line','?')}")
-        print(f"             {c['title']}")
-        print(f"             {c['body'][:120]}...\n" if len(c['body']) > 120
-              else f"             {c['body']}\n")
+    # 1. Missing from diff: files that import changed files but aren't in the diff
+    if impact_summary:
+        import re as _re2
+        # Extract file paths mentioned in blast radius that aren't in the PR diff
+        mentioned = _re2.findall(r'[\w./\-]+\.(?:py|ts|js|go|java|rs|rb|cs)', impact_summary)
+        for f in mentioned:
+            if f not in changed_files and f not in det_missing:
+                det_missing.append(f)
+
+    # 2. Secrets scan: regex over the diff (deterministic, no AI)
+    SECRET_PATTERNS = [
+        (r'(?i)(api[_-]?key|secret|password|token|auth)["\s:=]+["\']?([A-Za-z0-9+/]{20,})["\']?', "Potential secret"),
+        (r'sk-[A-Za-z0-9]{32,}', "OpenAI API key"),
+        (r'ghp_[A-Za-z0-9]{36}', "GitHub PAT"),
+        (r'AKIA[A-Z0-9]{16}', "AWS Access Key"),
+        (r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', "Private key"),
+    ]
+    for i, line in enumerate(diff_text.splitlines(), 1):
+        if not line.startswith("+"):
+            continue
+        for pat, label in SECRET_PATTERNS:
+            if _re2.search(pat, line):
+                det_secrets.append({"file": "diff", "line": i, "type": label,
+                                    "value_preview": line[1:50].strip()})
+                break
+
+    if det_missing:
+        print(f"  Deterministic: {len(det_missing)} files may be missing from diff")
+    if det_secrets:
+        print(f"  Deterministic: {len(det_secrets)} potential secret(s) detected")
+
+    print("  Reviewing with AI...")
+    report = claude_review(title, body, linked_issue, diff_text,
+                           impact_summary, symbol_excerpts, file_context)
+
+    # Merge deterministic findings into report
+    if det_missing:
+        existing_missing = report.get("missing_from_diff", [])
+        report["missing_from_diff"] = list(dict.fromkeys(existing_missing + det_missing))
+    if det_secrets:
+        report.setdefault("secrets_found", []).extend(det_secrets)
+
+    inline = report.get("inline_comments", [])
+    total = (len(inline) + len(report.get("sast_findings", [])) +
+             len(report.get("iac_findings", [])) + len(report.get("missing_from_diff", [])))
+    print(f"\n  Found {total} total findings ({len(inline)} inline):")
+    for c in inline:
+        sev_icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵"}.get(c.get("severity",""),"·")
+        print(f"  {sev_icon} [{c.get('severity','?'):8}] {c.get('file',c.get('path','?'))}:{c.get('line','?')} {c.get('title','')}")
 
     t_review = time.time()
-    post_review(owner, repo, pr_num, comments, head_sha, dry_run=args.dry)
+    post_review(owner, repo, pr_num, report, head_sha, dry_run=args.dry)
 
     if args.json_out:
-        cost_usd = _last_cost if hasattr(sys.modules[__name__], "_last_cost") else 0.0
         import pathlib
         pathlib.Path(args.json_out).write_text(json.dumps({
-            "findings": comments,
-            "cost_usd": cost_usd,
+            "findings": inline,
+            "report":   report,
+            "cost_usd": 0.0,
             "elapsed_s": round(time.time() - t_review, 1),
         }))
 
