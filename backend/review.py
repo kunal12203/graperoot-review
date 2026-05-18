@@ -117,24 +117,39 @@ def build_file_context(owner: str, repo: str, changed_files: list[str],
     This is the no-clone alternative to the AST graph — gives the model full visibility
     into what existed before the PR and what adjacent files look like.
     """
+    # High-signal filename patterns — fetch these first regardless of diff order.
+    # Only truly general patterns (code that tends to contain bugs), not domain-specific.
+    _PRIORITY = re.compile(
+        r'(math|calc|util|helper|valid|auth|crypt|sign|hash|schema|model'
+        r'|handler|middleware|guard|policy|permission|sanitiz|escape'
+        r'|response|request|error|exception|retry|timeout|parse|serial|deserial'
+        r'|encode|decode|transform|convert|format|process)',
+        re.I
+    )
+    priority = [f for f in changed_files if _PRIORITY.search(f.rsplit('/', 1)[-1])]
+    others   = [f for f in changed_files if f not in priority]
+    ordered  = priority + others  # high-signal files first
+
     parts: list[str] = []
     budget = max_chars
 
-    for path in changed_files[:6]:
-        if budget <= 0:
+    for path in ordered[:14]:          # up from 6 → 14
+        if budget <= 200:
             break
+
+        per_file_base = min(8000, budget // max(1, len(ordered[:14]) - ordered[:14].index(path)))
 
         # Base (before PR) — FULL content, critical for spotting omissions
         base = gh_file(owner, repo, path, base_sha)
         if base:
-            snippet = base[:min(15000, budget)]
+            snippet = base[:per_file_base]
             parts.append(f"### {path}  [BASE — before this PR]\n```\n{snippet}\n{'...(truncated)' if len(base) > len(snippet) else ''}\n```")
             budget -= len(snippet)
 
         # Head (after PR) for new files or heavily modified ones
         head = gh_file(owner, repo, path, head_sha)
         if head and head != base:
-            snippet = head[:min(10000, budget)]
+            snippet = head[:min(5000, budget)]
             parts.append(f"### {path}  [HEAD — after this PR]\n```\n{snippet}\n{'...(truncated)' if len(head) > len(snippet) else ''}\n```")
             budget -= len(snippet)
 
@@ -368,12 +383,13 @@ ANTI-HALLUCINATION: Quote exact lines from the provided context. Do not invent c
 
 You MUST do these checks in order and report findings for EACH:
 
-STEP 1 — REFACTOR INVENTORY: List every class and public method in the BASE version of changed files.
-Then for each method NOT moved to the new module:
-  - Read its BODY (not just signature). Does the body actually call framework-specific APIs?
-  - If the body only calls self.X() where X was already moved, this is an ORPHAN — report it as HIGH.
-  Example: `def make_null_session(self, app: Flask): return self.null_session_class()`
-  — body never uses `app`, only calls `self.null_session_class()` which moved to sansio → flag it.
+STEP 1 — REFACTOR INVENTORY: List every class and public method/function in the BASE version of changed files.
+Then for each symbol NOT present in the HEAD or the new module:
+  - Read its BODY. Does the body actually use framework/platform-specific APIs, or does it only call
+    other methods that were already moved?
+  - If the body is framework-agnostic and the helpers it calls were moved → it's an ORPHAN, report HIGH.
+  - Do NOT apply Python/Flask terminology (sansio, SessionMixin, etc.) to non-Python projects.
+    Use the project's own language: for TypeScript use "shared module" or "utility layer".
 
 STEP 2 — SIBLING ASYMMETRY: Find methods moved to the new module. Find their sibling methods.
 If sibling A moved but sibling B did not, and B has no framework dependency in its body → flag B.
