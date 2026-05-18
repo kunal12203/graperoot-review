@@ -712,12 +712,18 @@ def claude_review(
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
     notes: dict[str, list[dict]] = {}
 
+    # arch and security benefit from o1 reasoning; all others use gpt-4o (5x faster)
+    _FAST_CHECKS = {"arithmetic", "mutation", "n_plus_one", "falsy_traps",
+                    "api_compat", "quality", "rust_bounds"}
+
     def run_check(name: str, system: str) -> None:
         check_ctx = _build_check_context(name)
         print(f"  [{name}] context={len(check_ctx)} chars")
         try:
             if USE_OPENAI:
-                raw = _openai_review(check_ctx, system_override=system)
+                # Use gpt-4o for pattern-matching checks, o1 only for semantic reasoning
+                fast_model = "gpt-4o" if name in _FAST_CHECKS else None
+                raw = _openai_review(check_ctx, system_override=system, model_override=fast_model)
             else:
                 raw = _anthropic_review(check_ctx, system_override=system)
             # Each check returns a flat JSON array
@@ -805,22 +811,23 @@ def _anthropic_review(user_msg: str, system_override: str = "") -> str:
         raise
 
 
-def _openai_review(user_msg: str, system_override: str = "") -> str:
+def _openai_review(user_msg: str, system_override: str = "", model_override: str | None = None) -> str:
     system = system_override or SYSTEM_PROMPT
-    is_reasoning = MODEL.startswith(("o1", "o3", "o4"))
+    effective_model = model_override or MODEL
+    is_reasoning = effective_model.startswith(("o1", "o3", "o4"))
     if is_reasoning:
         payload = {
-            "model": MODEL,
+            "model": effective_model,
             "max_completion_tokens": 8000,
             "messages": [
                 {"role": "user", "content": f"{system}\n\n---\n\n{user_msg}"},
             ],
         }
-        if MODEL.startswith(("o3", "o4")):
+        if effective_model.startswith(("o3", "o4")):
             payload["reasoning_effort"] = "high"
     else:
         payload = {
-            "model": MODEL,
+            "model": effective_model,
             "max_tokens": 4096,
             "messages": [
                 {"role": "system", "content": system},
