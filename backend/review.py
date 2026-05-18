@@ -642,8 +642,8 @@ def claude_review(
         "falsy_traps": (re.compile(r'\bor\s+\w|\bif\s+not\b|\|\|\s|\?\?\s|page\s+or\b|\bnot\s+isinstance\b|is\s+None\b|is\s+not\s+None\b', re.I), 8),
         # arch: ONLY class-level declarations (no imports/from — too noisy)
         # arch: class/function defs + window=12 to capture full method bodies
-        # (make_null_session body is 2-3 lines below def → needs enough window)
-        "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function |\+class |\+def )', re.M), 12),
+        # Note: diff lines are indented (+    def foo), so match +\s*def not just +def
+        "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function )|\+\s*(?:class |def |export (?:class|function|default)|async function )', re.M), 12),
         # api_compat: response/request shapes, field names, return values
         "api_compat":  (re.compile(r'return\s*\{|response\.|\.json\(|body\s*=|\bdetails\b|\berror\b|\bmessage\b|\bdata\b|\bstatus\b|\btype\b.*:\s*\w', re.I), 8),
         # security: broad — auth, roles, errors, redirects, limits, secrets
