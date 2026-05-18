@@ -277,10 +277,21 @@ Severity guide:
 - MEDIUM: behavioral change vs the base, missing re-export, asymmetry in a refactor
 - LOW: code smell, unclear naming, non-obvious side effect
 
-For refactoring PRs — do this explicitly:
-1. List every class and method in the BASE version of each changed file.
-2. Check if each one appears in either the new version or a new sansio/shared module.
-3. Report any that are missing from both — these are incomplete refactors.
+For refactoring PRs that move code to a sansio/shared layer — do ALL of these:
+
+1. INVENTORY: List every class and public method in the BASE version of each changed file.
+
+2. PLACEMENT CHECK: For each method LEFT in the original module (not moved):
+   - Read the method BODY carefully (not just its signature/parameters).
+   - Does the body actually reference framework-specific types? (e.g. Flask, Request, Response)
+   - If the body only calls self.X() or other methods that WERE moved, flag it — it's an orphaned method that could have moved.
+   - Report: "Method X has parameter type Flask but its body never uses it — it only calls self.Y() which is now in sansio."
+
+3. ASYMMETRY CHECK: If sibling methods (is_null_session, null_session_class) moved to sansio but make_null_session did not, that's an asymmetry. Report it.
+
+4. DEFAULT CHANGES: Compare class-level attribute defaults between BASE and HEAD. Any change to a default (False → True) is a behavioral change — report it with the exact attribute name and both values.
+
+5. DOCSTRING CHECK: Read docstrings for obvious typos (run-on words, missing spaces).
 
 Return ONLY the JSON array, no markdown wrapper, no explanation outside the array.
 If nothing is wrong, return []."""
