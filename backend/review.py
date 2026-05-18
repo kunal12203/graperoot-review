@@ -394,19 +394,41 @@ Return ONLY JSON:
   "jira_intent_check": {"matches_description":true,"gaps":[],"missing_files":[]}
 }"""
 
-SEC_PROMPT = """You are a security engineer reviewing a PR for vulnerabilities and correctness bugs.
-Your ONLY job: find bugs, security issues, and data integrity problems.
+SEC_PROMPT = """You are a security engineer reviewing a PR for bugs, vulnerabilities, and data integrity issues.
+Your ONLY job: find things that will crash, corrupt data, or behave incorrectly at runtime.
 
-ANTI-HALLUCINATION: Every finding must cite exact code from the provided context.
+ANTI-HALLUCINATION: Every finding must cite the exact line(s) from the provided context. Do not invent code.
 
-Focus on:
-1. SECURITY — injection, auth bypass, privilege escalation, insecure defaults, exposed secrets
-2. CORRECTNESS — logic bugs that cause wrong behavior, silent data loss, race conditions
-3. DATA INTEGRITY — incorrect default values, missing validation, undefined behavior
-4. BEHAVIORAL CHANGES — anything that changes observable behavior for callers
+Run these checks IN ORDER. Do not skip any.
 
-Every inline comment title MUST begin with `[LLM-HEURISTIC: security-check]`. Example:
-  "title": "[LLM-HEURISTIC: security-check] Reversed secret key order changes signing"
+STEP 1 — ARITHMETIC SAFETY (highest priority):
+For every division, modulo, and numeric conversion in the diff:
+  a. Division/modulo: can the denominator ever be zero? Check every call site and data source.
+     Look for: `x / y`, `x % y`, `Number(bigint) / Number(other)` where other could be 0n.
+  b. BigInt↔float traps: `Number(bigint)` where bigint is large → Infinity.
+     Then `BigInt(Math.round(Infinity))` or `BigInt(Math.ceil(Infinity))` throws RangeError.
+     Pattern to find: any chain of `Number(bigint)` → arithmetic → `BigInt(result)`.
+  c. NaN propagation: any place where NaN can silently replace a numeric value.
+Report each as HIGH or CRITICAL with the exact expression and the input value that causes failure.
+
+STEP 2 — MUTATION TRAPS (Object.assign, spread, merge):
+For every `Object.assign(target, source)` or `{...target, ...source}`:
+  a. List the keys already written to target before the assign.
+  b. Check if source can contain any of those same keys (user input, `extra` param, options bag).
+  c. If yes: source silently overwrites target's values — report as HIGH.
+     Exact pattern: `body = { error: code, message: msg }; Object.assign(body, extra)` →
+     if extra has `error` or `message`, they are overwritten.
+
+STEP 3 — REDUNDANT / RACY OPERATIONS:
+  a. Same data fetched from network/DB twice in the same request or render cycle.
+  b. A loop where an inner call re-fetches data already available in an outer scope.
+  c. Report double fetches as MEDIUM (race window + wasted latency).
+
+STEP 4 — SECURITY (original focus):
+  - Injection, auth bypass, privilege escalation, insecure defaults, exposed secrets.
+  - Behavioral changes that affect callers (key ordering, default values, field semantics).
+
+Every inline comment title MUST begin with `[LLM-HEURISTIC: security-check]`.
 
 Return ONLY JSON:
 {
@@ -418,17 +440,32 @@ Return ONLY JSON:
   "attack_surface_delta": {"increased":[],"decreased":[],"net_risk":"NEUTRAL"}
 }"""
 
-QUAL_PROMPT = """You are a quality engineer reviewing a PR for reliability, testability, and maintainability.
+QUAL_PROMPT = """You are a quality engineer reviewing a PR for reliability, performance, testability, and maintainability.
 Your ONLY job: find quality gaps.
 
 ANTI-HALLUCINATION: Every finding must cite exact code from the provided context.
 
-Focus on:
-1. TEST GAPS — risky code paths with no test coverage
-2. DEAD CODE — exported symbols with no importers (use graph context)
-3. COMPLEXITY — functions that are too long, deeply nested, or have too many responsibilities
-4. DOCUMENTATION — missing or wrong docstrings, typos, missing space in docstrings
-5. DUPLICATION — similar logic in multiple places
+Run these checks IN ORDER:
+
+STEP 1 — ALGORITHMIC COMPLEXITY (often overlooked, high impact):
+For every loop in the diff:
+  a. Does the loop body call a function that itself iterates over a collection?
+     Pattern: `for x of list { list2.find(y => y.id === x.id) }` → O(n²).
+  b. Is there a helper function called on EVERY iteration that does a linear scan internally?
+     Look at the helper's body — does it contain `.find()`, `.filter()`, `.indexOf()`, or a for-loop?
+  c. If yes → report as HIGH with the outer loop + the inner scan, plus the O(n²) impact at scale.
+     Suggest: build a Map/Set once before the loop, look up in O(1) per iteration.
+
+STEP 2 — REDUNDANT COMPUTATIONS:
+  a. Is the same value computed or fetched more than once within a loop or function?
+  b. Could it be cached/memoized before the loop?
+  Report as MEDIUM.
+
+STEP 3 — TEST GAPS — risky code paths with no test coverage
+STEP 4 — DEAD CODE — exported symbols with no importers (use graph context)
+STEP 5 — COMPLEXITY — functions that are too long or deeply nested
+STEP 6 — DOCUMENTATION — docstring typos, missing spaces, run-on words
+STEP 7 — DUPLICATION — similar logic in multiple places
 
 Every inline comment title MUST begin with `[LLM-HEURISTIC: quality-check]`. Example:
   "title": "[LLM-HEURISTIC: quality-check] Docstring missing space before backtick"
