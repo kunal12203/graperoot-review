@@ -563,23 +563,55 @@ def claude_review(
 ### Key symbol excerpts
 {symbol_excerpts or "(none)"}"""
 
-    # ── Trim context per check so o1 has room to output findings ─────────────
-    # o1 splits max_completion_tokens between reasoning and output.
-    # With 40k input, all tokens go to reasoning → empty output.
-    # Each check gets: diff (first 12k) + file context (first 8k) = ~20k.
-    diff_section   = diff_text[:12000]
-    file_section   = file_context[:8000]
-    check_context  = f"{context[:2000]}\n\n### Diff\n```diff\n{diff_section}\n```\n\n### Key file content\n{file_section}"
+    # ── Per-check context: diff + only the lines relevant to each check ────────
+    # o1's max_completion_tokens covers BOTH reasoning and output.
+    # Passing 40k chars leaves no room for output → every check returns [].
+    # Solution: each check gets the diff (most important — shows what changed)
+    # plus a filtered subset of file content containing lines relevant to it.
+
+    _CHECK_PATTERNS: dict[str, re.Pattern] = {
+        "arithmetic":  re.compile(r'[*/%.]\s|Number\(|BigInt\(|Math\.|NaN|Infinity', re.I),
+        "mutation":    re.compile(r'Object\.assign|\.update\(|\.merge\(|\.\.\.|spread', re.I),
+        "n_plus_one":  re.compile(r'for |while |forEach|\.map\(|\.filter\(|\.objects\.|session\.query|\.find\(|SELECT', re.I),
+        "falsy_traps": re.compile(r'\bor\b|\bif not\b|\bif !\b|\|\||\?\?|\.length|is None|is not None', re.I),
+        "arch":        re.compile(r'def |class |function |export |import |from ', re.I),
+        "quality":     re.compile(r'for |while |def |function |TODO|FIXME|docstring|"""', re.I),
+    }
+
+    def _extract_relevant(content: str, pattern: re.Pattern, window: int = 5) -> str:
+        """Extract lines matching pattern plus window lines of context."""
+        lines = content.splitlines()
+        keep: set[int] = set()
+        for i, line in enumerate(lines):
+            if pattern.search(line):
+                for j in range(max(0, i - window), min(len(lines), i + window + 1)):
+                    keep.add(j)
+        if not keep:
+            return content[:3000]   # fallback: first 3k if no matches
+        return "\n".join(lines[i] for i in sorted(keep))
+
+    def _build_check_context(check_name: str) -> str:
+        pat = _CHECK_PATTERNS.get(check_name)
+        header = f"## PR: {pr_title}\n\n### Description\n{pr_body[:500] or '(none)'}\n"
+        diff_part = f"\n### Diff (what changed)\n```diff\n{diff_text[:10000]}\n```\n"
+        if pat and file_context:
+            filtered = _extract_relevant(file_context, pat, window=5)
+            file_part = f"\n### Relevant file sections (lines matching check pattern)\n{filtered[:8000]}\n"
+        else:
+            file_part = f"\n### File content\n{file_context[:4000]}\n"
+        return header + diff_part + file_part
 
     # ── Run all checks in parallel, each writing notes on ONE thing ───────────
     notes: dict[str, list[dict]] = {}
 
     def run_check(name: str, system: str) -> None:
+        check_ctx = _build_check_context(name)
+        print(f"  [{name}] context={len(check_ctx)} chars")
         try:
             if USE_OPENAI:
-                raw = _openai_review(check_context, system_override=system)
+                raw = _openai_review(check_ctx, system_override=system)
             else:
-                raw = _anthropic_review(check_context, system_override=system)
+                raw = _anthropic_review(check_ctx, system_override=system)
             # Each check returns a flat JSON array
             raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
             raw = re.sub(r"\n?```$", "", raw)
