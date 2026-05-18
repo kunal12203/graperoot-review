@@ -846,30 +846,32 @@ def detect_n_plus_one(diff_text: str) -> list[dict]:
 
 
 def detect_falsy_traps(diff_text: str) -> list[dict]:
-    """Detect `page or queryset` and similar falsy-list traps in added lines."""
+    """Detect `page or queryset` and similar falsy-list traps in added lines.
+    Matches both assignment form and argument form."""
     findings: list[dict] = []
     lines = diff_text.splitlines()
-    # Match: assignment where RHS is `a or b`, and both look like collections
-    assign_re = re.compile(r'^\+\s*(\w+)\s*=\s*(\w+)\s+or\s+(\w+)', re.I)
-    coll_hint = re.compile(r'page|queryset|result|items|rows|data|records|list', re.I)
+    # Match `a or b` anywhere on an added line where both look like collections
+    or_re    = re.compile(r'\b(\w+)\s+or\s+(\w+)', re.I)
+    coll_hint = re.compile(r'page|queryset|result|items|rows|data|records', re.I)
 
     for i, line in enumerate(lines):
-        m = assign_re.match(line)
-        if not m:
+        if not line.startswith("+"):
             continue
-        lhs, a, b = m.group(1), m.group(2), m.group(3)
-        if coll_hint.search(a) and coll_hint.search(b):
-            findings.append({
-                "file":     _detect_file_from_diff(lines, i),
-                "line":     i,
-                "severity": "CRITICAL",
-                "title":    f"[LLM-HEURISTIC: falsy-trap] `{a} or {b}` — empty list is falsy, falls through to full dataset",
-                "comment":  f"If `{a}` is an empty list (e.g. paginator returned no results), "
-                            f"`{a} or {b}` evaluates to `{b}` — the full, unpaginated dataset.\n"
-                            f"Fix: `{lhs} = {a} if {a} is not None else {b}`, or check `if {a} is not None:`.\n\n"
-                            f"Code: `{line.strip()[1:].strip()}`",
-                "check": "falsy_traps",
-            })
+        for m in or_re.finditer(line):
+            a, b = m.group(1), m.group(2)
+            if coll_hint.search(a) and coll_hint.search(b):
+                findings.append({
+                    "file":     _detect_file_from_diff(lines, i),
+                    "line":     i,
+                    "severity": "CRITICAL",
+                    "title":    f"[LLM-HEURISTIC: falsy-trap] `{a} or {b}` — empty list is falsy, bypasses correct empty result",
+                    "comment":  f"If `{a}` is an empty list (e.g. paginator returned no results for this page), "
+                                f"`{a} or {b}` evaluates to `{b}` — the full, unpaginated dataset — instead of the empty page.\n"
+                                f"Fix: use `{a} if {a} is not None else {b}` or check `if {a} is not None:` explicitly.\n\n"
+                                f"Code: `{line.strip()[1:].strip()}`",
+                    "check": "falsy_traps",
+                })
+                break  # one finding per line
     return findings
 
 
