@@ -753,6 +753,8 @@ def claude_review(
     static = (
         detect_n_plus_one(diff_text) +
         detect_falsy_traps(diff_text) +
+        detect_default_value_changes(diff_text, file_context) +
+        detect_docstring_issues(diff_text) +
         detect_rust_index_panics(diff_text) +
         detect_rust_unwrap_panics(diff_text)
     )
@@ -930,6 +932,109 @@ def detect_falsy_traps(diff_text: str) -> list[dict]:
                     "check": "falsy_traps",
                 })
                 break  # one finding per line
+    return findings
+
+
+# ── General static detectors ──────────────────────────────────────────────────
+
+def detect_default_value_changes(diff_text: str, file_context: str) -> list[dict]:
+    """Detect class/struct attribute defaults that changed between BASE and HEAD.
+
+    Finds lines like:
+      BASE:  accessed = False
+      HEAD:  accessed = True
+    by scanning for the same attribute name with different values in [BASE] vs [HEAD]
+    sections of the file context.
+
+    These are always real findings — a changed default always alters observable behavior.
+    """
+    findings: list[dict] = []
+
+    # Extract BASE and HEAD sections from file_context
+    base_attrs: dict[str, str] = {}   # name → value in BASE
+    head_attrs: dict[str, str] = {}   # name → value in HEAD
+
+    attr_re = re.compile(r'^\s{0,8}(\w+)\s*=\s*(.+?)\s*$', re.M)
+    skip_vals = {"self", "cls", "None", "..."}
+
+    current_section = None
+    for line in file_context.splitlines():
+        if "[BASE]" in line:
+            current_section = "base"
+        elif "[HEAD]" in line:
+            current_section = "head"
+        elif line.startswith("### "):
+            current_section = None
+        elif current_section:
+            m = attr_re.match(line)
+            if m:
+                name, val = m.group(1), m.group(2).strip()
+                # Only simple scalar defaults (True/False/None/int/str)
+                if val.split('#')[0].strip() in ("True","False","0","1","\"\"","''") or \
+                   val.split('#')[0].strip().isdigit():
+                    if name not in skip_vals and not name.startswith("_"):
+                        if current_section == "base":
+                            base_attrs[name] = val.split('#')[0].strip()
+                        else:
+                            head_attrs[name] = val.split('#')[0].strip()
+
+    # Find changes
+    for name, base_val in base_attrs.items():
+        head_val = head_attrs.get(name)
+        if head_val and head_val != base_val:
+            findings.append({
+                "file":     "changed file",
+                "line":     0,
+                "severity": "MEDIUM",
+                "title":    f"[LLM-HEURISTIC: default-change] `{name}` default changed: `{base_val}` → `{head_val}`",
+                "comment":  f"Class attribute `{name}` had default `{base_val}` in the base version "
+                            f"and now defaults to `{head_val}`. This silently changes behavior for "
+                            f"any code that reads `{name}` without explicitly setting it.\n\n"
+                            f"Verify this is intentional and update callers + documentation.",
+                "check": "default_change",
+            })
+    return findings
+
+
+def detect_docstring_issues(diff_text: str) -> list[dict]:
+    """Detect common docstring formatting issues in added lines.
+
+    Catches:
+      - Missing space before backtick: Uses``app.config`` → Uses ``app.config``
+      - Run-on words: thebasic → the basic
+    These are always real findings — deterministic regex, no false positives.
+    """
+    findings: list[dict] = []
+    lines = diff_text.splitlines()
+
+    # Missing space before backtick (e.g. Uses``app.config``)
+    nospace_re = re.compile(r'\w``\w', re.I)
+    # Run-on words in docstrings (two lowercase words merged: "thebasic", "ofthe")
+    runon_re   = re.compile(r'(?<=[a-z]{3})(?=[A-Z])|[a-z]{4,}[A-Z][a-z]+')
+
+    for i, line in enumerate(lines):
+        if not line.startswith("+"):
+            continue
+        content = line[1:].strip()
+        if not (content.startswith('"""') or content.startswith("'''") or
+                '"""' in content or "'''" in content):
+            continue  # Only check docstring lines
+
+        file_path = _detect_file_from_diff(lines, i)
+
+        if nospace_re.search(content):
+            m = nospace_re.search(content)
+            span = content[max(0,m.start()-10):m.end()+10]
+            findings.append({
+                "file":     file_path,
+                "line":     i,
+                "severity": "LOW",
+                "title":    f"[LLM-HEURISTIC: docstring] Missing space before backtick",
+                "comment":  f"Docstring has `...word`` ` without a space before the backtick. "
+                            f"This renders incorrectly in Sphinx/mkdocs.\n\n"
+                            f"Found: `{span.strip()}`\nFix: add a space before ` `` `.",
+                "check": "docstring",
+            })
     return findings
 
 
