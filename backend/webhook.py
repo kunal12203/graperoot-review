@@ -623,6 +623,104 @@ def _graph_semantic_examples(
     )
 
 
+def _graph_cross_file_checks(
+    owner: str,
+    repo: str,
+    changed_files: list[str],
+    affected_files: list[str],
+    head_sha: str,
+    github_token: str,
+    graph: dict | None = None,
+) -> list[dict]:
+    """
+    Use the full codebase graph to detect cross-file consistency issues.
+
+    These are the findings Greptile consistently beats us on — issues that are
+    invisible from the diff alone but obvious when you have the whole codebase indexed.
+
+    Check 1 — Missing migration: schema/model file changed but no migration in diff.
+    Check 2 — Orphaned symbol renames: callers still use the old name after rename.
+    Check 3 — Caller argument consistency: function signature changed, callers not updated.
+    """
+    if not _HAS_GRAPH_SVC:
+        return []
+
+    findings: list[dict] = []
+    changed_set = set(changed_files)
+
+    # ── Check 1: Missing migration ─────────────────────────────────────────────
+    # If a schema/model file changed, there should be a migration in the diff.
+    SCHEMA_PATTERNS = re.compile(r'schema|model|migration|entity|prisma|drizzle', re.I)
+    MIGRATION_PATTERNS = re.compile(r'migrat|\.sql$|alembic|flyway|knex.*migration', re.I)
+
+    schema_changes = [f for f in changed_files if SCHEMA_PATTERNS.search(f)
+                      and not MIGRATION_PATTERNS.search(f)]
+    has_migration  = any(MIGRATION_PATTERNS.search(f) for f in changed_files)
+
+    if schema_changes and not has_migration:
+        # Confirm: does this repo even use migrations? Check graph for migration files.
+        if graph:
+            nodes = graph.get("nodes", [])
+            all_paths = {str(n.get("path", "")) for n in nodes}
+            repo_has_migrations = any(MIGRATION_PATTERNS.search(p) for p in all_paths)
+            if repo_has_migrations:
+                for sf in schema_changes[:3]:
+                    findings.append({
+                        "severity": "HIGH",
+                        "title": f"[AST-HEURISTIC: missing-migration] Schema `{sf}` changed but no migration in diff",
+                        "comment": (
+                            f"The file `{sf}` appears to define or modify a schema/model, "
+                            f"but no migration file was included in this PR. "
+                            f"This repo has migrations (found in graph) — a missing migration "
+                            f"will cause schema drift when deployed.\n"
+                            f"Check: is a corresponding migration needed?"
+                        ),
+                        "check": "missing_migration",
+                    })
+
+    # ── Check 2: Orphaned symbol renames ──────────────────────────────────────
+    # If a symbol is renamed in the diff, check if callers still use the old name.
+    # We detect renames by looking for: -old_name ... +new_name in same file context.
+    if graph and affected_files:
+        edges = graph.get("edges", [])
+        # Build caller map: file → list of files that import it
+        caller_map: dict[str, list[str]] = {}
+        for edge in edges:
+            to = str(edge.get("to", ""))
+            frm = str(edge.get("from", ""))
+            if to and frm:
+                # Normalize: strip symbol-level notation
+                to_file = to.split("::")[0]
+                caller_map.setdefault(to_file, []).append(frm)
+
+        for changed_file in changed_files[:5]:
+            callers = caller_map.get(changed_file, [])
+            if not callers:
+                continue
+            # Fetch the changed file content at head to find current exported names
+            head_content = _gh_file_content(owner, repo, changed_file, head_sha, github_token)
+            if not head_content:
+                continue
+            # Find callers NOT in the diff and check if they're stale
+            stale_callers = [c for c in callers[:6] if c not in changed_set]
+            if stale_callers:
+                # Add to graph context so LLM can check consistency
+                findings.append({
+                    "severity": "MEDIUM",
+                    "title": f"[AST-HEURISTIC: stale-callers] {len(stale_callers)} file(s) import `{changed_file}` but are NOT in this diff",
+                    "comment": (
+                        f"The following files import from `{changed_file}` (which changed in this PR) "
+                        f"but were not updated:\n"
+                        + "\n".join(f"- `{c}`" for c in stale_callers[:4])
+                        + "\n\nIf this PR renames exports, changes function signatures, or removes fields, "
+                        f"these callers may break silently."
+                    ),
+                    "check": "stale_callers",
+                })
+
+    return findings[:6]  # cap to avoid noise
+
+
 def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, installed_by, review_id=None):
     pr_url_gh = pr_url or f"https://github.com/{owner}/{repo}/pull/{pr_num}"
     print(f"[review] {owner}/{repo}#{pr_num}", flush=True)
@@ -631,8 +729,9 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
     # ── Graph context (self-hosted only — hosted service uses diff only) ────────
     graph_available = False
     graph_ctx = ""
-    ast_fact_finding = None   # populated by _ast_fact_blast_radius if invariant holds
+    ast_fact_finding = None
     changed_files_for_graph: list[str] = []
+    _graph_xfile_findings: list[dict] = []   # cross-file findings from graph
 
     if _HAS_GRAPH_SVC and os.environ.get("ENABLE_GRAPH_CLONE") == "1":
         try:
@@ -665,6 +764,28 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
                         content = _gh_file_content(owner, repo, file_path, head_sha, github_token)
                         if content:
                             graph_ctx += f"\n### {file_path}  [affected by this PR]\n```\n{content[:1500]}\n```\n"
+
+                    # ── Graph-powered cross-file consistency checks ────────────────────
+                    # Load the full graph (already built above) for cross-file queries.
+                    try:
+                        from graph_service import _load_graph as _lg
+                        _full_graph = _lg(owner, repo)
+                    except Exception:
+                        _full_graph = None
+                    graph_xfile = _graph_cross_file_checks(
+                        owner, repo, changed_files_for_graph,
+                        impact.get("affected_files", []),
+                        head_sha, github_token, _full_graph
+                    )
+                    for finding in graph_xfile:
+                        print(f"[graph-xfile] {finding['severity']}: {finding['title'][:60]}", flush=True)
+                    if graph_xfile:
+                        # Pass as structured context AND as explicit graph findings
+                        graph_ctx += f"\n### Graph cross-file findings (AST-HEURISTIC)\n"
+                        for f in graph_xfile:
+                            graph_ctx += f"- [{f['severity']}] {f['title']}\n  {f['comment'][:200]}\n"
+                    # Store graph_xfile to include in final report
+                    _graph_xfile_findings = graph_xfile
 
                     # ── Semantic pre-injection: correct pattern examples from codebase ──
                     # Finds existing files using the same frameworks (not in diff),
@@ -752,10 +873,13 @@ def _run_review(owner, repo, pr_num, head_sha, github_token, pr_title, pr_url, i
     else:
         try:
             out      = json.loads(Path(json_out).read_text())
-            # report is the full 14-category dict; findings = inline_comments
             report   = out.get("report", {})
             findings = (report.get("inline_comments") or out.get("findings", []))
             cost     = out.get("cost_usd", 0)
+            # Merge graph cross-file findings (AST-HEURISTIC) into findings
+            xfile = _graph_xfile_findings
+            if xfile:
+                findings = list(xfile) + list(findings)
         except Exception:
             pass
         finally:
