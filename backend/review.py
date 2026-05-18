@@ -441,10 +441,21 @@ For every `Object.assign(target, source)` or `{...target, ...source}`:
      Exact pattern: `body = { error: code, message: msg }; Object.assign(body, extra)` →
      if extra has `error` or `message`, they are overwritten.
 
-STEP 3 — REDUNDANT / RACY OPERATIONS:
-  a. Same data fetched from network/DB twice in the same request or render cycle.
-  b. A loop where an inner call re-fetches data already available in an outer scope.
-  c. Report double fetches as MEDIUM (race window + wasted latency).
+STEP 3 — REDUNDANT / RACY OPERATIONS AND ORM ANTI-PATTERNS:
+  a. N+1 queries: a loop that calls Model.objects.filter/get/exists() once per iteration.
+     Any ORM query inside a for-loop is N+1 unless the full set was prefetched before the loop.
+     Fix: use filter(id__in=ids) or select_related/prefetch_related before the loop.
+  b. Same data fetched from network/DB/API twice in the same request — double fetch.
+  c. Missing filter application: a custom list/retrieve that calls get_queryset() directly
+     without wrapping in filter_queryset() — this silently bypasses all filter backends.
+
+STEP 4 — BOOLEAN / FALSY TRAPS (applies to Python, JS, Ruby):
+  a. `x or y` where x is a collection: empty list [] is falsy in Python/JS.
+     If x is a paginator result or queryset slice, `[] or fallback` silently returns
+     the full fallback when the correct answer is an empty result.
+     Pattern: `page = paginator.paginate_queryset(...); result = page or queryset`
+     → if page is [], result becomes queryset (wrong: returns everything instead of empty page).
+  b. Any `if not collection:` check that should distinguish "empty" from "absent".
 
 STEP 4 — SECURITY (original focus):
   - Injection, auth bypass, privilege escalation, insecure defaults, exposed secrets.
@@ -680,7 +691,7 @@ def _openai_review(user_msg: str, system_override: str = "") -> str:
     if is_reasoning:
         payload = {
             "model": MODEL,
-            "max_completion_tokens": 5000,
+            "max_completion_tokens": 8000,
             "messages": [
                 {"role": "user", "content": f"{system}\n\n---\n\n{user_msg}"},
             ],
