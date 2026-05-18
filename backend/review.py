@@ -704,11 +704,16 @@ def claude_review(
     for t in threads: t.start()
     for t in threads: t.join(timeout=200)
 
+    # ── Run static detectors (no LLM, deterministic) ─────────────────────────
+    static = detect_n_plus_one(diff_text) + detect_falsy_traps(diff_text)
+    for f in static:
+        print(f"  [static:{f['check']}] {f['title'][:60]}")
+
     # ── Aggregate: merge all notes, dedup by title, sort by severity ──────────
-    all_findings: list[dict] = []
+    all_findings: list[dict] = list(static)   # static findings first
     for name, findings in notes.items():
         for f in findings:
-            f.setdefault("check", name)  # provenance
+            f.setdefault("check", name)
         all_findings.extend(findings)
 
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
@@ -794,6 +799,78 @@ def _openai_review(user_msg: str, system_override: str = "") -> str:
         body = e.read().decode("utf-8", errors="replace")
         print(f"OpenAI API error {e.code}: {body[:500]}", file=sys.stderr)
         raise
+
+
+# ── Static detectors — deterministic [AST-HEURISTIC] without LLM ────────────
+
+def _detect_file_from_diff(lines: list[str], i: int) -> str:
+    for k in range(i, -1, -1):
+        if lines[k].startswith("diff --git"):
+            m = re.search(r" b/(.+)$", lines[k])
+            return m.group(1) if m else "unknown"
+    return "unknown"
+
+
+def detect_n_plus_one(diff_text: str) -> list[dict]:
+    """Detect for-loops that contain an ORM/DB query per iteration."""
+    findings: list[dict] = []
+    lines = diff_text.splitlines()
+    for_re  = re.compile(r'^\+\s+for\s+(\w+)\s+in\s+', re.I)
+    orm_re  = re.compile(r'\.objects\.\w|\.filter\s*\(|\.get\s*\(|\.exists\s*\(|session\.query\s*\(|\.find\s*\(|\.findOne\s*\(|\.execute\s*\(', re.I)
+
+    for i, line in enumerate(lines):
+        m = for_re.match(line)
+        if not m:
+            continue
+        loop_var = m.group(1)
+        body_lines = []
+        for j in range(i + 1, min(i + 15, len(lines))):
+            bline = lines[j]
+            if not bline.startswith("+"):
+                continue
+            body_lines.append(bline)
+            if orm_re.search(bline):
+                excerpt = "\n".join(l for l in [line] + body_lines[:6])
+                findings.append({
+                    "file":     _detect_file_from_diff(lines, i),
+                    "line":     i,
+                    "severity": "HIGH",
+                    "title":    f"[LLM-HEURISTIC: n-plus-one] N+1 query: '{loop_var}' loop calls DB per iteration",
+                    "comment":  f"A database query is issued for every item in the `for {loop_var}` loop.\n"
+                                f"Fix: fetch all needed records before the loop with a single query.\n\n"
+                                f"```\n{excerpt}\n```",
+                    "check": "n_plus_one",
+                })
+                break
+    return findings
+
+
+def detect_falsy_traps(diff_text: str) -> list[dict]:
+    """Detect `page or queryset` and similar falsy-list traps in added lines."""
+    findings: list[dict] = []
+    lines = diff_text.splitlines()
+    # Match: assignment where RHS is `a or b`, and both look like collections
+    assign_re = re.compile(r'^\+\s*(\w+)\s*=\s*(\w+)\s+or\s+(\w+)', re.I)
+    coll_hint = re.compile(r'page|queryset|result|items|rows|data|records|list', re.I)
+
+    for i, line in enumerate(lines):
+        m = assign_re.match(line)
+        if not m:
+            continue
+        lhs, a, b = m.group(1), m.group(2), m.group(3)
+        if coll_hint.search(a) and coll_hint.search(b):
+            findings.append({
+                "file":     _detect_file_from_diff(lines, i),
+                "line":     i,
+                "severity": "CRITICAL",
+                "title":    f"[LLM-HEURISTIC: falsy-trap] `{a} or {b}` — empty list is falsy, falls through to full dataset",
+                "comment":  f"If `{a}` is an empty list (e.g. paginator returned no results), "
+                            f"`{a} or {b}` evaluates to `{b}` — the full, unpaginated dataset.\n"
+                            f"Fix: `{lhs} = {a} if {a} is not None else {b}`, or check `if {a} is not None:`.\n\n"
+                            f"Code: `{line.strip()[1:].strip()}`",
+                "check": "falsy_traps",
+            })
+    return findings
 
 
 # ── Post comments to GitHub ────────────────────────────────────────────────────
