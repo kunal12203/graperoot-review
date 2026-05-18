@@ -362,17 +362,26 @@ Rules:
 
 # ── Specialized agent prompts ─────────────────────────────────────────────────
 
-ARCH_PROMPT = """You are a senior architect reviewing a PR for completeness and structural correctness.
-Your ONLY job: find what's MISSING, INCOMPLETE, or ASYMMETRIC.
+ARCH_PROMPT = """You are a senior architect. Your ONLY job: find what is MISSING, INCOMPLETE, or ASYMMETRIC in this PR.
 
-ANTI-HALLUCINATION: Every finding must cite exact code from the provided context.
+ANTI-HALLUCINATION: Quote exact lines from the provided context. Do not invent code.
 
-Focus on:
-1. REFACTOR COMPLETENESS — inventory every class/method in the BASE file. For each one left
-   behind: does its body actually reference framework types, or could it have moved? Flag orphans.
-2. ASYMMETRY — if sibling methods A and B moved to a shared module but C did not, flag C.
-3. MISSING FROM DIFF — what files should have changed based on the blast radius but didn't?
-4. BROKEN CONTRACTS — re-exports, API compatibility, callers that will break.
+You MUST do these checks in order and report findings for EACH:
+
+STEP 1 — REFACTOR INVENTORY: List every class and public method in the BASE version of changed files.
+Then for each method NOT moved to the new module:
+  - Read its BODY (not just signature). Does the body actually call framework-specific APIs?
+  - If the body only calls self.X() where X was already moved, this is an ORPHAN — report it as HIGH.
+  Example: `def make_null_session(self, app: Flask): return self.null_session_class()`
+  — body never uses `app`, only calls `self.null_session_class()` which moved to sansio → flag it.
+
+STEP 2 — SIBLING ASYMMETRY: Find methods moved to the new module. Find their sibling methods.
+If sibling A moved but sibling B did not, and B has no framework dependency in its body → flag B.
+
+STEP 3 — DEFAULT VALUE CHANGES: Compare class-level attribute defaults between BASE and HEAD.
+Any change (False→True, None→value) is a behavioral change → report as MEDIUM.
+
+STEP 4 — MISSING FILES: Based on blast radius, which files that import changed modules are NOT in diff?
 
 Return ONLY JSON:
 {
@@ -445,18 +454,21 @@ def _parse_json(text: str) -> dict:
     return {}
 
 
+_CODE_RE = re.compile(r'[=\(\)\[\]{}<>:;,\.\+\-\*\/]|def |class |return |import |self\.')
+
 def _verify_findings(findings: list[dict], context: str) -> list[dict]:
-    """Filter out hallucinations: keep only findings whose cited code appears in context."""
+    """Filter hallucinations: only check snippets that look like actual code, not prose."""
     verified = []
     for f in findings:
         comment = f.get("comment", f.get("body", ""))
-        cited = re.findall(r"`([^`\n]{4,80})`", comment)
+        # Only extract snippets that contain programming syntax (not prose explanation)
+        all_snippets = re.findall(r"`([^`\n]{4,120})`", comment)
+        code_snippets = [s for s in all_snippets if _CODE_RE.search(s)]
         ok = True
-        for snippet in cited[:3]:
-            # Allow short snippets (names) but verify longer code fragments
-            if len(snippet) > 10 and snippet not in context:
+        for snippet in code_snippets[:3]:
+            if snippet not in context:
                 ok = False
-                print(f"  [verify] filtered hallucination: '{snippet[:40]}' not in context")
+                print(f"  [verify] filtered: '{snippet[:50]}' not in context")
                 break
         if ok:
             verified.append(f)
@@ -600,7 +612,7 @@ def _openai_review(user_msg: str, system_override: str = "") -> str:
     if is_reasoning:
         payload = {
             "model": MODEL,
-            "max_completion_tokens": 8000,
+            "max_completion_tokens": 5000,
             "messages": [
                 {"role": "user", "content": f"{system}\n\n---\n\n{user_msg}"},
             ],
