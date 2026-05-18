@@ -390,21 +390,24 @@ Rules:
 def _check_prompt(tag: str, focus: str, rules: str) -> str:
     return f"""You are doing ONE specific code review check: {focus}
 
-ANTI-HALLUCINATION: Every finding must cite exact code from the provided context. Do not invent code.
-If you cannot find the exact code in the context, return [].
-
 {rules}
 
-Return a JSON ARRAY of findings (empty [] if nothing found):
+IMPORTANT:
+- Quote the exact problematic line(s) from the provided code in your comment.
+- Do not invent code that is not in the context — if you cannot find the pattern, return [].
+- If you DO find the pattern, report it. Do not suppress real findings.
+
+Return a JSON ARRAY of findings:
 [{{
   "file": "path/to/file",
   "line": 0,
   "severity": "CRITICAL|HIGH|MEDIUM|LOW",
   "title": "[LLM-HEURISTIC: {tag}] one-line summary",
-  "comment": "explanation — quote the exact problematic line(s), then give the fix",
+  "comment": "quote the exact line, then explain the problem and fix",
   "suggestion": "corrected code if applicable"
 }}]
 
+Return [] ONLY if you have genuinely searched and found nothing.
 Return ONLY the JSON array. No prose outside the array."""
 
 
