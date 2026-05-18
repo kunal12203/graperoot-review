@@ -848,10 +848,17 @@ def _openai_review(user_msg: str, system_override: str = "") -> str:
 # ── Static detectors — deterministic [AST-HEURISTIC] without LLM ────────────
 
 def _detect_file_from_diff(lines: list[str], i: int) -> str:
+    """Find the file path for line i. Handles both raw git diff and ### path formats."""
     for k in range(i, -1, -1):
-        if lines[k].startswith("diff --git"):
-            m = re.search(r" b/(.+)$", lines[k])
+        line = lines[k]
+        if line.startswith("diff --git"):
+            m = re.search(r" b/(.+)$", line)
             return m.group(1) if m else "unknown"
+        # Handle hunk format: "### path/to/file  [BASE]" or "### path/to/file"
+        if line.startswith("### "):
+            path = line[4:].split("  ")[0].split("\t")[0].strip()
+            if path and not path.startswith("#"):
+                return path
     return "unknown"
 
 
@@ -945,6 +952,10 @@ def detect_rust_index_panics(diff_text: str) -> list[dict]:
         if not m:
             continue
         container, expr = m.group(1), m.group(2).strip()
+        # Only flag Rust files (.rs) — not markdown code blocks, not other languages
+        file_path = _detect_file_from_diff(lines, i)
+        if not file_path.endswith(".rs"):
+            continue
         # Skip: integer literals, string keys, simple constants — only flag dynamic expressions
         if re.match(r'^["\'\d]', expr) or expr.isupper():
             continue
@@ -986,6 +997,9 @@ def detect_rust_unwrap_panics(diff_text: str) -> list[dict]:
         if not m:
             continue
         file_path = _detect_file_from_diff(lines, i)
+        # Only flag Rust files — not markdown code blocks
+        if not file_path.endswith(".rs"):
+            continue
         # Skip test files
         if any(x in file_path for x in ("test", "spec", "mock", "fixture")):
             continue
