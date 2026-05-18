@@ -57,7 +57,8 @@ MAX_CONTENT_CHARS = 24_000
 
 # Only extract symbols from code files (not config/markdown)
 SYMBOL_EXTS = {".ts", ".tsx", ".js", ".jsx", ".py", ".php", ".go",
-               ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx"}
+               ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+               ".rs"}
 
 # ── Named import regexes (for dead-export detection — unchanged from v6) ──────
 _RE_TS_NAMED_IMPORT = re.compile(
@@ -660,6 +661,163 @@ def _parse_imports_cpp(content: str, file_id: str) -> list[dict]:
     return edges
 
 
+# ── Rust symbol extraction (regex-based) ──────────────────────────────────────
+
+def _classify_rust(name: str, kind: str) -> tuple[str, str]:
+    low = name.lower()
+    if kind in ("struct", "enum", "trait", "type"):
+        return "model", "high"
+    if kind == "macro":
+        return "utility", "medium"
+    if kind == "const":
+        return "utility", "low"
+    if low.startswith("test") or low.startswith("bench") or low == "main":
+        return "utility", "medium"
+    if any(x in low for x in ("handle", "handler", "route", "endpoint", "serve", "dispatch")):
+        return "api_route", "high"
+    if any(x in low for x in ("new", "create", "build", "init", "setup", "from")):
+        return "use_case", "high"
+    return "use_case", "high"
+
+
+def extract_symbols_rust(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    text  = content
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    def add_sym(name: str, line_no: int, kind: str, exported: bool,
+                qualifier: str | None = None) -> None:
+        full = f"{qualifier}.{name}" if qualifier else name
+        if full in seen or not name:
+            return
+        seen.add(full)
+        end = _find_block_end_ts(lines, line_no)
+        sym_type, conf = _classify_rust(name, kind)
+        symbols.append({
+            "id": f"{file_path}::{full}", "name": full,
+            "symbol_type": sym_type, "line_start": line_no, "line_end": end,
+            "body_hash": _body_hash(lines, line_no, end), "confidence": conf,
+            "exported": exported, "keywords": _name_keywords(name),
+        })
+
+    def line_of(pos: int) -> int:
+        return text[:pos].count("\n")
+
+    # pub fn / async fn / pub async fn / fn
+    for m in re.finditer(
+        r"^(?P<pub>pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(",
+        text, re.MULTILINE,
+    ):
+        add_sym(m.group("name"), line_of(m.start()), "fn", bool(m.group("pub")))
+
+    # pub struct / struct
+    for m in re.finditer(
+        r"^(?P<pub>pub(?:\(crate\))?\s+)?struct\s+(?P<name>[A-Za-z_]\w*)\b",
+        text, re.MULTILINE,
+    ):
+        add_sym(m.group("name"), line_of(m.start()), "struct", bool(m.group("pub")))
+
+    # pub enum / enum
+    for m in re.finditer(
+        r"^(?P<pub>pub(?:\(crate\))?\s+)?enum\s+(?P<name>[A-Za-z_]\w*)\b",
+        text, re.MULTILINE,
+    ):
+        add_sym(m.group("name"), line_of(m.start()), "enum", bool(m.group("pub")))
+
+    # pub trait / trait
+    for m in re.finditer(
+        r"^(?P<pub>pub(?:\(crate\))?\s+)?trait\s+(?P<name>[A-Za-z_]\w*)\b",
+        text, re.MULTILINE,
+    ):
+        add_sym(m.group("name"), line_of(m.start()), "trait", bool(m.group("pub")))
+
+    # pub type Foo = ...
+    for m in re.finditer(
+        r"^(?P<pub>pub(?:\(crate\))?\s+)?type\s+(?P<name>[A-Za-z_]\w*)\s*(?:<[^>]*)?\s*=",
+        text, re.MULTILINE,
+    ):
+        add_sym(m.group("name"), line_of(m.start()), "type", bool(m.group("pub")))
+
+    # pub const / pub static
+    for m in re.finditer(
+        r"^pub(?:\(crate\))?\s+(?:const|static)\s+(?P<name>[A-Z_][A-Z0-9_]*)\s*:",
+        text, re.MULTILINE,
+    ):
+        add_sym(m.group("name"), line_of(m.start()), "const", True)
+
+    # macro_rules! foo
+    for m in re.finditer(r"^(?:(?:#\[macro_export\]\s+))?macro_rules!\s+(?P<name>[A-Za-z_]\w*)", text, re.MULTILINE):
+        exported = "#[macro_export]" in text[max(0, m.start()-30):m.start()]
+        add_sym(m.group("name"), line_of(m.start()), "macro", exported)
+
+    # impl Foo { pub fn method — extract methods with qualifier
+    for impl_m in re.finditer(
+        r"^impl(?:\s*<[^>]*>)?\s+(?:[A-Za-z_]\w*\s+for\s+)?(?P<type>[A-Za-z_]\w*)\s*(?:<[^>]*)?\s*\{",
+        text, re.MULTILINE,
+    ):
+        impl_type = impl_m.group("type")
+        impl_start = impl_m.end()
+        # Find matching closing brace
+        depth, pos = 1, impl_start
+        while pos < len(text) and depth > 0:
+            if text[pos] == "{":
+                depth += 1
+            elif text[pos] == "}":
+                depth -= 1
+            pos += 1
+        impl_body = text[impl_start:pos - 1]
+        body_offset = impl_start
+        for fn_m in re.finditer(
+            r"(?P<pub>pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z_]\w*)\s*(?:<[^>]*)?\s*\(",
+            impl_body,
+        ):
+            fn_name = fn_m.group("name")
+            if fn_name in ("new", ) or fn_m.group("pub"):  # include new() and pub methods
+                abs_pos = body_offset + fn_m.start()
+                add_sym(fn_name, line_of(abs_pos), "fn", bool(fn_m.group("pub")), impl_type)
+
+    return symbols
+
+
+def _parse_imports_rust(content: str, file_id: str) -> list[dict]:
+    """Parse Rust `use` declarations into import edges."""
+    edges: list[dict] = []
+    seen: set[str] = set()
+
+    def add_edge(module: str) -> None:
+        # Normalise: strip leading `crate::`, `super::`, `self::`
+        clean = module.strip().rstrip(";").strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            edges.append({"from": file_id, "to": clean, "rel": "imports"})
+
+    for m in re.finditer(r"^use\s+([^;{]+(?:\{[^}]*\})?[^;]*);", content, re.MULTILINE):
+        raw = m.group(1).strip()
+        # use a::b::{C, D, E} → emit a::b as module
+        if "{" in raw:
+            module = raw[:raw.index("{")].rstrip(":").strip()
+            add_edge(module)
+            # also emit each specific symbol
+            inner = raw[raw.index("{") + 1:raw.index("}")]
+            for sym in inner.split(","):
+                sym = sym.strip().split(" as ")[0].strip()
+                if sym and sym != "*":
+                    add_edge(f"{module}::{sym}")
+        else:
+            # use a::b::C  →  emit a::b::C and a::b
+            add_edge(raw)
+            parts = raw.split("::")
+            if len(parts) > 1:
+                add_edge("::".join(parts[:-1]))
+
+    # extern crate foo;
+    for m in re.finditer(r"^extern\s+crate\s+([A-Za-z_]\w*)\s*;", content, re.MULTILINE):
+        add_edge(m.group(1))
+
+    return edges
+
+
 # ── Import/relation parsing — AST+regex union for TS/JS, regex for rest (v6.2) ─
 
 def _parse_imports_ts_ast(content: str, file_id: str, ext: str) -> list[dict]:
@@ -725,7 +883,7 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
                 edges.append({"from": file_id, "to": to, "rel": "requires"})
 
         # File-reference edges
-        for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx))', text):
+        for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx|rs))', text):
             candidate = match.group(1)
             if "/" in candidate:
                 edges.append({"from": file_id, "to": candidate, "rel": "references"})
@@ -734,6 +892,10 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
     # C/C++ #include parsing
     if ext in _CPP_EXTS:
         return _parse_imports_cpp(text, file_id)
+
+    # Rust use/extern crate parsing
+    if ext == ".rs":
+        return _parse_imports_rust(text, file_id)
 
     # Regex fallback (identical to v6 parse_relations)
     edges: list[dict] = []
@@ -752,7 +914,7 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
     if path.suffix == ".swift":
         for match in re.finditer(r'^import\s+([A-Za-z_]\w*)', text, flags=re.MULTILINE):
             edges.append({"from": file_id, "to": match.group(1), "rel": "imports"})
-    for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx))', text):
+    for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx|rs))', text):
         candidate = match.group(1)
         if "/" in candidate:
             edges.append({"from": file_id, "to": candidate, "rel": "references"})
@@ -918,6 +1080,7 @@ def should_scan(path: Path) -> bool:
         ".go", ".py", ".js", ".jsx", ".ts", ".tsx", ".swift",
         ".json", ".yaml", ".yml", ".md",
         ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx",
+        ".rs",
     }
 
 
@@ -964,6 +1127,8 @@ def _extract_symbols_for_file(content: str, file_id: str, ext: str) -> list[dict
         return extract_symbols_go(content, file_id)
     if ext in _CPP_EXTS:
         return extract_symbols_cpp(content, file_id)
+    if ext == ".rs":
+        return extract_symbols_rust(content, file_id)
     return []
 
 
