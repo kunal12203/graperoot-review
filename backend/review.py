@@ -41,8 +41,14 @@ GR_GRAPH_CONTEXT = os.environ.get("GR_GRAPH_CONTEXT", "")  # injected by webhook
 MAX_DIFF_CHARS   = 24_000
 MAX_COMMENTS     = 25
 
-USE_OPENAI = bool(OPENAI_KEY and not ANTHROPIC_KEY)
-MODEL          = os.environ.get("OPENAI_MODEL", "gpt-4o") if USE_OPENAI else os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+import shutil as _shutil
+# Backend priority: claude CLI > Anthropic API > OpenAI API
+USE_CLAUDE_CLI = bool(_shutil.which("claude") and not ANTHROPIC_KEY and not OPENAI_KEY) \
+                 or os.environ.get("USE_CLAUDE_CLI", "") == "1"
+USE_OPENAI     = bool(OPENAI_KEY and not ANTHROPIC_KEY and not USE_CLAUDE_CLI)
+MODEL          = "claude-cli" if USE_CLAUDE_CLI else (
+                 os.environ.get("OPENAI_MODEL", "gpt-4o") if USE_OPENAI
+                 else os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"))
 
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────────
@@ -528,7 +534,7 @@ def claude_review(
     """
     import threading
 
-    if not ANTHROPIC_KEY and not OPENAI_KEY:
+    if not ANTHROPIC_KEY and not OPENAI_KEY and not USE_CLAUDE_CLI:
         print("Set ANTHROPIC_API_KEY or OPENAI_API_KEY", file=sys.stderr)
         return {}
 
@@ -649,7 +655,9 @@ def claude_review(
         check_ctx = _build_check_context(name)
         print(f"  [{name}] context={len(check_ctx)} chars")
         try:
-            if USE_OPENAI:
+            if USE_CLAUDE_CLI:
+                raw = _claude_cli_review(check_ctx, system_override=system)
+            elif USE_OPENAI:
                 raw = _openai_review(check_ctx, system_override=system)
             else:
                 raw = _anthropic_review(check_ctx, system_override=system)
@@ -713,6 +721,30 @@ def claude_review(
         "pr_summary":      f"PR: {pr_title}",
         "inline_comments": deduped,
     }
+
+
+def _claude_cli_review(user_msg: str, system_override: str = "") -> str:
+    """Use `claude --print` CLI (Claude Code subscription) as the inference backend.
+    No API key needed — uses the existing Claude Code session/subscription.
+    This is the same backend GrapeRoot Pro benchmarks used for 38-40 findings.
+    """
+    import subprocess, json as _json
+    system = system_override or SYSTEM_PROMPT
+    full_prompt = f"{system}\n\n---\n\n{user_msg}"
+    result = subprocess.run(
+        ["claude", "--print", "--output-format", "json"],
+        input=full_prompt,
+        capture_output=True, text=True, timeout=180,
+    )
+    if result.returncode != 0:
+        err = result.stderr[:300] if result.stderr else f"exit {result.returncode}"
+        raise RuntimeError(f"claude CLI failed: {err}")
+    try:
+        data = _json.loads(result.stdout)
+        # Claude Code --output-format json returns {"result": "...", "usage": {...}}
+        return data.get("result", "") or result.stdout
+    except _json.JSONDecodeError:
+        return result.stdout
 
 
 def _anthropic_review(user_msg: str, system_override: str = "") -> str:
@@ -1369,7 +1401,7 @@ def main() -> None:
 
     if not GITHUB_TOKEN:
         print("Error: set GITHUB_TOKEN env var", file=sys.stderr); sys.exit(1)
-    if not ANTHROPIC_KEY and not OPENAI_KEY:
+    if not ANTHROPIC_KEY and not OPENAI_KEY and not USE_CLAUDE_CLI:
         print("Error: set ANTHROPIC_API_KEY or OPENAI_API_KEY", file=sys.stderr); sys.exit(1)
 
     owner, repo, pr_num = parse_pr_url(args.pr_url)
