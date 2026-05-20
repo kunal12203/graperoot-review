@@ -1351,7 +1351,9 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
     @mcp.tool()
     def graph_read(file: str, max_chars: int = 20000, query: str = "", anchor: str = "") -> dict[str, Any]:
-        """Read ONE file. Use file::symbol notation for focused reads."""
+        """Read a file recommended by graph_continue. Use instead of Bash/Read.
+        Accepts file::symbol notation (e.g. src/auth.ts::handleLogin) to read only that symbol.
+        Only call this for files returned in graph_continue recommended_files."""
         requested = max(256, int(max_chars or 0))
         effective_hard_max = int(TURN_STATE.get("explore_hard_max_chars", HARD_MAX_READ_CHARS))
         max_chars = min(requested, effective_hard_max)
@@ -1810,7 +1812,9 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
     @mcp.tool()
     def graph_continue(query: str, top_files: int = 5, top_edges: int = 12, limit: int = 8) -> dict[str, Any]:
-        """Main entry — returns recommended_files + confidence. If needs_project=True, call graph_scan first."""
+        """CALL THIS FIRST — before Read, Bash, grep, or any file exploration.
+        Returns recommended_files to read via graph_read, and a confidence level.
+        Do NOT use Bash/grep/Read before calling this. If needs_project=True, call graph_scan next."""
         # ── Project setup gate ────────────────────────────────────────────────
         # Only check the graph file — NOT PROJECT_ROOT.is_dir().
         # In the Railway upload model the project directory never exists on the
@@ -2195,7 +2199,8 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
     @mcp.tool()
     def fallback_rg(pattern: str, max_hits: int = 30) -> dict[str, Any]:
-        """Controlled fallback grep if retriever confidence is low."""
+        """Use instead of Bash grep/rg when graph_continue confidence is medium or low.
+        Do NOT use Bash grep directly — always use this tool for pattern search."""
         calls = int(TURN_STATE.get("fallback_calls", 0))
         # v7.2: Use shared _EXHAUSTIVE_FALLBACK_CAP constant (same value as graph_continue uses)
         # so the cap is always in sync between server signals and enforcement.

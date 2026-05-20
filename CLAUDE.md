@@ -1,11 +1,11 @@
-<!-- dgc-policy-v11 -->
+<!-- dgc-policy-v12 -->
 # Dual-Graph Context Policy
 
-This project uses a local dual-graph MCP server for efficient context retrieval.
+**HARD RULE: Do NOT use Bash, Read, grep, rg, or any file tool until you have called `graph_continue` first. This is not optional.**
 
-## MANDATORY: Always follow this order
+## Required tool order — every single turn
 
-1. **Call `graph_continue` first** — before any file exploration, grep, or code reading.
+1. **Call `graph_continue` first** — before Bash, Read, grep, rg, or any file exploration.
 
 2. **If `graph_continue` returns `needs_project=true`**: call `graph_scan` with the
    current project directory (`pwd`). Do NOT ask the user.
@@ -59,13 +59,14 @@ without a limit", "audit all test files for missing describes". Use these tools 
 
 These bypass the top-K retrieval cap intentionally — they exist for full-codebase sweeps.
 
-## Rules
+## Rules — these are hard constraints, not suggestions
 
-- Do NOT use `rg`, `grep`, or bash file exploration before calling `graph_continue`.
-- Do NOT do broad/recursive exploration at any confidence level.
-- `max_supplementary_greps` and `max_supplementary_files` are hard caps - never exceed them.
+- **NEVER** use `rg`, `grep`, `Bash`, or `Read` for file exploration before calling `graph_continue`. Using native tools before `graph_continue` is always wrong.
+- **NEVER** do broad/recursive exploration at any confidence level.
+- `max_supplementary_greps` and `max_supplementary_files` are hard caps — never exceed them.
 - Do NOT dump full chat history.
 - Do NOT call `graph_retrieve` more than once per turn.
+- If you find yourself about to run `find`, `grep`, `cat`, or `ls` to explore the codebase — stop. Call `graph_continue` instead.
 - After edits, call `graph_register_edit(files: ["path/to/file"])` — the parameter is **`files` (plural, always an array)**. Never pass `file` (singular). Use `file::symbol` notation (e.g. `src/auth.ts::handleLogin`) when the edit targets a specific function, class, or hook.
 
 ## Releasing
