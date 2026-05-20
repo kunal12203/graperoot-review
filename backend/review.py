@@ -422,7 +422,7 @@ Return [] ONLY if you have genuinely searched and found nothing.
 Return ONLY the JSON array. No prose outside the array."""
 
 
-# LLM checks: only 2. Everything else is handled by static detectors.
+# LLM checks: arch + security + mutation (mutation re-added — catches Object.assign overwrites)
 # arithmetic → guarded divisions are false positives; static Rust detector handles Rust
 # mutation → static dict.update pattern; api_compat rarely fires
 # n_plus_one → static detect_n_plus_one() always fires
@@ -454,17 +454,29 @@ Compare class-level attribute defaults: BASE `accessed = False`, HEAD `accessed 
 Report MEDIUM with exact old→new values. Do NOT report if the value is the same.""")),
 
     ("security", _check_prompt("security-check",
-        "security vulnerabilities — auth bypass, unhandled errors, access control, exposed secrets",
-        """Look for these patterns:
-- Auth bypass: code that grants access based on a condition that can be bypassed.
-  Check: does unauthenticated state lead to a 404/error instead of a login redirect?
-  Check: does a default role or fallback value grant elevated privilege (e.g. default='admin')?
-- Missing error handling: async/await call where the error return value is never checked.
-  Pattern: `const result = await api.doSomething()` with no `if (result.error)` check.
-- Privilege escalation: action that should be blocked for the actor's own account
-  (e.g. admin can delete/demote themselves — missing `currentUserId !== targetId` guard).
-- Hard-coded limits silently truncating: `limit: 500` with no pagination cursor → data loss.
-- Exposed secrets or insecure defaults in the diff.""")),
+        "security vulnerabilities — auth bypass, condition completeness, unhandled errors",
+        """Find ALL of these. Do not stop at the first finding.
+
+1. AUTH: unauthenticated state → 404/error instead of login redirect. Default role grants admin. Missing same-user guard (admin demotes self).
+
+2. CONDITION COMPLETENESS: a condition checks properties A and B but omits C.
+   Compare with similar code elsewhere in the diff/context — if withS2Data checks `error` but this new code only checks `data || response`, that's the bug.
+   Quote what the condition checks and what it silently omits.
+
+3. ASYNC ERRORS: `await call()` result used without checking `.error` field. `.then(success)` without `.catch(error)`.
+
+4. LIMITS & DATA LOSS: hard-coded `limit: N` with no pagination cursor silently drops records.
+
+5. SECRETS: hardcoded credentials, API keys, or insecure default values in diff.""")),
+
+    ("mutation", _check_prompt("mutation",
+        "mutation traps — Object.assign / spread / dict.update overwriting already-set keys",
+        """For every Object.assign(target, source), {...target, ...source}, dict.update(extra):
+- List the keys already written to target before the merge.
+- Can source contain any of those same keys (user input, options bag, extra param)?
+- If yes: source silently overwrites target's values → report HIGH with exact keys at risk.
+Classic pattern: `body = { error: code }; Object.assign(body, extra)` →
+  if extra has 'error', it overwrites the already-set code. Report this.""")),
 ]
 
 
@@ -583,8 +595,14 @@ def claude_review(
         "arch":        (re.compile(r'^(?:class |def |export (?:class|function|default)|async function )|\+\s*(?:class |def |export (?:class|function|default)|async function )', re.M), 12),
         # api_compat: response/request shapes, field names, return values
         "api_compat":  (re.compile(r'return\s*\{|response\.|\.json\(|body\s*=|\bdetails\b|\berror\b|\bmessage\b|\bdata\b|\bstatus\b|\btype\b.*:\s*\w', re.I), 8),
-        # security: broad — auth, roles, errors, redirects, limits, secrets
-        "security":    (re.compile(r'auth|role|permiss|admin\b|error\b|redirect|limit\b|session\b|token\b|secret|password|notFound|guard\b|login|logout|signup|register|removeUser|deleteUser|banUser|currentUser', re.I), 12),
+        # security: FOCUSED on auth/access/secrets — DOM is handled by static detectors
+        # Keeping this tight prevents onClick/window.open noise from drowning real auth issues
+        "security":    (re.compile(
+            r'auth|role|permiss|admin\b|error\b|redirect|limit\b|session\b|token\b|secret|password'
+            r'|notFound|guard\b|login|logout|signup|register|removeUser|deleteUser|banUser|currentUser'
+            # Condition completeness — checking some but not all properties of a union/response
+            r'|hasOwnProperty|\.data\b|\.response\b|\.error\b|typeof\s+\w',
+            re.I), 12),
         "quality":     (re.compile(r'\bfor\b|\bwhile\b|TODO|FIXME|"""|console\.\w|logger\.\w|\.log\(|\bprint\(', re.I), 6),
     }
 
@@ -621,13 +639,14 @@ def claude_review(
             f"### Intent\n{linked_issue or '(none)'}\n"
         )
         if pat:
-            # Tight filter: extract ONLY pattern-matching lines + small window.
-            # Target total context: 2-4k chars — same ballpark as the 251-char
-            # snippet where gpt-4o reliably found the bug. More = noise = [].
             filtered_diff  = _filter_diff(diff_text, pat, window=min(win, 5))
             filtered_files = _extract_relevant(file_context, pat, min(win, 5))
-            diff_part  = f"### Changed lines (filtered to this check's pattern)\n```diff\n{filtered_diff[:2500]}\n```\n"
-            file_part  = f"### File sections (filtered)\n{filtered_files[:1500]}\n"
+            # Context floor: if filter captured < 1800 chars the pattern found
+            # almost nothing — fall back to the full diff so the model isn't blind.
+            if len(filtered_diff) < 1800:
+                filtered_diff = diff_text[:5000]  # full diff, more context
+            diff_part  = f"### Changed lines (filtered to this check's pattern)\n```diff\n{filtered_diff[:3500]}\n```\n"
+            file_part  = f"### File sections (filtered)\n{filtered_files[:2000]}\n"
         else:
             diff_part  = f"### Diff\n```diff\n{diff_text[:4000]}\n```\n"
             file_part  = f"### File content\n{file_context[:2000]}\n"
@@ -691,6 +710,8 @@ def claude_review(
         detect_default_value_changes(diff_text, file_context) +
         detect_docstring_issues(diff_text) +
         detect_orphaned_methods(diff_text, file_context) +
+        detect_window_open_noopener(diff_text) +
+        detect_click_without_keyboard(diff_text) +
         detect_rust_index_panics(diff_text) +
         detect_rust_unwrap_panics(diff_text)
     )
@@ -1079,6 +1100,71 @@ def detect_docstring_issues(diff_text: str) -> list[dict]:
                             f"Found: `{span.strip()}`\nFix: add a space before ` `` `.",
                 "check": "docstring",
             })
+    return findings
+
+
+# ── DOM / Web security static detectors ───────────────────────────────────────
+
+def detect_window_open_noopener(diff_text: str) -> list[dict]:
+    """Detect window.open() calls without noopener — opener attack surface."""
+    findings: list[dict] = []
+    lines = diff_text.splitlines()
+    open_re = re.compile(r'^\+.*\bwindow\.open\s*\(', re.I)
+
+    for i, line in enumerate(lines):
+        if not open_re.match(line):
+            continue
+        # Check this line + next 3 lines for noopener/noreferrer
+        window = "\n".join(lines[i:min(i+4, len(lines))])
+        if "noopener" in window.lower() or "noreferrer" in window.lower():
+            continue
+        findings.append({
+            "file":     _detect_file_from_diff(lines, i),
+            "line":     i,
+            "severity": "HIGH",
+            "title":    "[AST-HEURISTIC: dom-security] `window.open()` without `noopener` — opener attack",
+            "comment":  "The opened window can access `window.opener` and navigate the parent page.\n"
+                        "Fix: `window.open(url, '_blank', 'noopener,noreferrer')` or add `rel='noopener noreferrer'` to anchor tags.\n\n"
+                        f"Code: `{line.strip()[1:].strip()}`",
+            "check": "dom_security",
+        })
+    return findings
+
+
+def detect_click_without_keyboard(diff_text: str) -> list[dict]:
+    """Detect JSX onClick without keyboard accessibility (WCAG 2.1 SC 2.1.1)."""
+    findings: list[dict] = []
+    lines = diff_text.splitlines()
+    onclick_re  = re.compile(r'^\+.*\bonClick\s*=', re.I)
+    keyboard_re = re.compile(r'onKeyDown|onKeyPress|onKeyUp|role\s*=\s*["\']button|tabIndex\s*=', re.I)
+    # Skip actual button/a elements — they're inherently keyboard-accessible
+    skip_re     = re.compile(r'<(?:button|a|input|select|textarea|label)\b', re.I)
+
+    for i, line in enumerate(lines):
+        if not onclick_re.match(line):
+            continue
+        if skip_re.search(line):
+            continue
+        # Check surrounding 10 lines for keyboard handler
+        window = "\n".join(lines[max(0,i-5):min(len(lines),i+6)])
+        if keyboard_re.search(window):
+            continue
+        file_path = _detect_file_from_diff(lines, i)
+        # Only flag JSX files
+        if not file_path.endswith((".tsx", ".jsx", ".js", ".ts")):
+            continue
+        findings.append({
+            "file":     file_path,
+            "line":     i,
+            "severity": "MEDIUM",
+            "title":    "[AST-HEURISTIC: a11y] `onClick` with no keyboard handler — WCAG 2.1 SC 2.1.1",
+            "comment":  "This element handles `onClick` but has no `onKeyDown`/`onKeyPress` handler, "
+                        "no `role='button'`, and no `tabIndex`. Keyboard-only users cannot activate it.\n"
+                        "Fix: add `onKeyDown={(e) => e.key==='Enter' && handler()}` "
+                        "and `role='button' tabIndex={0}`.\n\n"
+                        f"Code: `{line.strip()[1:].strip()}`",
+            "check": "a11y",
+        })
     return findings
 
 
