@@ -1,3 +1,7 @@
+1.0.14  (2026-05-21)
+- Security: replaced internal Railway hostname in shipped .py with
+  api.graperoot.dev/ping (no infrastructure details exposed to users)
+
 1.0.13  (2026-05-21)
 - TOOL ENFORCEMENT: All 7 context tools (graph_read, fallback_rg, graph_impact,
   graph_neighbors, graph_dead_exports, graph_find_cycles, graph_grep_all) now
