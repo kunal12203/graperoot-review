@@ -3254,7 +3254,7 @@ def _ping_license_server() -> None:
     def _send(payload: bytes) -> None:
         try:
             req = urllib.request.Request(
-                "https://api.graperoot.dev/ping",
+                "https://dual-graph-license-production.up.railway.app/ping",
                 data=payload,
                 headers={"Content-Type": "application/json"},
                 method="POST",
