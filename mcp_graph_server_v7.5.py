@@ -2962,9 +2962,12 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
         import subprocess, sys, os, json
         from pathlib import Path
 
-        review_script = Path(__file__).parent / "review.py"
+        # Use enterprise review script (clean local-first implementation)
+        review_script = Path(__file__).parent / "review_enterprise.py"
         if not review_script.exists():
-            return {"error": f"review.py not found at {review_script}"}
+            review_script = Path(__file__).parent / "review.py"  # fallback
+        if not review_script.exists():
+            return {"error": f"review_enterprise.py not found at {review_script.parent}"}
 
         cmd = [sys.executable, str(review_script), pr_url]
         if dry_run or not post:
