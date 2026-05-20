@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """MCP gateway exposing dual-graph retrieval/read/impact tools.
 
+v7.6 — Session-aware tool enforcement.
+  * All 7 context tools (graph_read, fallback_rg, graph_impact, graph_neighbors,
+    graph_dead_exports, graph_find_cycles, graph_grep_all) now hard-gate behind
+    graph_continue — return {ok:false, action_required:graph_continue} if skipped.
+  * Session-aware TURN_STATE: each mcp-session-id gets its own persistent state
+    so graph_continue_called=True survives across sequential tool calls within
+    one Claude conversation (stateless_http was resetting state per-request).
+  * Session middleware: saves/restores TURN_STATE per session on every request.
+  * Session isolation: User A's graph_continue does not unlock tools for User B.
+  * FastMCP instructions= field embeds the policy — no CLAUDE.md dependency.
+
 v7.5 — Fixes v7.4 regressions + further cost trim.
   * reuse_gate OFF by default — blocked 34% of reads in v7.4 (each wasted an error response
     that still entered session cache).
@@ -199,25 +210,79 @@ def _rerank_by_language(graph_files: list[dict], dominant_lang: str) -> list[dic
 
 
 # Process-local state for adaptive budgeting and dedupe.
-TURN_STATE: dict[str, Any] = {
-    "query_key": "",
-    "used_chars": 0,
-    "seen_reads": {},  # key: (file, query, anchor) -> content
-    "reuse_gate_candidates": [],
-    "reuse_gate_satisfied": False,
-    "retrieved_files": [],
-    "retrieve_count": 0,
-    "last_retrieve_out": None,
-    "fallback_calls": 0,
-    # v6: cost budget + turn breaker
-    "total_read_chars": 0,
-    "total_grep_calls": 0,
-    "grep_all_calls": 0,
-    "turn_count": 0,
-    "task_type": "unknown",  # "targeted" | "exhaustive" | "behavioral" | "unknown"
-    # v7.5: gate — tracks whether graph_continue was called this turn
-    "graph_continue_called": False,
-}
+def _default_turn_state() -> dict[str, Any]:
+    return {
+        "query_key": "",
+        "used_chars": 0,
+        "seen_reads": {},
+        "reuse_gate_candidates": [],
+        "reuse_gate_satisfied": False,
+        "retrieved_files": [],
+        "retrieve_count": 0,
+        "last_retrieve_out": None,
+        "fallback_calls": 0,
+        "total_read_chars": 0,
+        "total_grep_calls": 0,
+        "grep_all_calls": 0,
+        "turn_count": 0,
+        "task_type": "unknown",
+        "graph_continue_called": False,
+    }
+
+# Session store: mcp-session-id → persistent state dict
+_SESSION_STATES: dict[str, dict[str, Any]] = {}
+# Current request's session ID — set by ASGI middleware before each tool call
+_CURRENT_SID: str = "default"
+
+
+def _get_session_state(session_id: str) -> dict[str, Any]:
+    sid = session_id or "default"
+    if sid not in _SESSION_STATES:
+        _SESSION_STATES[sid] = _default_turn_state()
+    if len(_SESSION_STATES) > 50:
+        for k in list(_SESSION_STATES.keys())[:-50]:
+            del _SESSION_STATES[k]
+    return _SESSION_STATES[sid]
+
+
+def _set_session(session_id: str) -> None:
+    """Set the current session ID. Tool calls use _get_current_state() to read/write."""
+    global _CURRENT_SID
+    _CURRENT_SID = session_id or "default"
+    _get_session_state(_CURRENT_SID)  # ensure it exists
+
+
+def _get_current_state() -> dict[str, Any]:
+    """Return the persistent state dict for the current request's session."""
+    return _SESSION_STATES.get(_CURRENT_SID, TURN_STATE)
+
+
+class _TurnStateProxy(dict):
+    """Proxy TURN_STATE to the current session's persistent dict.
+
+    All 76+ existing `TURN_STATE[key]` references route through here.
+    Reads/writes go to _SESSION_STATES[_CURRENT_SID] so state persists
+    across sequential tool calls within one Claude conversation.
+    """
+    def _s(self) -> dict:
+        return _SESSION_STATES.get(_CURRENT_SID, self)
+
+    def __getitem__(self, k):           return self._s()[k]
+    def __setitem__(self, k, v):        self._s()[k] = v
+    def __delitem__(self, k):           del self._s()[k]
+    def __contains__(self, k):          return k in self._s()
+    def get(self, k, default=None):     return self._s().get(k, default)
+    def update(self, *a, **kw):         self._s().update(*a, **kw)
+    def clear(self):                    self._s().clear()
+    def setdefault(self, k, d=None):    return self._s().setdefault(k, d)
+    def keys(self):                     return self._s().keys()
+    def values(self):                   return self._s().values()
+    def items(self):                    return self._s().items()
+    def pop(self, *a):                  return self._s().pop(*a)
+    def __repr__(self):                 return repr(self._s())
+
+
+TURN_STATE: dict[str, Any] = _TurnStateProxy(_default_turn_state())
 
 # v6.1: Task-aware budgets — generous for exhaustive, tight for targeted
 _COST_BUDGETS = {
@@ -1281,7 +1346,9 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             TURN_STATE["last_retrieve_out"] = None
             TURN_STATE["fallback_calls"] = 0
             TURN_STATE["grep_all_calls"] = 0
-            TURN_STATE["graph_continue_called"] = False  # new query = new turn, gate resets
+            # Note: graph_continue_called is NOT reset here — only graph_continue sets it.
+            # graph_retrieve is an internal function; resetting gc_called here would break
+            # the gate when graph_continue calls graph_retrieve as part of its own flow.
         # Avoid repeated retrieval cycles for the same turn unless query changed.
         if ENFORCE_SINGLE_RETRIEVE and qk and qk == TURN_STATE.get("query_key", "") and int(TURN_STATE.get("retrieve_count", 0)) >= 1:
             cached = dict(TURN_STATE.get("last_retrieve_out") or {})
@@ -2104,6 +2171,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
         # No relevant memory: do single retrieval and return compact suggestions.
         retrieved = graph_retrieve(query=query, top_files=top_files, top_edges=top_edges)
+        TURN_STATE["graph_continue_called"] = True  # re-affirm after graph_retrieve (which resets turn state)
         graph_files = retrieved.get("graph_files", [])
 
         # v7.1: Language-aware reranking for mixed-language codebases.
@@ -3517,7 +3585,23 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
         }), media_type="application/json")
 
     mcp_app = mcp.streamable_http_app()
-    mcp_app.router.routes[0:0] = [
+
+    # ── Session middleware (pure-ASGI, no BaseHTTPMiddleware) ──────────────
+    # BaseHTTPMiddleware spawns a new task context, breaking ContextVar
+    # propagation. Pure-ASGI middleware runs in the same task context as the
+    # handler, so ContextVar set here IS visible inside tool functions.
+    _starlette_app = mcp_app
+
+    async def session_middleware(scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            sid = (headers.get(b"mcp-session-id", b"")
+                   or headers.get(b"x-mcp-session-id", b"")).decode() or "default"
+            _set_session(sid)
+        await _starlette_app(scope, receive, send)
+
+    # Add custom routes to the Starlette app BEFORE wrapping with middleware
+    _starlette_app.router.routes[0:0] = [
         Route("/prime", prime, methods=["GET"]),
         Route("/log", log_token_usage, methods=["POST"]),
         Route("/ingest-graph", ingest_graph, methods=["POST"]),
@@ -3529,6 +3613,9 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
         Route("/api/system-map", api_system_map, methods=["GET"]),
         Route("/api/hotspots", api_hotspots, methods=["GET"]),
     ]
+
+    mcp_app = session_middleware  # type: ignore[assignment]
+    # ──────────────────────────────────────────────────────────────────────
 
     async def serve() -> None:
         config = uvicorn.Config(mcp_app, host="0.0.0.0", port=port, log_level="error")
