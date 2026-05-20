@@ -1281,6 +1281,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             TURN_STATE["last_retrieve_out"] = None
             TURN_STATE["fallback_calls"] = 0
             TURN_STATE["grep_all_calls"] = 0
+            TURN_STATE["graph_continue_called"] = False  # new query = new turn, gate resets
         # Avoid repeated retrieval cycles for the same turn unless query changed.
         if ENFORCE_SINGLE_RETRIEVE and qk and qk == TURN_STATE.get("query_key", "") and int(TURN_STATE.get("retrieve_count", 0)) >= 1:
             cached = dict(TURN_STATE.get("last_retrieve_out") or {})
@@ -2501,6 +2502,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             "last_retrieve_out": None,
             "fallback_calls": 0,
             "grep_all_calls": 0,
+            "graph_continue_called": True,  # graph_scan is the setup step; reads allowed after
         })
 
         file_count = graph.get("file_count", graph["node_count"])
