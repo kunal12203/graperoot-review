@@ -245,10 +245,17 @@ def _get_session_state(session_id: str) -> dict[str, Any]:
     return _SESSION_STATES[sid]
 
 
+def _sanitize_sid(raw: str) -> str:
+    """Sanitize session ID: alphanumeric + hyphen/underscore only, max 128 chars."""
+    import re as _re
+    clean = _re.sub(r"[^a-zA-Z0-9_\-]", "_", raw or "default")[:128]
+    return clean or "default"
+
+
 def _set_session(session_id: str) -> None:
     """Set the current session ID. Tool calls use _get_current_state() to read/write."""
     global _CURRENT_SID
-    _CURRENT_SID = session_id or "default"
+    _CURRENT_SID = _sanitize_sid(session_id)
     _get_session_state(_CURRENT_SID)  # ensure it exists
 
 
@@ -3618,7 +3625,11 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
     # ──────────────────────────────────────────────────────────────────────
 
     async def serve() -> None:
-        config = uvicorn.Config(mcp_app, host="0.0.0.0", port=port, log_level="error")
+        # workers=1 is critical for _CURRENT_SID session routing — multiple workers
+        # would each have their own _SESSION_STATES and _CURRENT_SID globals.
+        # For multi-worker deployments, replace _CURRENT_SID with a proper
+        # per-request ContextVar solution or Redis session store.
+        config = uvicorn.Config(mcp_app, host="0.0.0.0", port=port, log_level="error", workers=1)
         await uvicorn.Server(config).serve()
 
     anyio.run(serve)
