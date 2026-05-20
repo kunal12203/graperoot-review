@@ -48,16 +48,17 @@ Live dashboard URL is printed at startup next to "Token usage".
 ## Exhaustive enumeration tasks (v5)
 
 Some tasks require scanning **every file** — e.g. "find all dead exports", "list every .find()
-without a limit", "audit all test files for missing describes". Use these tools **first**:
+without a limit", "audit all test files for missing describes".
 
-- **`graph_dead_exports()`** — instantly returns all exported symbols with no importers.
-  Pre-computed at scan time. Call this first for any dead-export / unused-symbol task.
+Always call `graph_continue` first (sets task_type=exhaustive and the right budget), then use:
 
-- **`graph_grep_all(pattern, file_glob?, max_hits?)`** — exhaustive grep, no call-limit cap.
+- **`graph_dead_exports()`** — pre-computed dead exports. Fast, no grep needed.
+
+- **`graph_grep_all(pattern, file_glob?, max_hits?)`** — exhaustive grep across the whole project.
   Use when `fallback_rg` would need to be called many times.
   Examples: `graph_grep_all("\.find\(", "*.ts")` · `graph_grep_all("TODO|FIXME")`
 
-These bypass the top-K retrieval cap intentionally — they exist for full-codebase sweeps.
+- **`graph_find_cycles()`** — pre-computed circular import chains. Fast.
 
 ## Rules — these are hard constraints, not suggestions
 

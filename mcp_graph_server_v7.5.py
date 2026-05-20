@@ -2525,7 +2525,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
     @mcp.tool()
     def graph_dead_exports(file_prefix: str = "", min_line_span: int = 0, symbol_type: str = "", limit: int = 60) -> dict[str, Any]:
-        """Return pre-computed dead exports (exported symbols with no importers).
+        """Return pre-computed dead exports. Call after graph_continue.
 
         Pre-computed at scan time — instant, no grep needed. Scope per package
         using file_prefix (e.g. "packages/admin") so you can iterate per-package.
@@ -2536,6 +2536,8 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             symbol_type: Filter by symbol type (api_route, hook, model, use_case, utility).
             limit: Max results to return (default 60).
         """
+        if not TURN_STATE.get("graph_continue_called"):
+            return {"ok": False, "error": "Call graph_continue first.", "action_required": "graph_continue"}
         graph_json = DG_DATA_DIR / "info_graph.json"
         if not graph_json.exists():
             return {"ok": False, "error": "No graph found. Call graph_scan first."}
@@ -2573,7 +2575,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
     @mcp.tool()
     def graph_find_cycles(file_prefix: str = "", limit: int = 20) -> dict[str, Any]:
-        """Find circular import chains using Tarjan's SCC algorithm.
+        """Find circular import chains. Call after graph_continue.
 
         Resolves relative import paths properly so barrel-file cycles are detected.
         Scope per package with file_prefix (e.g. "packages/medusa").
@@ -2582,6 +2584,8 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             file_prefix: Only look for cycles among files starting with this prefix.
             limit: Max number of cycles to return.
         """
+        if not TURN_STATE.get("graph_continue_called"):
+            return {"ok": False, "error": "Call graph_continue first.", "action_required": "graph_continue"}
         graph_json = DG_DATA_DIR / "info_graph.json"
         if not graph_json.exists():
             return {"ok": False, "error": "No graph found. Call graph_scan first."}
@@ -2696,6 +2700,8 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             file_glob: Optional glob to restrict files (e.g. "*.ts", "**/*.py").
             max_hits: Maximum number of matches to return (default 200).
         """
+        if not TURN_STATE.get("graph_continue_called"):
+            return {"ok": False, "error": "Call graph_continue first.", "action_required": "graph_continue"}
         # Track call count and enforce soft limit
         call_num = int(TURN_STATE.get("grep_all_calls", 0)) + 1
         TURN_STATE["grep_all_calls"] = call_num
