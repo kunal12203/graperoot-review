@@ -1,0 +1,120 @@
+1.0.13  (2026-05-21)
+- TOOL ENFORCEMENT: All 7 context tools (graph_read, fallback_rg, graph_impact,
+  graph_neighbors, graph_dead_exports, graph_find_cycles, graph_grep_all) now
+  hard-gate behind graph_continue — return actionable error if called first.
+- SESSION-AWARE STATE: TURN_STATE is now per-session (keyed by mcp-session-id)
+  so parallel Claude sessions don't share tool state. Gate flags persist
+  correctly across sequential tool calls within one conversation.
+- RUST SUPPORT: graph_builder now extracts pub fn, struct, enum, trait, type,
+  const, macro_rules!, and impl methods from .rs files with import edges.
+- POLICY EMBEDDED: tool enforcement policy baked into FastMCP server
+  instructions — no CLAUDE.md dependency for enforcement.
+- SECURITY: session IDs sanitized (alphanumeric only, 128 char max).
+
+1.0.12  (2026-04-28)
+- AUTO-STALENESS: graperoot-pro now keeps its index in sync with the live
+  filesystem at per-file granularity, on every tool call. No "graph is stale,
+  let me read directly" fallbacks from Claude.
+  - graph_read: stat -> hash -> reparse just THE one file if changed (~50-200ms
+    when triggered, 1us in steady state). Symbol line ranges always reflect
+    current disk content; no more wrong slices after edits.
+  - graph_continue: drops recommendations for deleted files (cheap stat per
+    recommended file).
+  - Background safety net: if >20 stale files detected within 60s (e.g. after
+    `git pull`), an async full re-scan runs in a daemon thread and replaces
+    the cache atomically. Current request never blocks on it.
+  - Updated graph flushed to disk every 30s when dirty (atomic tmp+rename).
+  - Per-file asyncio-style threading.Lock prevents concurrent reparse races.
+  - Edge cases: deleted, renamed (=delete+add), touched-but-unchanged,
+    permission-denied, large files, FAT32 mtime granularity, partial reads.
+
+1.0.11  (2026-04-28)
+- UX: dgc-pro now writes/prepends a CLAUDE.md "Dual-Graph Context Policy"
+  to the project root on first run. Without it, Claude knew graperoot-pro
+  was loaded but never called its tools — defaulting to native Read/Grep
+  instead. Now Claude proactively calls graph_continue / graph_read.
+- Idempotent: existing CLAUDE.md is never overwritten; the policy is only
+  prepended if no `dgc-policy-vN` marker is present. User content stays.
+
+1.0.10  (2026-04-28)
+- ARCHITECTURE: graperoot-pro is now a stdio MCP server (was HTTP on random port).
+  - Claude Code spawns the server on session start, kills it on session end.
+  - No more orphan processes, no port management, no stale .mcp.json entries.
+  - `claude mcp list` works correctly outside of `dgc-pro` invocations.
+  - Same pattern as filesystem/git MCPs in the official MCP spec.
+- launch.py: write_mcp_config() now writes a stdio command entry. Existing
+  HTTP-based .mcp.json entries are auto-overwritten on next dgc-pro run.
+- Server: --stdio flag added to mcp_graph_server_v7.4.py. HTTP mode preserved
+  for the dashboard ingest workflow (graph upload, system-map API).
+
+1.0.9  (2026-04-27)
+- Enterprise install: precise diagnostics on connectivity failure. Now distinguishes
+  DNS block / TCP timeout / TLS-inspection / 4xx-server-rejection. Each shows a
+  different message; corp-network failure prints the exact whitelist line for IT.
+- Honors HTTPS_PROXY and GRAPEROOT_CA_BUNDLE env vars at install + runtime.
+- Installer retries the verify call 3x with 5s/10s backoff before giving up.
+- Fixed: typo'd / revoked / expired keys previously masqueraded as
+  "License server unreachable" because curl -f swallowed the 4xx body. Now we
+  show the server's actual reason ("unknown license key", "license revoked", etc.)
+- Same fix applied to runtime launcher (launch_pro.sh / launch_pro.ps1) — landed
+  via auto-update on next dgc-pro run for existing customers.
+
+1.0.8  (2026-04-23)
+- Better PS install errors: shows the actual exception + URL + corp-network hint
+  instead of opaque 'License server unreachable'.
+
+1.0.7  (2026-04-23)
+- Windows: install.ps1, launch_pro.ps1, dgc-pro.ps1 are now pure ASCII. Eliminates
+  the PowerShell 5.1 parse-crash caused by UTF-8 em-dashes / box-drawing chars that
+  the free repo fought for months (their commits 3.9.45, 3.9.51, 3.9.53).
+- Windows: `$ProgressPreference = "SilentlyContinue"` set in install.ps1 + launch_pro.ps1.
+  Fixes the PS 5.1 Invoke-WebRequest slowdown (~40x faster downloads).
+- Auto-update: launcher file refresh now falls back to GitHub raw when R2 is unavailable.
+  Previously, a 1.0.x→1.0.y auto-update would install the new engine tarball but
+  leave bin/version.txt, launch_pro.sh etc. at the old version.
+- Verified end-to-end auto-update on macOS (1.0.5 → 1.0.6 in this release).
+
+1.0.6  (2026-04-23)
+- Polish on the v1.0.5 non-interactive fix: TTY probe now uses `{ : </dev/tty; } 2>/dev/null`
+  so the misleading "Device not configured" message never leaks to installer output
+  when running from automation / CI / piped shells.
+
+1.0.5  (2026-04-23)
+- Installer no longer hangs on non-interactive shells (CI, automation, SSH without
+  TTY, piped `curl | bash`). When no TTY is attached, optional prompts default to
+  YES so the install completes; set GRAPEROOT_SKIP_OPTIONAL=1 to opt out instead.
+  No security impact — all optional prompts are package installs the user can
+  always install manually later.
+
+1.0.4  (2026-04-23)
+- Security: MCP server now binds to 127.0.0.1 only (was 0.0.0.0). On public wifi /
+  office LANs, other machines could previously call graph_read to exfiltrate source.
+  Fixed in all 4 bind points in the server.
+- Security: dashboard session cookie changed to SameSite=Lax + explicit Origin guard
+  on all cookie-authed POSTs (login/logout/revoke-device). Blocks cross-site CSRF
+  even when browsers misbehave.
+- Security: ADMIN_TOKEN bearer comparison is now constant-time.
+
+1.0.3  (2026-04-23)
+- Orphan MCP server cleanup: every `dgc-pro` invocation now scans for stray server
+  processes from previous hard-killed runs (kill -9, Force Quit, crash, power loss)
+  and wipes them. Cross-platform via stdlib — macOS (ps), Linux (ps), Windows (wmic).
+- Normal Ctrl+C / exit behaviour unchanged — server is killed via the finally block
+  on SIGTERM / SIGINT as before. The new cleanup only fires when the finally block
+  never ran (parent was SIGKILLed).
+
+1.0.2  (2026-04-23)
+- Installer auto-detects and installs ripgrep across macOS (brew), Linux (apt/dnf/pacman),
+  and Windows (winget/scoop/choco). Unblocks fallback_rg + graph_grep_all on first run.
+- Patch release — bundled server unchanged since 1.0.1.
+
+1.0.1  (2026-04-23)
+- Initial commercial release of GrapeRoot Pro.
+- Symbol-level reads (file::symbol) — reads 30-line function body instead of 400-line file.
+- Priority-queue action memory — retains meaningful reads/edits across sessions.
+- Confidence-calibrated retrieval — safety-net grep at high confidence so weak signal still triggers exploration.
+- Cross-turn deduplication — already-read content returns a pointer, not bytes.
+- Benchmarked -29% cost vs GrapeRoot Free at +1.4 quality (nuon codebase, 25 prompts).
+- Self-serve dashboard at graperoot.dev/pro/login (sign in with license key).
+- Per-device seat management + 90-day audit trail.
+

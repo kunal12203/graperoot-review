@@ -1,0 +1,31 @@
+name = "graperoot-pro-license"
+main = "src/license-worker.js"
+compatibility_date = "2026-04-01"
+
+# Custom domain — point api.graperoot.dev at this Worker
+routes = [
+  { pattern = "api.graperoot.dev/*", zone_name = "graperoot.dev" }
+]
+
+# Variables (public) — override per env as needed
+[vars]
+PRO_REPO         = "kunal12203/graperoot-pro-releases"
+PRO_VERSION      = "v1.0.13"
+PRO_ASSET        = "graperoot-pro.tar.gz"
+DASHBOARD_ORIGIN = "https://graperoot.dev"
+
+# KV namespace — create once:
+#   wrangler kv namespace create LICENSES
+# Then paste the returned id below.
+[[kv_namespaces]]
+binding = "LICENSES"
+id      = "273da98358724f30ada795f7d0e8713d"
+
+[[kv_namespaces]]
+binding = "AUDIT_LOG"
+id      = "7a925a7edb3e47a3ac9c86a67245d89c"
+
+# Secrets (do NOT put in this file):
+#   wrangler secret put GITHUB_TOKEN    # PAT with repo scope for kunal12203/graperoot-pro-releases
+#   wrangler secret put ADMIN_TOKEN     # random long string for admin endpoints
+#   wrangler secret put SESSION_SECRET  # random 32+ chars for signing dashboard session JWTs
