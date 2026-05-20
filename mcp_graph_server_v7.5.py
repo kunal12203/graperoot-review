@@ -1629,7 +1629,9 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
     @mcp.tool()
     def graph_neighbors(file: str, limit: int = 30) -> dict[str, Any]:
-        """Return graph edges touching a file."""
+        """Return graph edges (imports/importers) for a file. Call after graph_continue."""
+        if not TURN_STATE.get("graph_continue_called"):
+            return {"ok": False, "error": "Call graph_continue first.", "action_required": "graph_continue"}
         _log_tool("graph_neighbors", {"file": file, "limit": limit})
         g = _local_info_graph() or _get("/api/info-graph?full=1")
         edges = g.get("edges", [])
@@ -1643,7 +1645,9 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
     @mcp.tool()
     def graph_impact(changed_files: list[str]) -> dict[str, Any]:
-        """Return connected local files likely impacted by edits."""
+        """Return files impacted by edits to changed_files. Call after graph_continue."""
+        if not TURN_STATE.get("graph_continue_called"):
+            return {"ok": False, "error": "Call graph_continue first.", "action_required": "graph_continue"}
         _log_tool("graph_impact", {"changed_files": changed_files})
         _record_action("impact", {"changed_files": changed_files})
         g = _local_info_graph() or _get("/api/info-graph?full=1")
