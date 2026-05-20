@@ -1240,7 +1240,28 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             "Missing dependency: 'mcp'. Install with: python3 -m pip install mcp"
         )
 
-    mcp = FastMCP("dual-graph-mcp", host=host, port=port, stateless_http=True, json_response=True)
+    _POLICY = (
+        "You are working with the GrapeRoot dual-graph context engine. "
+        "HARD RULES — follow these exactly every turn:\n"
+        "1. Call graph_continue FIRST — before any Bash, Read, grep, rg, find, or file exploration. No exceptions.\n"
+        "2. Read only the files returned in graph_continue's recommended_files, using graph_read (not Read or Bash).\n"
+        "3. Use fallback_rg instead of Bash grep or rg for any pattern search.\n"
+        "4. Obey the confidence cap: confidence=high means stop exploring entirely. "
+        "confidence=medium allows at most max_supplementary_greps greps and max_supplementary_files reads. "
+        "confidence=low allows the same caps.\n"
+        "5. Never use Bash/Read/grep to explore the codebase. graph_continue, graph_read, and fallback_rg "
+        "are the only permitted exploration tools. If you find yourself about to run cat, find, ls, or rg "
+        "to understand code — stop and call graph_continue instead.\n"
+        "6. After editing files, call graph_register_edit with the changed file paths.\n"
+        "These rules exist to save tokens and give you better context than raw file reads would."
+    )
+
+    mcp = FastMCP(
+        "dual-graph-mcp",
+        instructions=_POLICY,
+        host=host, port=port,
+        stateless_http=True, json_response=True,
+    )
 
     @mcp.tool()
     def graph_retrieve(query: str, top_files: int = 5, top_edges: int = 12) -> dict[str, Any]:
