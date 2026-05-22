@@ -1,3 +1,14 @@
+1.0.15  (2026-05-22)
+- FIXED fallback_rg: was returning 0 hits on 100% of benchmark calls.
+  Two root causes fixed:
+  1. Added --engine pcre2 flag so Claude's regex patterns ([\s\S], lookaheads,
+     \w+, character classes) actually match — rg's default RE2 engine was
+     silently rejecting them.
+  2. Phase-1 scoped search: searches graph-retrieved directories first
+     (cheaper, more relevant), falls back to full project if nothing found.
+  Benchmark result on Hoppscotch 1384-file project:
+  7 test patterns: 0 hits → 60 hits across all pattern types.
+
 1.0.14  (2026-05-21)
 - Security: replaced internal Railway hostname in shipped .py with
   api.graperoot.dev/ping (no infrastructure details exposed to users)
