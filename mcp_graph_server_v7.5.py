@@ -2338,27 +2338,72 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
                 "fallback_calls": calls,
                 "fallback_max_calls": effective_max,
             }
-        _log_tool("fallback_rg", {"pattern": pattern, "max_hits": max_hits})
-        cmd = ["rg", "-n", "-S", "--max-count", str(max_hits), pattern, "."]
-        proc = subprocess.run(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        # Scope to graph-retrieved directories first — cheaper and more relevant.
+        # Fall back to full PROJECT_ROOT if graph dirs yield no results.
+        retrieved = list(TURN_STATE.get("retrieved_files", []))
+        graph_dirs: list[str] = []
+        if retrieved:
+            import os as _os
+            seen: set[str] = set()
+            for fp in retrieved:
+                # Strip file::symbol notation to get bare file path
+                bare = fp.split("::")[0] if "::" in fp else fp
+                rel_dir = str(_os.path.dirname(bare))
+                if not rel_dir or rel_dir == ".":
+                    continue
+                # Only include if directory actually exists in PROJECT_ROOT
+                abs_dir = PROJECT_ROOT / rel_dir
+                if abs_dir.exists() and rel_dir not in seen:
+                    seen.add(rel_dir)
+                    graph_dirs.append(rel_dir)
+
+        # Try PCRE2 engine first (handles [\s\S], lookaheads, etc.).
+        # Fall back to default engine if PCRE2 not available.
+        def _run_rg(search_paths: list[str]) -> subprocess.CompletedProcess:
+            base = ["rg", "-n", "-S", "--engine", "pcre2",
+                    "--max-count", str(max_hits), pattern]
+            r = subprocess.run(base + search_paths, cwd=str(PROJECT_ROOT),
+                               capture_output=True, text=True, timeout=30, check=False)
+            if r.returncode == 2 and "PCRE2" in r.stderr:
+                # PCRE2 not compiled in — retry with default engine
+                base2 = ["rg", "-n", "-S", "--max-count", str(max_hits), pattern]
+                r = subprocess.run(base2 + search_paths, cwd=str(PROJECT_ROOT),
+                                   capture_output=True, text=True, timeout=30, check=False)
+            return r
+
+        _log_tool("fallback_rg", {"pattern": pattern, "max_hits": max_hits,
+                                   "graph_dirs": graph_dirs})
+
+        # Phase 1: search graph-relevant directories
+        proc = _run_rg(graph_dirs) if graph_dirs else None
+
         hits = []
-        for line in proc.stdout.splitlines():
-            parts = line.split(":", 2)
-            if len(parts) == 3:
-                hits.append({"file": parts[0], "line": parts[1], "text": parts[2]})
-            if len(hits) >= max_hits:
-                break
+        if proc and proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                parts = line.split(":", 2)
+                if len(parts) == 3:
+                    hits.append({"file": parts[0], "line": parts[1], "text": parts[2]})
+                if len(hits) >= max_hits:
+                    break
+
+        # Phase 2: full project if phase 1 found nothing
+        if not hits:
+            proc = _run_rg(["."])
+            for line in proc.stdout.splitlines():
+                parts = line.split(":", 2)
+                if len(parts) == 3:
+                    hits.append({"file": parts[0], "line": parts[1], "text": parts[2]})
+                if len(hits) >= max_hits:
+                    break
+
         TURN_STATE["fallback_calls"] = calls + 1
-        # v6: track total grep calls for cost budget
         TURN_STATE["total_grep_calls"] = int(TURN_STATE.get("total_grep_calls", 0)) + 1
-        return {"ok": True, "pattern": pattern, "hits": hits}
+        return {
+            "ok": True,
+            "pattern": pattern,
+            "hits": hits,
+            "searched_dirs": graph_dirs if hits and graph_dirs else ["(full project)"],
+        }
 
     @mcp.tool()
     def graph_add_memory(
