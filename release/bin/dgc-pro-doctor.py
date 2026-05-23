@@ -21,8 +21,9 @@ import sys
 import time
 from pathlib import Path
 
+IS_WINDOWS = sys.platform.startswith("win")
 PRO_HOME = Path.home() / ".graperoot-pro"
-MCP_CONFIG = Path.home() / ".mcp.json"
+MCP_CONFIG = Path.home() / ".mcp.json" if not IS_WINDOWS else Path.home() / "AppData" / "Roaming" / "Claude" / ".mcp.json"
 CLAUDE_HOOKS = Path.home() / ".claude" / "hooks"
 
 class Colors:
@@ -109,7 +110,10 @@ def check_python_deps():
     header("Python Dependencies")
 
     issues = []
-    venv_python = PRO_HOME / "venv" / "bin" / "python3"
+    if IS_WINDOWS:
+        venv_python = PRO_HOME / "venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = PRO_HOME / "venv" / "bin" / "python3"
 
     if not venv_python.exists():
         print(fail("Virtual environment not found"))
@@ -177,7 +181,13 @@ def check_orphan_servers():
     header("Server Processes")
 
     issues = []
-    ok, stdout, _ = run_cmd("ps aux | grep mcp_graph_server | grep -v grep")
+
+    if IS_WINDOWS:
+        cmd = 'wmic process where "CommandLine like \'%mcp_graph_server%\'" get ProcessId,CommandLine /format:list'
+    else:
+        cmd = "ps aux | grep mcp_graph_server | grep -v grep"
+
+    ok, stdout, _ = run_cmd(cmd)
 
     if ok and stdout.strip():
         lines = [l for l in stdout.strip().split('\n') if l]
@@ -223,7 +233,10 @@ def test_server_startup():
     header("Server Startup Test")
 
     issues = []
-    venv_python = PRO_HOME / "venv" / "bin" / "python3"
+    if IS_WINDOWS:
+        venv_python = PRO_HOME / "venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = PRO_HOME / "venv" / "bin" / "python3"
     server = PRO_HOME / "mcp_graph_server_v7.5.py"
 
     if not server.exists():
@@ -297,12 +310,19 @@ def fix_mcp_config_version():
 
 def fix_orphan_servers():
     """Kill orphaned MCP server processes"""
-    ok, stdout, _ = run_cmd("ps aux | grep mcp_graph_server | grep -v grep")
+    if IS_WINDOWS:
+        cmd_check = 'wmic process where "CommandLine like \'%mcp_graph_server%\'" get ProcessId /format:list'
+        cmd_kill = 'wmic process where "CommandLine like \'%mcp_graph_server%\'" delete'
+    else:
+        cmd_check = "ps aux | grep mcp_graph_server | grep -v grep"
+        cmd_kill = "pkill -f mcp_graph_server"
+
+    ok, stdout, _ = run_cmd(cmd_check)
 
     if not ok or not stdout.strip():
         return False
 
-    ok, _, _ = run_cmd("pkill -f mcp_graph_server")
+    ok, _, _ = run_cmd(cmd_kill)
     if ok:
         print(check("Killed orphan server processes"))
         time.sleep(1)
@@ -311,7 +331,10 @@ def fix_orphan_servers():
 
 def fix_missing_deps():
     """Install missing Python dependencies"""
-    venv_pip = PRO_HOME / "venv" / "bin" / "pip"
+    if IS_WINDOWS:
+        venv_pip = PRO_HOME / "venv" / "Scripts" / "pip.exe"
+    else:
+        venv_pip = PRO_HOME / "venv" / "bin" / "pip"
     if not venv_pip.exists():
         return False
 
