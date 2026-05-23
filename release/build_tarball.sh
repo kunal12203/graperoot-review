@@ -34,7 +34,13 @@ EOF
 cp "$RELEASE_DIR/bin/launch.py"   "$STAGE/launch.py"
 cp "$RELEASE_DIR/bin/version.txt" "$STAGE/VERSION"
 
-# 5. LICENSE / terms
+# 5. Doctor script (diagnostic + auto-fix for MCP issues)
+mkdir -p "$STAGE/bin"
+cp "$RELEASE_DIR/bin/dgc-pro-doctor.py" "$STAGE/bin/"
+cp "$RELEASE_DIR/bin/dgc-pro-doctor"    "$STAGE/bin/"
+chmod +x "$STAGE/bin/dgc-pro-doctor"
+
+# 6. LICENSE / terms
 cat > "$STAGE/LICENSE.txt" <<'EOF'
 GrapeRoot Pro — Commercial License
 © 2026 GrapeRoot.  All rights reserved.
