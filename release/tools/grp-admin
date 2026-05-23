@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""grp-admin — CLI for managing GrapeRoot Pro licenses.
+
+Admin token is stored in macOS Keychain (or ~/.graperoot-pro-admin/token on Linux with 0600 perms).
+Never needs to be pasted or typed again after first-time setup.
+
+Usage:
+  grp-admin setup                                                    # one-time: save token to keychain
+  grp-admin issue --customer NAME --email E [--seats N] [--expires D] [--tier T]
+  grp-admin revoke GRP-XXXX-XXXX-XXXX
+  grp-admin verify GRP-XXXX-XXXX-XXXX                                # test a key works end-to-end
+  grp-admin smoke                                                    # issue throwaway, full download test, revoke
+  grp-admin info                                                     # show configured endpoint + token source
+  grp-admin url                                                      # print the API URL
+
+Env overrides:
+  GRAPEROOT_PRO_API        Override the license server (default: https://api.graperoot.dev)
+  GRAPEROOT_ADMIN_TOKEN    Bypass keychain (for CI / scripts only)
+"""
+from __future__ import annotations
+import argparse
+import getpass
+import json
+import os
+import platform
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+API_DEFAULT = "https://api.graperoot.dev"
+KEYCHAIN_SVC = "graperoot-pro-admin"
+KEYCHAIN_ACCT = "admin-token"
+FILE_STORE = Path.home() / ".graperoot-pro-admin" / "token"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Token storage: macOS Keychain preferred; ~/.graperoot-pro-admin/token otherwise
+# ─────────────────────────────────────────────────────────────────────────
+def _is_macos() -> bool:
+    return platform.system() == "Darwin"
+
+
+def token_save(token: str) -> str:
+    token = token.strip()
+    if not token:
+        die("empty token")
+    if _is_macos():
+        # Delete any existing entry, then add
+        subprocess.run(
+            ["security", "delete-generic-password", "-s", KEYCHAIN_SVC, "-a", KEYCHAIN_ACCT],
+            capture_output=True,
+        )
+        r = subprocess.run(
+            ["security", "add-generic-password", "-s", KEYCHAIN_SVC, "-a", KEYCHAIN_ACCT,
+             "-w", token, "-U"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            die(f"keychain save failed: {r.stderr.strip()}")
+        return "macOS Keychain"
+    else:
+        FILE_STORE.parent.mkdir(parents=True, exist_ok=True)
+        FILE_STORE.write_text(token)
+        FILE_STORE.chmod(0o600)
+        return str(FILE_STORE)
+
+
+def token_load() -> str | None:
+    env = os.environ.get("GRAPEROOT_ADMIN_TOKEN")
+    if env:
+        return env.strip()
+    if _is_macos():
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SVC, "-a", KEYCHAIN_ACCT, "-w"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+        return None
+    if FILE_STORE.exists():
+        return FILE_STORE.read_text().strip()
+    return None
+
+
+def token_source() -> str:
+    if os.environ.get("GRAPEROOT_ADMIN_TOKEN"):
+        return "environment variable GRAPEROOT_ADMIN_TOKEN"
+    if _is_macos():
+        return f"macOS Keychain ({KEYCHAIN_SVC}/{KEYCHAIN_ACCT})"
+    return str(FILE_STORE)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# HTTP helpers
+# ─────────────────────────────────────────────────────────────────────────
+def api_url() -> str:
+    return os.environ.get("GRAPEROOT_PRO_API", API_DEFAULT).rstrip("/")
+
+
+def http(method: str, path: str, *, body: dict | None = None, auth: bool = False) -> dict:
+    url = api_url() + path
+    data = json.dumps(body).encode() if body is not None else None
+    # Set a real User-Agent — Cloudflare blocks Python-urllib as suspicious (error 1010)
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "grp-admin/1.0 (+https://graperoot.dev/pro)",
+        "Accept": "application/json",
+    }
+    if auth:
+        token = token_load()
+        if not token:
+            die("no admin token configured. Run:  grp-admin setup")
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode(errors="replace")[:500]
+        die(f"HTTP {e.code} {e.reason}: {msg}")
+    except urllib.error.URLError as e:
+        die(f"connection failed: {e.reason}")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"grp-admin: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────
+def cmd_setup(args) -> None:
+    existing = token_load()
+    if existing and not args.force:
+        print(f"Admin token already configured in: {token_source()}")
+        print("Use --force to replace it.")
+        return
+
+    token = None
+
+    # Source 1: explicit --token flag
+    if args.token:
+        token = args.token.strip()
+
+    # Source 2: stdin (if piped, like:  echo TOKEN | grp-admin setup)
+    elif not sys.stdin.isatty():
+        token = sys.stdin.read().strip()
+
+    # Source 3: --clipboard (read from macOS pasteboard)
+    elif args.clipboard:
+        if _is_macos():
+            r = subprocess.run(["pbpaste"], capture_output=True, text=True)
+            token = r.stdout.strip()
+            if not token:
+                die("clipboard is empty")
+        else:
+            die("--clipboard is macOS-only")
+
+    # Source 4: visible prompt (not hidden — solves the getpass paste issue)
+    elif args.visible:
+        print(f"Paste your ADMIN_TOKEN (will be stored in: {token_source()})")
+        print("Input is VISIBLE — will be echoed as you type/paste. Press Enter to submit.")
+        try:
+            token = input("ADMIN_TOKEN: ").strip()
+        except EOFError:
+            die("no input")
+
+    # Source 5: hidden prompt (default — fallback to visible if paste doesn't work)
+    else:
+        print(f"Paste your ADMIN_TOKEN (will be stored in: {token_source()})")
+        print("Input is HIDDEN — paste with Cmd+V, then press Enter.")
+        print("If paste doesn't work (some macOS terminals block it), re-run with --visible instead.")
+        try:
+            token = getpass.getpass("ADMIN_TOKEN: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            die("no input")
+
+    if not token:
+        die("no token entered — retry with:  grp-admin setup --clipboard     "
+            "(after copying the token), or  grp-admin setup --visible     (echoed input)")
+
+    loc = token_save(token)
+    print(f"✓ Saved to {loc}")
+
+    # Smoke-verify
+    try:
+        h = http("GET", "/health")
+        if h.get("ok"):
+            print(f"✓ Reached {api_url()}/health — service is up")
+    except SystemExit:
+        pass
+
+
+def cmd_info(args) -> None:
+    token = token_load()
+    print(f"API endpoint:   {api_url()}")
+    print(f"Token source:   {token_source()}")
+    print(f"Token present:  {'yes' if token else 'no'}")
+    if token:
+        masked = token[:4] + "…" + token[-4:] if len(token) > 8 else "****"
+        print(f"Token preview:  {masked}")
+
+
+def cmd_issue(args) -> None:
+    body = {
+        "customer": args.customer,
+        "email": args.email,
+        "tier": args.tier,
+        "seats": args.seats,
+        "expires": args.expires,
+    }
+    resp = http("POST", "/v1/admin/issue", body=body, auth=True)
+    lic = resp.get("license", {})
+    key = lic.get("key", "")
+    print("✓ License issued")
+    print(f"  Key:       {key}")
+    print(f"  Customer:  {lic.get('customer','')}")
+    print(f"  Email:     {lic.get('email','')}")
+    print(f"  Tier:      {lic.get('tier','')}")
+    print(f"  Seats:     {lic.get('seats','')}")
+    print(f"  Expires:   {lic.get('expires','')}")
+    if args.json:
+        print()
+        print(json.dumps(lic, indent=2))
+
+
+def cmd_revoke(args) -> None:
+    resp = http("POST", "/v1/admin/revoke", body={"license_key": args.key}, auth=True)
+    if resp.get("ok"):
+        print(f"✓ Revoked {args.key}")
+    else:
+        die(f"revoke failed: {resp}")
+
+
+def cmd_verify(args) -> None:
+    import socket
+    resp = http("POST", "/v1/license/verify",
+                body={"license_key": args.key, "host": socket.gethostname(), "os": platform.system()})
+    print(json.dumps(resp, indent=2))
+    if not resp.get("valid"):
+        sys.exit(2)
+
+
+def cmd_smoke(args) -> None:
+    print("Running full smoke test (issue → verify → download test → revoke)…")
+    issued = http("POST", "/v1/admin/issue",
+                  body={"customer": "Smoke Test", "email": "smoke@graperoot.dev",
+                        "tier": "pro", "seats": 1, "expires": "perpetual"}, auth=True)
+    key = issued["license"]["key"]
+    print(f"  ✓ Issued temp key: {key}")
+
+    download_ok = False
+    download_error = None
+    try:
+        verified = http("POST", "/v1/license/verify",
+                        body={"license_key": key, "host": "smoke", "os": "test"})
+        if not verified.get("valid"):
+            die(f"verify failed: {verified}")
+        dl = verified["download_url"]
+        print(f"  ✓ Verified, download_url: {dl}")
+
+        # Download first 16 bytes — DON'T raise on HTTPError; capture body for diagnosis
+        req = urllib.request.Request(dl, headers={
+            "Range": "bytes=0-15",
+            "User-Agent": "grp-admin/1.0 (+https://graperoot.dev/pro)",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                head = r.read(16)
+                print(f"  ✓ First 16 bytes of asset: {head.hex(' ')}")
+                if head[:4] == b"\x1f\x8b\x08\x00":
+                    print("  ✓ gzip magic confirmed — full install pipeline works end-to-end")
+                    download_ok = True
+                else:
+                    print(f"  !! Expected gzip magic 1f8b0800, got {head[:4].hex()}")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:800]
+            download_error = f"HTTP {e.code} {e.reason}\n--- response body ---\n{body}"
+            print(f"  ✗ Download failed: HTTP {e.code} {e.reason}")
+            print("    --- response body from Worker ---")
+            for line in body.splitlines():
+                print(f"    {line}")
+            print("    ---------------------------------")
+    finally:
+        http("POST", "/v1/admin/revoke", body={"license_key": key}, auth=True)
+        print(f"  ✓ Revoked temp key")
+
+    if download_ok:
+        print("\n✅ Smoke test passed")
+    else:
+        print("\n✗ Smoke test FAILED — see response body above for diagnosis.")
+        print("   Common causes:")
+        print("     • 'release lookup failed: 404' → GitHub PAT can't see the private repo")
+        print("     • 'asset not found' → tarball not attached to the latest release")
+        print("     • 'license not found in KV' → KV write hasn't propagated (retry)")
+        sys.exit(1)
+
+
+def cmd_url(args) -> None:
+    print(api_url())
+
+
+def cmd_audit(args) -> None:
+    """Pull recent audit entries via wrangler CLI (needs wrangler installed + logged in)."""
+    worker_dir = Path.home() / "Documents" / "Personal Projects" / "GrapeRoot Pro" / "release" / "worker"
+    if not worker_dir.exists():
+        die("cannot locate release/worker dir; run audit from project root or update path")
+    r = subprocess.run(
+        ["wrangler", "kv", "key", "list", "--binding", "AUDIT_LOG", "--remote"],
+        cwd=str(worker_dir), capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        die(f"wrangler failed: {r.stderr.strip()[:300]}")
+    try:
+        keys = json.loads(r.stdout)
+    except Exception:
+        die("could not parse wrangler output")
+    # Sort chronologically (key format: audit:<ISO-ts>-<rand>)
+    keys.sort(key=lambda k: k["name"], reverse=True)
+
+    print(f"{'Timestamp':24s}  {'IP':25s}  {'Action':28s}  Details")
+    print("-" * 120)
+    shown = 0
+    for k in keys:
+        if shown >= args.limit:
+            break
+        r2 = subprocess.run(
+            ["wrangler", "kv", "key", "get", k["name"], "--binding", "AUDIT_LOG", "--remote"],
+            cwd=str(worker_dir), capture_output=True, text=True, timeout=15,
+        )
+        if r2.returncode != 0:
+            continue
+        try:
+            entry = json.loads(r2.stdout)
+        except Exception:
+            continue
+        if args.filter and entry.get("action") != args.filter:
+            continue
+        ts = entry.get("ts", "")[:19].replace("T", " ")
+        ip = (entry.get("ip", "") or "")[:25]
+        action = (entry.get("action", "") or "")[:28]
+        details = {k: v for k, v in entry.items() if k not in {"ts", "ip", "ua", "action"}}
+        print(f"{ts:24s}  {ip:25s}  {action:28s}  {json.dumps(details, separators=(',',':'))[:80]}")
+        shown += 1
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    p = argparse.ArgumentParser(prog="grp-admin", description="Manage GrapeRoot Pro licenses.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("setup", help="One-time: save ADMIN_TOKEN to secure storage")
+    s.add_argument("--force", action="store_true", help="Overwrite existing token")
+    s.add_argument("--token", help="Provide token directly (shell-history visible — use sparingly)")
+    s.add_argument("--clipboard", action="store_true",
+                   help="Read token from macOS clipboard (copy it first, then run this)")
+    s.add_argument("--visible", action="store_true",
+                   help="Use visible (non-hidden) prompt — works when paste into hidden fields fails")
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("info", help="Show API endpoint + token source")
+    s.set_defaults(func=cmd_info)
+
+    s = sub.add_parser("issue", help="Issue a new license")
+    s.add_argument("--customer", required=True)
+    s.add_argument("--email", required=True)
+    s.add_argument("--tier", default="pro", choices=["pro", "enterprise"])
+    s.add_argument("--seats", type=int, default=1)
+    s.add_argument("--expires", default="perpetual", help="YYYY-MM-DD or 'perpetual'")
+    s.add_argument("--json", action="store_true", help="Also print full license JSON")
+    s.set_defaults(func=cmd_issue)
+
+    s = sub.add_parser("revoke", help="Revoke a license by key")
+    s.add_argument("key")
+    s.set_defaults(func=cmd_revoke)
+
+    s = sub.add_parser("verify", help="Verify a license key end-to-end")
+    s.add_argument("key")
+    s.set_defaults(func=cmd_verify)
+
+    s = sub.add_parser("smoke", help="Full end-to-end smoke test (issue → download → revoke)")
+    s.set_defaults(func=cmd_smoke)
+
+    s = sub.add_parser("url", help="Print the API base URL")
+    s.set_defaults(func=cmd_url)
+
+    s = sub.add_parser("audit", help="View recent audit log entries (from Cloudflare KV)")
+    s.add_argument("--limit", type=int, default=20, help="Number of recent entries (default 20)")
+    s.add_argument("--filter", help="Filter by action (e.g. license_issued, dashboard_login_ok)")
+    s.set_defaults(func=cmd_audit)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

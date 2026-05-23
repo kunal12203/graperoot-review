@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
-v1.0.16: graperoot-pro is now a stdio MCP server. Claude Code spawns it on
+v1.0.17: graperoot-pro is now a stdio MCP server. Claude Code spawns it on
 session start and kills it on exit — no port management, no orphan processes,
 no stale .mcp.json entries. Same pattern as filesystem/git/everyone-else MCPs.
 
@@ -135,10 +135,10 @@ def build_graph(project: Path, data_dir: Path) -> None:
                     "--root", str(project), "--out", str(graph_file)], check=True)
 
 
-def write_mcp_config(project: Path, data_dir: Path) -> Path:
-    """Merge graperoot-pro into project's .mcp.json as a stdio MCP entry.
+def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
+    """Merge graperoot-pro into project's .mcp.json as an HTTP MCP entry.
 
-    Claude Code spawns the server when the session starts, kills it on exit.
+    The server runs as a background HTTP process — Claude Code connects via HTTP transport.
     Other MCP entries in the project are preserved.
     """
     cfg = project / ".mcp.json"
@@ -149,15 +149,9 @@ def write_mcp_config(project: Path, data_dir: Path) -> Path:
         except Exception:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
-    server_py = PRO_HOME / "mcp_graph_server_v7.5.py"
     servers["graperoot-pro"] = {
-        "command": sys.executable,  # the venv python that this launcher is running under
-        "args": [str(server_py), "--stdio"],
-        "env": {
-            "DG_DATA_DIR": str(data_dir),
-            "DUAL_GRAPH_PROJECT_ROOT": str(project),
-            "GRAPEROOT_PRO_HOME": str(PRO_HOME),
-        },
+        "type": "http",
+        "url": f"http://localhost:{port}/mcp",
     }
     cfg.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     return cfg
@@ -276,7 +270,7 @@ def main() -> None:
     cleanup_orphan_servers()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.16"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.17"
         print(f"dgc-pro v{ver}")
         return
 
@@ -286,16 +280,30 @@ def main() -> None:
     data_dir = project / ".dual-graph-pro"
 
     build_graph(project, data_dir)
-    mcp_cfg = write_mcp_config(project, data_dir)
-    print(f"[dgc-pro] graperoot-pro registered (stdio) in {mcp_cfg}", flush=True)
+
+    port = find_free_port()
+    proc = start_mcp_server(port, project, data_dir)
+    print(f"[dgc-pro] MCP server started on port {port} (pid {proc.pid})", flush=True)
+
+    mcp_cfg = write_mcp_config(project, data_dir, port)
+    print(f"[dgc-pro] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
+
     claude_md, action = write_claude_md(project)
     if action == "created":
         print(f"[dgc-pro] CLAUDE.md created with dual-graph policy ({claude_md})", flush=True)
     elif action == "prepended":
         print(f"[dgc-pro] dual-graph policy prepended to existing CLAUDE.md ({claude_md})", flush=True)
-    # action == "kept": stay silent, user already has the policy
+
     claude = resolve_claude()
-    sys.exit(subprocess.call([claude] + passthrough, cwd=str(project)))
+    exit_code = subprocess.call([claude] + passthrough, cwd=str(project))
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

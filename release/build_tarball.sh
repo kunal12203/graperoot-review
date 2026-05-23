@@ -3,7 +3,7 @@
 # Usage: ./build_tarball.sh [VERSION]
 set -Eeuo pipefail
 
-VERSION="${1:-$(cat release/bin/version.txt 2>/dev/null || echo 1.0.16)}"
+VERSION="${1:-$(cat release/bin/version.txt 2>/dev/null || echo 1.0.17)}"
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_DIR="$PROJ_ROOT/release"
 BUILD_DIR="$(mktemp -d -t grp-pro-build.XXXXXX)"

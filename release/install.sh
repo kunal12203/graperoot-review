@@ -313,7 +313,7 @@ if ! grep -q ".graperoot-pro/bin" "$SHELL_RC" 2>/dev/null; then
   echo "[install] Added $INSTALL_DIR/bin to PATH in $SHELL_RC"
 fi
 
-VER=$(cat "$INSTALL_DIR/bin/version.txt" 2>/dev/null || echo "1.0.16")
+VER=$(cat "$INSTALL_DIR/bin/version.txt" 2>/dev/null || echo "1.0.17")
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  Install complete.  GrapeRoot Pro v$VER                    ║"

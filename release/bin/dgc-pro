@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# dgc-pro — GrapeRoot Pro launcher (Unix shim)
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/launch_pro.sh" "$@"
