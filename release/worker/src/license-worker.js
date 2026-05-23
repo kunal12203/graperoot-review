@@ -262,7 +262,7 @@ async function streamAsset(req, env) {
   }
   if (!record) return new Response(`license not found in KV after retries (key=${key})`, { status: 403 });
   if (record.revoked) return new Response("license revoked", { status: 403 });
-  if (record.expires && record.expires !== "perpetual" && new Date(record.expires) < new Date()) {
+  if (record.expires !== "perpetual" && record.expires && new Date(record.expires) < new Date()) {
     return new Response("license expired", { status: 403 });
   }
 
@@ -342,7 +342,7 @@ async function issueLicense(req, env) {
     return jsonResp({ error: "unauthorized" }, 401);
   }
   const body = await req.json();
-  const { customer, email, tier = "pro", seats = 1, expires = "perpetual" } = body;
+  const { customer, email, tier = "pro", seats = 3, expires = "perpetual" } = body;
   if (!customer || !email) return jsonResp({ error: "customer and email required" }, 400);
   const key = generateKey();
   const record = {
@@ -638,7 +638,7 @@ async function adminWebIssue(req, env) {
   if (!isOriginAllowed(req, env)) return jsonResp({ ok: false, error: "invalid origin" }, 403, cors);
   if (!(await requireAdminWeb(req, env))) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
   const body = await req.json();
-  const { customer, email, tier = "pro", seats = 1, expires = "perpetual" } = body;
+  const { customer, email, tier = "pro", seats = 3, expires = "perpetual" } = body;
   if (!customer || !email) return jsonResp({ ok: false, error: "customer and email required" }, 400, cors);
   const key = generateKey();
   const record = {
