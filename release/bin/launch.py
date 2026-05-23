@@ -285,6 +285,23 @@ def main() -> None:
     proc = start_mcp_server(port, project, data_dir)
     print(f"[dgc-pro] MCP server started on port {port} (pid {proc.pid})", flush=True)
 
+    # Ensure server is killed on ANY exit — normal, Ctrl+C, terminal close, SIGHUP
+    def _cleanup(*_args):
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    import atexit
+    atexit.register(_cleanup)
+    if not IS_WINDOWS:
+        signal.signal(signal.SIGHUP, lambda *_: (_cleanup(), sys.exit(1)))
+        signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(1)))
+
     mcp_cfg = write_mcp_config(project, data_dir, port)
     print(f"[dgc-pro] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
 
@@ -297,12 +314,7 @@ def main() -> None:
     claude = resolve_claude()
     exit_code = subprocess.call([claude] + passthrough, cwd=str(project))
 
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
+    _cleanup()
     sys.exit(exit_code)
 
 
