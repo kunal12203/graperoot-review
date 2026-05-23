@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
-v1.0.12: graperoot-pro is now a stdio MCP server. Claude Code spawns it on
+v1.0.15: graperoot-pro is now a stdio MCP server. Claude Code spawns it on
 session start and kills it on exit — no port management, no orphan processes,
 no stale .mcp.json entries. Same pattern as filesystem/git/everyone-else MCPs.
 
@@ -276,7 +276,7 @@ def main() -> None:
     cleanup_orphan_servers()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.12"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.15"
         print(f"dgc-pro v{ver}")
         return
 
