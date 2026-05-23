@@ -319,6 +319,29 @@ echo "╔═══════════════════════�
 echo "║  Install complete.  GrapeRoot Pro v$VER                    ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Post-install health check — detect and offer to fix common issues
+# ══════════════════════════════════════════════════════════════════════════════
+DOCTOR="$INSTALL_DIR/bin/dgc-pro-doctor.py"
+if [[ -f "$DOCTOR" && -x "$VENV/bin/python3" ]]; then
+  echo "[check] Running post-install diagnostics..."
+  if "$VENV/bin/python3" "$DOCTOR" --check-mcp 2>/dev/null; then
+    echo "[check] ✓ No issues detected"
+  else
+    echo ""
+    echo "[check] Found potential issues."
+    if confirm "[check] Run auto-fix? (kills orphan servers, updates configs)"; then
+      "$VENV/bin/python3" "$DOCTOR" --fix || true
+      echo ""
+      echo "[check] Fixes applied. Restart Claude Code (Cmd+Q, reopen) to reconnect MCP."
+    else
+      echo "[check] Skipped. Run manually: dgc-pro-doctor --fix"
+    fi
+  fi
+  echo ""
+fi
+
 echo "  Run once:       source $SHELL_RC"
 echo "  Then per project:"
 echo "    dgc-pro /path/to/your/project"
