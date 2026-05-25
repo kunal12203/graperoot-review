@@ -1013,7 +1013,8 @@ def _add_edge(g: dict[str, Any], frm: str, to: str, rel: str, meta: dict[str, An
 def _slim_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Strip large fields from action payloads before storing."""
     keep: dict[str, Any] = {"kind": kind}
-    for k in ("file", "query", "mode", "pattern", "response_chars", "overlap"):
+    for k in ("file", "query", "mode", "pattern", "response_chars", "overlap",
+              "hit_count", "hit_files", "searched_dirs"):
         if k in payload:
             keep[k] = payload[k]
     return keep
@@ -1028,6 +1029,7 @@ _ACTION_WEIGHT = {
     "retrieve": 15,
     "fallback_rg": 10,
     "impact": 8,
+    "cross_search": 8,
     "action_summary": 5,
     "read_cache_hit": 3,
     "retrieve_cache_hit": 3,
@@ -1061,6 +1063,15 @@ def _record_action(kind: str, payload: dict[str, Any]) -> None:
         kept.sort(key=lambda a: int(a.get("ts", 0) or 0))
         g["actions"] = kept
     _save_action_graph(g)
+
+
+def _write_gc_active() -> None:
+    """Write gate file so PreToolUse hook allows native exploration."""
+    try:
+        gate = DG_DATA_DIR / ".gc_active"
+        gate.write_text(str(int(time.time())))
+    except OSError:
+        pass
 
 
 def _recent_action_evidence(files: list[str], window_sec: int = 120) -> dict[str, Any]:
@@ -1566,24 +1577,35 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             }
 
         granted = min(max_chars, remaining)
+        # Dedupe: prevent re-reading the exact same content in the same turn.
+        # Key includes max_chars so requesting MORE data bypasses the dedupe.
+        # Bare file reads bypass dedupe if previous read was a symbol excerpt.
         dedupe_key = f"{file}|{_query_key(query)}|{anchor.lower()}"
         seen = TURN_STATE.get("seen_reads", {})
-        if dedupe_key in seen:
-            prev = str(seen[dedupe_key])
-            # Return only tiny reminder for duplicate reads in same turn.
-            preview = prev[:500]
-            payload = {
-                "file": file,
-                "requested_chars": requested,
-                "granted_chars": min(500, granted),
-                "query": query,
-                "anchor": anchor,
-                "mode": "dedupe_preview",
-                "response_chars": len(preview),
-                "response_tokens_est": _est_tokens(preview),
-            }
-            _log_tool("graph_read", payload)
-            return {"ok": True, "file": file, "content": preview, "mode": "dedupe_preview", "already_returned": True}
+        prev_entry = seen.get(dedupe_key)
+        if prev_entry:
+            prev_content = str(prev_entry.get("content", ""))
+            prev_mode = str(prev_entry.get("mode", ""))
+            prev_chars = int(prev_entry.get("chars", 0))
+            # Allow re-read if: requesting more chars, or previous was a symbol excerpt
+            # and now asking for full file (larger max_chars)
+            is_upgrade = max_chars > prev_chars or (
+                prev_mode in ("symbol_excerpt", "auto_symbol_excerpt") and "::" not in file
+            )
+            if not is_upgrade:
+                preview = prev_content[:500]
+                payload = {
+                    "file": file,
+                    "requested_chars": requested,
+                    "granted_chars": min(500, granted),
+                    "query": query,
+                    "anchor": anchor,
+                    "mode": "dedupe_preview",
+                    "response_chars": len(preview),
+                    "response_tokens_est": _est_tokens(preview),
+                }
+                _log_tool("graph_read", payload)
+                return {"ok": True, "file": file, "content": preview, "mode": "dedupe_preview", "already_returned": True}
 
         # Handle file::symbol notation — O(1) lookup via symbol index.
         sym_meta = None
@@ -1618,7 +1640,14 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
         # v7.3: auto-promote bare file reads to symbol_excerpt using current turn query.
         # If the caller passed a bare path (no ::) but we have a query in TURN_STATE,
         # find the best-scoring symbol in this file and extract only those lines.
-        if not sym_meta and not anchor and "::" not in file:
+        # v7.5.1: Skip auto-promote if this file was already read as a symbol excerpt —
+        # Claude is explicitly asking for the full file because the excerpt was insufficient.
+        _already_symbol_read = any(
+            e.get("mode") in ("symbol_excerpt", "auto_symbol_excerpt")
+            for k, e in seen.items()
+            if isinstance(e, dict) and k.startswith(file.split("::")[0])
+        )
+        if not sym_meta and not anchor and "::" not in file and not _already_symbol_read:
             _cur_query = str(TURN_STATE.get("current_query", ""))
             if _cur_query:
                 _promoted = _resolve_to_symbols([file], _cur_query)
@@ -1632,6 +1661,24 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             _lines = text.splitlines()
             _start = int(sym_meta.get("line_start", 0))
             _end = min(int(sym_meta.get("line_end", len(_lines) - 1)), len(_lines) - 1)
+            # v7.5.1: If index range is too small (< 5 lines), expand to capture full body.
+            # This handles cases where the index only stored the signature.
+            if _end - _start < 5 and _start < len(_lines):
+                # Find the end of the function/block by tracking indentation or braces
+                base_indent = len(_lines[_start]) - len(_lines[_start].lstrip()) if _lines[_start].strip() else 0
+                expanded_end = _start
+                brace_depth = 0
+                for li in range(_start, min(len(_lines), _start + 200)):
+                    line = _lines[li]
+                    brace_depth += line.count("{") - line.count("}")
+                    # For Python: stop at next line with same or less indent (not empty)
+                    if li > _start + 1 and line.strip() and not line.strip().startswith(("#", "//", "/*")):
+                        cur_indent = len(line) - len(line.lstrip())
+                        if cur_indent <= base_indent and brace_depth <= 0:
+                            break
+                    expanded_end = li
+                if expanded_end > _end:
+                    _end = expanded_end
             text = "\n".join(_lines[_start:_end + 1])
             mode = "symbol_excerpt"
             # Staleness check: compare body hash against current file content.
@@ -1640,11 +1687,14 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
                 current_hash = hashlib.md5(text.encode()).hexdigest()[:8]
                 sym_stale = current_hash != stored_hash
         if anchor:
-            i = text.lower().find(anchor.lower())
+            # If anchor is specified, search the FULL file content (not symbol excerpt)
+            # to find the anchor and return a window around it.
+            full_text = tgt.read_text(encoding="utf-8", errors="ignore") if tgt.exists() else text
+            i = full_text.lower().find(anchor.lower())
             if i >= 0:
                 start = max(0, i - granted // 2)
-                end = min(len(text), i + granted // 2)
-                text = text[start:end]
+                end = min(len(full_text), i + granted // 2)
+                text = full_text[start:end]
                 mode = "anchor_excerpt"
             else:
                 text = text[:granted]
@@ -1656,9 +1706,9 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
         TURN_STATE["used_chars"] = used + len(text)
         # v6: accumulate total chars read across all turns for cost budget
         TURN_STATE["total_read_chars"] = int(TURN_STATE.get("total_read_chars", 0)) + len(text)
-        # Store only a 200-char fingerprint for dedupe — not the full content.
-        seen[dedupe_key] = text[:200]
-        if len(seen) > 20:  # evict oldest if too many entries
+        # Store dedupe metadata so upgraded re-reads can bypass.
+        seen[dedupe_key] = {"content": text[:200], "mode": mode, "chars": len(text)}
+        if len(seen) > 20:
             oldest = next(iter(seen))
             del seen[oldest]
         TURN_STATE["seen_reads"] = seen
@@ -1675,7 +1725,18 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             "budget_remaining_chars": max(0, TURN_READ_BUDGET_CHARS - int(TURN_STATE.get("used_chars", 0))),
         }
         _log_tool("graph_read", payload)
-        _record_action("read", payload)
+        # Inline action append — do NOT call _record_action() here because `g` was loaded
+        # at the top of this function and gets saved at the end. _record_action does its own
+        # load/save cycle which would be overwritten by our _save_action_graph(g) below.
+        actions = g.setdefault("actions", [])
+        actions.append({"ts": int(datetime.now(timezone.utc).timestamp()), "kind": "read", "payload": _slim_payload("read", payload)})
+        if len(actions) > 300:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            scored = [(a, _action_importance(a, now_ts)) for a in actions]
+            scored.sort(key=lambda x: -x[1])
+            kept = [a for a, _ in scored[:300]]
+            kept.sort(key=lambda a: int(a.get("ts", 0) or 0))
+            g["actions"] = kept
         # Persist file cache + graph edges.
         qid = f"query:{_query_key(query)}" if query else "query:(empty)"
         _ensure_node(g, qid, "query", {"text": query})
@@ -1971,6 +2032,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
                     "recommended_files": rec_files[: min(3, len(rec_files))],
                     "graph_edges": retrieved.get("graph_edges", []),
                 }
+            _write_gc_active()
             return {
                 "ok": True,
                 "skip": True,
@@ -1986,6 +2048,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
         TURN_STATE["turn_count"] = int(TURN_STATE.get("turn_count", 0)) + 1
         turn_count = TURN_STATE["turn_count"]
         TURN_STATE["graph_continue_called"] = True   # gate: allow graph_read/fallback_rg this turn
+        _write_gc_active()
         # v7.2: Reset per-turn grep counter so exhaustive tasks get the full cap each turn.
         TURN_STATE["fallback_calls"] = 0
 
@@ -2267,16 +2330,59 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             rec_slice = rec_files[: min(3, len(rec_files))]
         # v7.3: upgrade bare file paths → file::symbol where query resolves to a specific symbol
         rec_slice = _resolve_to_symbols(rec_slice, query)
-        # v7.4 LEAN RESPONSE + v7.5 task_type restoration.
-        out: dict[str, Any] = {
-            "ok": True,
-            "mode": "retrieve_then_read",
-            "confidence": confidence,
-            "max_supplementary_greps": max_supp_greps,
-            "max_supplementary_files": max_supp_files,
-            "recommended_files": rec_slice,
-            "task_type": task_type,  # v7.5: restored — single word scaffolding
-        }
+        # v7.5.1: confidence-aware response strategy
+        # Low: don't recommend files (likely wrong), tell Claude to fallback_rg first
+        # Medium: recommend files + tell Claude to verify with fallback_rg if insufficient
+        # High: recommend files, no extra exploration needed
+        if confidence == "low":
+            # Extract search hints from retrieved files (directories, not files)
+            search_hints = []
+            if rec_files:
+                seen_dirs: set[str] = set()
+                for f in rec_files[:6]:
+                    d = str(Path(f).parent)
+                    if d and d != "." and d not in seen_dirs:
+                        seen_dirs.add(d)
+                        search_hints.append(d)
+            out: dict[str, Any] = {
+                "ok": True,
+                "mode": "search_first",
+                "confidence": confidence,
+                "recommended_files": [],
+                "task_type": task_type,
+                "search_hints": search_hints[:4],
+                "strategy": (
+                    "Low confidence — graph is unsure where this lives. "
+                    "DO NOT read files blindly. Instead: "
+                    "1) Call fallback_rg with specific search terms to locate the right files. "
+                    "2) Then call graph_read on the files fallback_rg found. "
+                    "This is cheaper than guessing. Never use native grep/cat/Read."
+                ),
+            }
+        elif confidence == "medium":
+            out: dict[str, Any] = {
+                "ok": True,
+                "mode": "retrieve_then_read",
+                "confidence": confidence,
+                "recommended_files": rec_slice,
+                "task_type": task_type,
+                "strategy": (
+                    "Medium confidence — these files are likely relevant but may not be complete. "
+                    "1) Read recommended_files with graph_read first. "
+                    "2) If they don't fully answer the question, call fallback_rg to find more. "
+                    "3) Then graph_read the files fallback_rg found. "
+                    "Never use native grep/cat/Read."
+                ),
+            }
+        else:
+            out: dict[str, Any] = {
+                "ok": True,
+                "mode": "retrieve_then_read",
+                "confidence": confidence,
+                "recommended_files": rec_slice,
+                "task_type": task_type,
+                "fallback_rg_hint": "Use fallback_rg only if recommended_files don't fully answer the question. Never use native grep/cat/Read.",
+            }
         _first_turn = (int(TURN_STATE.get("turn_count", 0)) == 1)
         # Exhaustive tasks benefit from search_map — keep it, but leaner.
         if task_type == "exhaustive" and _pre_hit_dirs:
@@ -2318,26 +2424,6 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
                 "action_required": "graph_continue",
             }
         calls = int(TURN_STATE.get("fallback_calls", 0))
-        # v7.2: Use shared _EXHAUSTIVE_FALLBACK_CAP constant (same value as graph_continue uses)
-        # so the cap is always in sync between server signals and enforcement.
-        task_type = TURN_STATE.get("task_type", "unknown")
-        effective_max = _EXHAUSTIVE_FALLBACK_CAP if task_type == "exhaustive" else FALLBACK_MAX_CALLS_PER_TURN
-        if calls >= effective_max:
-            payload = {
-                "pattern": pattern,
-                "max_hits": max_hits,
-                "mode": "fallback_blocked_limit",
-                "fallback_calls": calls,
-                "fallback_max_calls": effective_max,
-            }
-            _log_tool("fallback_rg", payload)
-            _record_action("fallback_blocked_limit", payload)
-            return {
-                "ok": False,
-                "error": "fallback_rg call limit reached for this query turn",
-                "fallback_calls": calls,
-                "fallback_max_calls": effective_max,
-            }
         # Scope to graph-retrieved directories first — cheaper and more relevant.
         # Fall back to full PROJECT_ROOT if graph dirs yield no results.
         retrieved = list(TURN_STATE.get("retrieved_files", []))
@@ -2398,11 +2484,121 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
 
         TURN_STATE["fallback_calls"] = calls + 1
         TURN_STATE["total_grep_calls"] = int(TURN_STATE.get("total_grep_calls", 0)) + 1
+        _record_action("fallback_rg", {
+            "pattern": pattern,
+            "hit_count": len(hits),
+            "searched_dirs": graph_dirs if hits and graph_dirs else ["(full project)"],
+            "hit_files": list({h["file"] for h in hits[:10]}),
+        })
+        # Deduplicate hit files for the next_step hint
+        hit_files_unique = list(dict.fromkeys(h["file"] for h in hits))[:5]
         return {
             "ok": True,
             "pattern": pattern,
             "hits": hits,
             "searched_dirs": graph_dirs if hits and graph_dirs else ["(full project)"],
+            "next_step": f"Now call graph_read on the relevant files found: {hit_files_unique}" if hit_files_unique else "No hits found. Try a different search term.",
+        }
+
+    @mcp.tool()
+    def cross_search(pattern: str, path: str, max_hits: int = 50) -> dict[str, Any]:
+        """Search for a pattern in a directory OUTSIDE the current project.
+        Registers found files so the gate allows subsequent cat/grep/find.
+        For in-project searches use fallback_rg instead.
+        """
+        search_path = Path(path).expanduser().resolve()
+
+        # Redirect internal paths to fallback_rg
+        try:
+            search_path.relative_to(PROJECT_ROOT)
+            return {
+                "ok": False,
+                "error": "path is inside the current project root",
+                "hint": "Use fallback_rg(pattern=...) for in-project searches.",
+                "project_root": str(PROJECT_ROOT),
+            }
+        except ValueError:
+            pass
+
+        if not search_path.exists():
+            return {"ok": False, "error": f"path does not exist: {search_path}"}
+
+        max_hits = min(int(max_hits or 50), 50)
+
+        def _run(target: str) -> subprocess.CompletedProcess:
+            base = ["rg", "-n", "-S", "--engine", "pcre2",
+                    "--max-count", str(max_hits), pattern, target]
+            r = subprocess.run(base, capture_output=True, text=True, timeout=30, check=False)
+            if r.returncode == 2 and "PCRE2" in r.stderr:
+                base2 = ["rg", "-n", "-S", "--max-count", str(max_hits), pattern, target]
+                r = subprocess.run(base2, capture_output=True, text=True, timeout=30, check=False)
+            return r
+
+        try:
+            proc = _run(str(search_path))
+        except FileNotFoundError:
+            return {"ok": False, "error": "rg not found — install ripgrep"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "search timed out after 30s",
+                    "hint": "Use a more specific path or pattern"}
+
+        hits: list[dict] = []
+        hit_files: set[str] = set()
+        hit_dirs: set[str] = set()
+
+        for line in proc.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3:
+                abs_file = parts[0]
+                hits.append({"file": abs_file, "line": parts[1], "text": parts[2]})
+                hit_files.add(abs_file)
+                hit_dirs.add(str(Path(abs_file).parent) + "/")
+                if len(hits) >= max_hits:
+                    break
+
+        # Register in external_refs
+        g = _load_action_graph()
+        ext_refs: dict = g.setdefault("external_refs", {})
+        now_ts = int(time.time())
+
+        # Evict expired entries (>24h) on each write
+        for k in [k for k, v in ext_refs.items()
+                  if now_ts - int(v.get("ts", 0)) >= 86400]:
+            del ext_refs[k]
+
+        # Always register searched root (even with 0 hits)
+        root_key = str(search_path).rstrip("/") + ("/" if search_path.is_dir() else "")
+        ext_refs[root_key] = {"ts": now_ts, "found_via": "cross_search",
+                              "pattern": pattern,
+                              "kind": "dir" if search_path.is_dir() else "file"}
+
+        # Register each hit file + parent dir
+        for f in hit_files:
+            ext_refs[f] = {"ts": now_ts, "found_via": "cross_search",
+                           "pattern": pattern, "kind": "file"}
+        for d in hit_dirs:
+            if d not in ext_refs:
+                ext_refs[d] = {"ts": now_ts, "found_via": "cross_search",
+                               "pattern": pattern, "kind": "dir"}
+
+        _save_action_graph(g)
+        _log_tool("cross_search", {"pattern": pattern, "path": str(search_path),
+                                    "hit_count": len(hits)})
+        _record_action("cross_search", {
+            "pattern": pattern, "path": str(search_path),
+            "hit_count": len(hits), "hit_files": sorted(hit_files)[:10],
+        })
+
+        return {
+            "ok": True,
+            "pattern": pattern,
+            "path": str(search_path),
+            "hits": hits,
+            "next_step": (
+                f"Registered. You can now cat/grep/find paths under {search_path} — gate allows silently."
+                if hits else
+                f"No hits. {search_path} registered — ls/find on this dir now allowed."
+            ),
         }
 
     @mcp.tool()
@@ -2628,6 +2824,7 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             "grep_all_calls": 0,
             "graph_continue_called": True,  # graph_scan is the setup step; reads allowed after
         })
+        _write_gc_active()
 
         file_count = graph.get("file_count", graph["node_count"])
         symbol_count = graph.get("symbol_count", 0)
@@ -2852,6 +3049,13 @@ def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
             cleaned.append(line)
 
         _log_tool("graph_grep_all", {"pattern": pattern, "total": total, "returned": len(cleaned), "call_num": call_num})
+        hit_files = list({line.split(":")[0] for line in cleaned if ":" in line})[:15]
+        _record_action("grep_all", {
+            "pattern": pattern,
+            "file_glob": file_glob,
+            "hit_count": total,
+            "hit_files": hit_files,
+        })
 
         out: dict[str, Any] = {"ok": True, "total": total, "truncated": truncated, "results": cleaned,
                                "grep_all_calls": call_num, "grep_all_soft_limit": soft_limit}

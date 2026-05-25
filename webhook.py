@@ -49,7 +49,7 @@ DB_PATH         = os.environ.get("DB_PATH", "/app/data/reviews.db")  # SQLite fa
 app = Flask(__name__)
 app.secret_key = SESSION_SECRET
 
-FRONTEND_ORIGIN = "https://review.graperoot.dev"
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "https://graperoot-review-production.up.railway.app")
 
 @app.after_request
 def _cors(response):

@@ -1,4 +1,4 @@
-<!-- dgc-policy-v12 -->
+<!-- dgc-policy-v11 -->
 # Dual-Graph Context Policy
 
 **HARD RULE: Do NOT use Bash, Read, grep, rg, or any file tool until you have called `graph_continue` first. This is not optional.**

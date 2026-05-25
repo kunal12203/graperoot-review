@@ -1175,6 +1175,8 @@ echo ""
 if [[ "$ASSISTANT" == "claude" ]]; then
   cat > "$DATA_DIR/prime.sh" << PRIMEEOF
 #!/usr/bin/env bash
+# Clear gate file so graph_continue is required each new session
+rm -f "$DATA_DIR/.gc_active"
 PORT=\$(cat "$DATA_DIR/mcp_port" 2>/dev/null || echo $MCP_PORT)
 OUT=\$(curl -sf --max-time 2 "http://localhost:\$PORT/prime" 2>/dev/null || true)
 if [[ -n "\$OUT" ]]; then
@@ -1297,13 +1299,17 @@ STOPEOF
   PRIME_CMD="$DATA_DIR/prime.sh"
   # Write JSON via Python to avoid quoting/escaping issues in paths with spaces.
   SHIELD_SCRIPT="$SCRIPT_DIR/undo_shield.py"
-  "$PYTHON" - "$PROJECT/.claude/settings.local.json" "$PRIME_CMD" "$DATA_DIR/stop.sh" "$SHIELD_SCRIPT" "$DATA_DIR" <<'PY'
+  GATE_SCRIPT="$SCRIPT_DIR/graph_gate.py"
+  SYNC_SCRIPT="$SCRIPT_DIR/graph_sync.py"
+  "$PYTHON" - "$PROJECT/.claude/settings.local.json" "$PRIME_CMD" "$DATA_DIR/stop.sh" "$SHIELD_SCRIPT" "$DATA_DIR" "$GATE_SCRIPT" "$SYNC_SCRIPT" <<'PY'
 import json, sys, platform, os
 settings_file = sys.argv[1]
 prime_cmd = sys.argv[2]
 stop_cmd = sys.argv[3]
 shield_script = sys.argv[4]
 dg_data_dir = sys.argv[5]
+gate_script = sys.argv[6]
+sync_script = sys.argv[7]
 # Use plain "bash" on Windows (Git Bash resolves it); /bin/bash on Unix
 bash = "bash" if platform.system() == "Windows" else "/bin/bash"
 python = sys.executable
@@ -1311,11 +1317,19 @@ hook_cmd = f'{bash} "{prime_cmd}"'
 stop_hook_cmd = f'{bash} "{stop_cmd}"'
 # Undo Shield: PreToolUse hook for Write, Edit, Bash
 shield_cmd = f'DG_DATA_DIR="{dg_data_dir}" {python} "{shield_script}"'
+# Graph Gate: PreToolUse hook — blocks exploration until graph_continue is called
+gate_cmd = f'DG_DATA_DIR="{dg_data_dir}" {python} "{gate_script}"'
+# Graph Sync: PostToolUse hook — auto-registers edits to keep graph fresh
+sync_cmd = f'DG_DATA_DIR="{dg_data_dir}" {python} "{sync_script}"'
 dgc_hooks = {
     "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": hook_cmd}]}],
     "PreCompact":   [{"matcher": "", "hooks": [{"type": "command", "command": hook_cmd}]}],
     "Stop":         [{"matcher": "", "hooks": [{"type": "command", "command": stop_hook_cmd}]}],
-    "PreToolUse":   [{"matcher": "Write|Edit|Bash|NotebookEdit", "hooks": [{"type": "command", "command": shield_cmd}]}],
+    "PreToolUse":   [
+        {"matcher": "Bash|Read", "hooks": [{"type": "command", "command": gate_cmd}]},
+        {"matcher": "Write|Edit|Bash|NotebookEdit", "hooks": [{"type": "command", "command": shield_cmd}]},
+    ],
+    "PostToolUse":  [{"matcher": "Write|Edit", "hooks": [{"type": "command", "command": sync_cmd}]}],
 }
 # Read existing settings so we don't wipe user's permissions/other keys
 existing = {}
@@ -1334,7 +1348,9 @@ for hook_type, new_entries in dgc_hooks.items():
     kept = [e for e in old if not any(
         "prime.sh" in h.get("command", "") or "stop.sh" in h.get("command", "") or
         "prime.ps1" in h.get("command", "") or "stop_hook" in h.get("command", "") or
-        "undo_shield" in h.get("command", "")
+        "undo_shield" in h.get("command", "") or
+        "graph_gate" in h.get("command", "") or
+        "graph_sync" in h.get("command", "")
         for h in e.get("hooks", [])
     )]
     merged_hooks[hook_type] = new_entries + kept  # dgc hooks first for priority
@@ -1343,7 +1359,7 @@ with open(settings_file, "w", encoding="utf-8") as f:
     json.dump(payload, f, indent=2)
     f.write("\n")
 PY
-  echo "[$TOOL_LABEL] Context hooks ready (SessionStart + PreCompact + Undo Shield)"
+  echo "[$TOOL_LABEL] Context hooks ready (SessionStart + PreCompact + Graph Gate + Undo Shield + Graph Sync)"
 fi
 # ──────────────────────────────────────────────────────────────────────────────
 

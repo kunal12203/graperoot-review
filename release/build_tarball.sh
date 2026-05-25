@@ -3,7 +3,7 @@
 # Usage: ./build_tarball.sh [VERSION]
 set -Eeuo pipefail
 
-VERSION="${1:-$(cat release/bin/version.txt 2>/dev/null || echo 1.0.17)}"
+VERSION="${1:-$(cat release/bin/version.txt 2>/dev/null || echo 1.0.19)}"
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_DIR="$PROJ_ROOT/release"
 BUILD_DIR="$(mktemp -d -t grp-pro-build.XXXXXX)"
@@ -33,6 +33,10 @@ EOF
 # 4. Version + launch.py (the Python core called by launch_pro.{sh,ps1})
 cp "$RELEASE_DIR/bin/launch.py"   "$STAGE/launch.py"
 cp "$RELEASE_DIR/bin/version.txt" "$STAGE/VERSION"
+
+# 4b. Hook scripts (Graph Gate + Sync)
+cp "$PROJ_ROOT/bin/graph_gate.py" "$STAGE/graph_gate.py"
+cp "$PROJ_ROOT/bin/graph_sync.py" "$STAGE/graph_sync.py"
 
 # 5. Doctor script (diagnostic + auto-fix for MCP issues)
 mkdir -p "$STAGE/bin"

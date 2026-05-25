@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
-v1.0.17: graperoot-pro is now a stdio MCP server. Claude Code spawns it on
+v1.0.19: fix graph gate blocking CLI tools (vercel, aws, etc.), fix --resume flag,
+fix action graph read persistence.
+
+v1.0.18: graperoot-pro is now a stdio MCP server. Claude Code spawns it on
 session start and kills it on exit — no port management, no orphan processes,
 no stale .mcp.json entries. Same pattern as filesystem/git/everyone-else MCPs.
 
@@ -228,6 +231,45 @@ def write_claude_md(project: Path) -> tuple[Path, str]:
     return cfg, "prepended"
 
 
+def write_hooks(project: Path, data_dir: Path) -> None:
+    """Register PreToolUse (graph gate) and PostToolUse (graph sync) hooks."""
+    gate_script = PRO_HOME / "graph_gate.py"
+    sync_script = PRO_HOME / "graph_sync.py"
+    if not gate_script.exists():
+        return
+    settings_dir = project / ".claude"
+    settings_dir.mkdir(exist_ok=True)
+    settings_file = settings_dir / "settings.local.json"
+    existing = {}
+    if settings_file.exists():
+        try:
+            existing = json.loads(settings_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    python = sys.executable
+    gate_cmd = f'DG_DATA_DIR="{data_dir}" {python} "{gate_script}"'
+    sync_cmd = f'DG_DATA_DIR="{data_dir}" {python} "{sync_script}"'
+    gate_entry = {"matcher": "Bash|Read", "hooks": [{"type": "command", "command": gate_cmd}]}
+    sync_entry = {"matcher": "Write|Edit", "hooks": [{"type": "command", "command": sync_cmd}]}
+    hooks = existing.setdefault("hooks", {})
+    # Clean stale entries
+    for hook_type in ("PreToolUse", "PostToolUse"):
+        old = hooks.get(hook_type, [])
+        hooks[hook_type] = [e for e in old if not any(
+            "graph_gate" in h.get("command", "") or "graph_sync" in h.get("command", "")
+            for h in e.get("hooks", [])
+        )]
+    hooks.setdefault("PreToolUse", []).insert(0, gate_entry)
+    hooks.setdefault("PostToolUse", []).insert(0, sync_entry)
+    existing["hooks"] = hooks
+    settings_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    # Clear gate file for fresh session
+    gc_active = data_dir / ".gc_active"
+    if gc_active.exists():
+        gc_active.unlink()
+    print(f"[dgc-pro] Graph Gate + Sync hooks registered", flush=True)
+
+
 def start_mcp_server(port: int, project: Path, data_dir: Path) -> subprocess.Popen:
     server_py = PRO_HOME / "mcp_graph_server_v7.5.py"
     if not server_py.exists():
@@ -257,20 +299,147 @@ def resolve_claude() -> str:
     sys.exit("[dgc-pro] `claude` CLI not found. Install: npm install -g @anthropic-ai/claude-code")
 
 
+def _local_version() -> str:
+    vf = PRO_HOME / "bin" / "version.txt"
+    if vf.exists():
+        return vf.read_text().strip()
+    vf2 = PRO_HOME / "VERSION"
+    if vf2.exists():
+        return vf2.read_text().strip()
+    return "0.0.0"
+
+
+def _version_tuple(v: str) -> tuple:
+    try:
+        return tuple(int(x) for x in v.strip().lstrip("v").split("."))
+    except Exception:
+        return (0, 0, 0)
+
+
+def auto_update() -> None:
+    """Check for newer version and self-update if available."""
+    import urllib.request
+    import tarfile
+    import tempfile
+
+    local_ver = _local_version()
+    license_file = PRO_HOME / "license.key"
+    if not license_file.exists():
+        return  # Can't verify without license
+
+    license_key = license_file.read_text().strip()
+    api_url = "https://api.graperoot.dev/v1/license/verify"
+
+    # Check remote version (fast — just a JSON POST)
+    try:
+        body = json.dumps({"license_key": license_key, "host": socket.gethostname(), "os": sys.platform}).encode()
+        req = urllib.request.Request(api_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        resp = urllib.request.urlopen(req, timeout=8)
+        data = json.loads(resp.read())
+    except Exception:
+        return  # Network issue — skip silently
+
+    if not data.get("valid"):
+        return
+
+    remote_ver = data.get("version", "").lstrip("v")
+    if not remote_ver:
+        return
+
+    if _version_tuple(remote_ver) <= _version_tuple(local_ver):
+        return  # Already up to date
+
+    download_url = data.get("download_url", "")
+    if not download_url:
+        return
+
+    print(f"[dgc-pro] Update available: v{local_ver} → v{remote_ver}", flush=True)
+    print(f"[dgc-pro] Downloading...", flush=True)
+
+    try:
+        tmp = tempfile.mkdtemp(prefix="grp-pro-update-")
+        tarball = os.path.join(tmp, "graperoot-pro.tar.gz")
+        urllib.request.urlretrieve(download_url, tarball)
+
+        with tarfile.open(tarball, "r:gz") as tf:
+            tf.extractall(tmp)
+
+        extracted = Path(tmp) / "graperoot-pro"
+        if not extracted.is_dir():
+            return
+
+        # Copy new files over existing install (preserve license.key, venv, data)
+        preserve = {"license.key", "venv", "server.log", "bin"}
+        for item in extracted.iterdir():
+            dest = PRO_HOME / item.name
+            if item.name in preserve:
+                continue
+            if item.is_file():
+                shutil.copy2(str(item), str(dest))
+            elif item.is_dir():
+                if dest.exists():
+                    shutil.rmtree(str(dest))
+                shutil.copytree(str(item), str(dest))
+
+        # Update version file
+        ver_src = extracted / "VERSION"
+        if ver_src.exists():
+            bin_dir = PRO_HOME / "bin"
+            bin_dir.mkdir(exist_ok=True)
+            shutil.copy2(str(ver_src), str(bin_dir / "version.txt"))
+
+        # Copy bin/ contents (doctor, etc.)
+        src_bin = extracted / "bin"
+        if src_bin.is_dir():
+            dest_bin = PRO_HOME / "bin"
+            dest_bin.mkdir(exist_ok=True)
+            for f in src_bin.iterdir():
+                shutil.copy2(str(f), str(dest_bin / f.name))
+
+        shutil.rmtree(tmp, ignore_errors=True)
+        print(f"[dgc-pro] Updated to v{remote_ver}", flush=True)
+
+    except Exception as e:
+        print(f"[dgc-pro] Update failed ({e}) — continuing with current version", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="dgc-pro",
         description="GrapeRoot Pro — Claude Code + dual-graph context engine (Pro v1.0).")
     ap.add_argument("project", nargs="?", default=".")
     ap.add_argument("--version", action="store_true")
+    ap.add_argument("--skip-update", action="store_true", help="Skip auto-update check")
+    # Declare claude flags that take a value argument so argparse doesn't
+    # accidentally consume their value as the positional "project" arg.
+    ap.add_argument("--resume", "-r", dest="_resume", default=None)
+    ap.add_argument("--model", dest="_model", default=None)
+    ap.add_argument("--prompt", "-p", dest="_prompt", default=None)
+    ap.add_argument("--max-turns", dest="_max_turns", default=None)
+    ap.add_argument("--system-prompt", dest="_system_prompt", default=None)
     # Everything else passes through to claude
     args, passthrough = ap.parse_known_args()
+    # Re-inject declared claude flags into passthrough
+    if args._resume:
+        passthrough = ["--resume", args._resume] + passthrough
+    if args._model:
+        passthrough = ["--model", args._model] + passthrough
+    if args._prompt:
+        passthrough = ["--prompt", args._prompt] + passthrough
+    if args._max_turns:
+        passthrough = ["--max-turns", args._max_turns] + passthrough
+    if args._system_prompt:
+        passthrough = ["--system-prompt", args._system_prompt] + passthrough
 
     # Wipe any MCP servers left behind by a previous run that was hard-killed
     # (Force Quit, kill -9, crash). Runs before anything else — cheap no-op when clean.
     cleanup_orphan_servers()
 
+    # Auto-update before anything else (fast — just one HTTP call to check version)
+    if not args.skip_update:
+        auto_update()
+
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.17"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.19"
         print(f"dgc-pro v{ver}")
         return
 
@@ -310,6 +479,8 @@ def main() -> None:
         print(f"[dgc-pro] CLAUDE.md created with dual-graph policy ({claude_md})", flush=True)
     elif action == "prepended":
         print(f"[dgc-pro] dual-graph policy prepended to existing CLAUDE.md ({claude_md})", flush=True)
+
+    write_hooks(project, data_dir)
 
     claude = resolve_claude()
     exit_code = subprocess.call([claude] + passthrough, cwd=str(project))

@@ -1,3 +1,42 @@
+1.0.19  (2026-05-25)
+- NEW: cross_search(pattern, path) tool — search for patterns in directories outside the current
+  project. Registers found files so the gate allows subsequent cat/grep/find silently.
+  Use when Claude needs to reference a sibling repo or external directory.
+- IMPROVED: graph_gate.py now distinguishes registered vs unregistered external paths:
+  registered paths (via cross_search) → silent allow; unregistered → hint + allow; inside
+  project → block as before (exit 2). Mixed inside+outside → always blocked.
+- IMPROVED: fallback_rg now calls _record_action so hits appear in action graph memory.
+- IMPROVED: graph_grep_all now records hits into action graph (for context across turns).
+- IMPROVED: graph_read dedupe now allows "upgrade" re-reads (more chars, or full file after
+  symbol excerpt) — Claude no longer gets a stale dedupe_preview when it legitimately needs more.
+- IMPROVED: auto_symbol_excerpt skipped if the file was already read as a symbol — avoids
+  re-promoting a bare read that Claude explicitly requested after an excerpt was insufficient.
+- FIXED: graph_continue returns confidence-tier strategy hints (high/medium/low) so Claude
+  knows exactly how many supplementary greps are allowed at each tier.
+- build_tarball.sh: graph_gate.py + graph_sync.py now bundled in tarball (needed for hook setup).
+- launch.py: write_hooks() registers PreToolUse (gate) + PostToolUse (sync) on session start.
+
+1.0.18  (2026-05-24)
+- Skipped (internal staging only — never shipped to GitHub Releases).
+
+1.0.17  (2026-05-23)
+- FIXED: MCP transport mismatch — server speaks HTTP/SSE but launch.py was writing stdio
+  transport. Claude Code waited 30s for a handshake that never came → timeout on every session.
+  launch.py now finds a free port, starts server as background HTTP process, writes
+  {"type":"http","url":"http://localhost:PORT/mcp"} to .mcp.json.
+- FIXED: signal handlers (SIGHUP, SIGTERM, SIGINT, atexit) ensure MCP server port is freed
+  on all exit paths: normal exit, Ctrl+C, terminal close, kill command.
+
+1.0.16  (2026-05-23)
+- FIXED: perpetual license 403 error in streamAsset() — Cloudflare Worker now serves
+  assets correctly for perpetual-tier customers.
+- FIXED: MCP server version mismatch — launch.py was referencing v7.4 but tarball ships v7.5.
+- ADDED: dgc-pro-doctor diagnostic tool — auto-detects and fixes MCP config issues,
+  version mismatches, missing dependencies. Run: dgc-pro-doctor --fix
+- ADDED: Windows support for dgc-pro-doctor.
+- ADDED: Post-install health check with auto-fix.
+- FIXED: all version fallbacks updated to current version.
+
 1.0.15  (2026-05-22)
 - FIXED fallback_rg: was returning 0 hits on 100% of benchmark calls.
   Two root causes fixed:
