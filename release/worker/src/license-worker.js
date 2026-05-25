@@ -269,7 +269,7 @@ async function streamAsset(req, env) {
 
   // Locate asset ID on GitHub
   const repo = env.PRO_REPO || "kunal12203/graperoot-pro-releases";
-  const tag  = env.PRO_VERSION || "v1.0.12";
+  const tag  = env.PRO_VERSION || "v1.0.20";
   const name = env.PRO_ASSET  || "graperoot-pro.tar.gz";
   const rel  = await fetch(`https://api.github.com/repos/${repo}/releases/tags/${tag}`, {
     headers: {
