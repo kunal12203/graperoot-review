@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.20: cross_search tool, gate external-ref tracking, graph hooks auto-registration.
+
 v1.0.19: fix graph gate blocking CLI tools (vercel, aws, etc.), fix --resume flag,
 fix action graph read persistence.
 

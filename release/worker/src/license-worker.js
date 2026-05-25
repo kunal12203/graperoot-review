@@ -241,7 +241,7 @@ async function verifyLicense(req, env) {
     customer: record.customer,
     tier: record.tier,
     expires: record.expires,
-    version: env.PRO_VERSION || "v1.0.19",
+    version: env.PRO_VERSION || "v1.0.20",
     download_url,
   });
 }

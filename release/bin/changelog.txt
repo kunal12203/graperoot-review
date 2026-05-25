@@ -1,4 +1,4 @@
-1.0.19  (2026-05-25)
+1.0.20  (2026-05-25)
 - NEW: cross_search(pattern, path) tool — search for patterns in directories outside the current
   project. Registers found files so the gate allows subsequent cat/grep/find silently.
   Use when Claude needs to reference a sibling repo or external directory.
