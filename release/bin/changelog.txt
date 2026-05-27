@@ -1,3 +1,12 @@
+1.0.27  (2026-05-27)
+- FIXED: dg-pro and graperoot-pro commands not found on WSL / Linux installs.
+  Root cause: install.sh only wrote PATH to ~/.zshrc (default) or ~/.bashrc (bash),
+  but WSL login shells read ~/.profile which wasn't updated. Fix: now writes to
+  ~/.profile (login shells), ~/.bashrc (interactive bash), and ~/.zshrc (if zsh
+  installed) — all three, on every Linux/WSL install.
+- FIXED: install.sh "Run once" hint now shows correct source command per OS:
+  Linux/WSL shows `source ~/.profile`, macOS shows `source ~/.zshrc`.
+
 1.0.26  (2026-05-27)
 - SECURITY: MCP server now binds to 127.0.0.1 only (was 0.0.0.0). On public wifi /
   office LANs, other machines could previously call graph_read to exfiltrate source.

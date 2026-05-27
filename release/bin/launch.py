@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
-v1.0.26: security fix — MCP server now binds 127.0.0.1 only (was 0.0.0.0)
+v1.0.27: fix PATH registration on WSL/Linux — write to ~/.profile + ~/.bashrc + ~/.zshrc
 shims in install.sh/ps1 and self-update lists for Mac/Linux/Windows.
 
 v1.0.24: fix Windows self-update missing dg-pro.cmd/.ps1 shims.
@@ -729,7 +729,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.26"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.27"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
