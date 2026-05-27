@@ -56,6 +56,12 @@ self_update() {
           mv "$BIN_DIR/$f.new" "$BIN_DIR/$f"
         done
         chmod +x "$BIN_DIR/launch_pro.sh" "$BIN_DIR/dgc-pro" "$BIN_DIR/dg-pro" "$BIN_DIR/graperoot-pro" 2>/dev/null || true
+        # Re-create symlinks in ~/.local/bin so dg-pro/graperoot-pro work immediately
+        if mkdir -p "$HOME/.local/bin" 2>/dev/null; then
+          for shim in dgc-pro dg-pro graperoot-pro; do
+            ln -sf "$BIN_DIR/$shim" "$HOME/.local/bin/$shim" 2>/dev/null || true
+          done
+        fi
         # Show changelog
         [[ -f "$BIN_DIR/changelog.txt" ]] && head -20 "$BIN_DIR/changelog.txt" >&2
       fi
