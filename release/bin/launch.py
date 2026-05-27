@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
-v1.0.27: fix PATH registration on WSL/Linux — write to ~/.profile + ~/.bashrc + ~/.zshrc
+v1.0.28: symlink shims to ~/.local/bin so commands work instantly in any terminal
 shims in install.sh/ps1 and self-update lists for Mac/Linux/Windows.
 
 v1.0.24: fix Windows self-update missing dg-pro.cmd/.ps1 shims.
@@ -729,7 +729,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.27"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.28"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 

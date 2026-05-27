@@ -1,3 +1,11 @@
+1.0.28  (2026-05-27)
+- FIXED: dgc-pro, dg-pro, graperoot-pro now work immediately in any terminal
+  after install — no "source ~/.profile" or terminal restart needed.
+  Fix: installer now symlinks all three shims into ~/.local/bin (pre-added to
+  PATH by Ubuntu/Debian/WSL default ~/.profile) instead of appending to PATH
+  in rc files. Falls back to /usr/local/bin if ~/.local/bin is unavailable.
+  Also exports PATH into the current session so commands work right away.
+
 1.0.27  (2026-05-27)
 - FIXED: dg-pro and graperoot-pro commands not found on WSL / Linux installs.
   Root cause: install.sh only wrote PATH to ~/.zshrc (default) or ~/.bashrc (bash),

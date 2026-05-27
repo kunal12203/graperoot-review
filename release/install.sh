@@ -299,39 +299,73 @@ echo "[install] Creating isolated Python venv…"
 echo -n "$LICENSE_KEY" > "$INSTALL_DIR/license.key"
 chmod 600 "$INSTALL_DIR/license.key"
 
-# PATH — write to every rc file that's relevant for the current OS/shell.
-# On Linux/WSL we write to both ~/.profile (login shells, including WSL default)
-# and ~/.bashrc (interactive non-login bash), plus ~/.zshrc if zsh is installed.
-# On macOS bash we use ~/.bash_profile; zsh is already covered by ~/.zshrc default.
+# PATH — symlink shims into a directory that is already on PATH so commands
+# work immediately in any new terminal without sourcing anything.
+#
+# Priority order:
+#   1. ~/.local/bin  — XDG standard; pre-added to PATH by Ubuntu/Debian/WSL
+#                      default ~/.profile via `if [ -d "$HOME/.local/bin" ]`
+#   2. /usr/local/bin — always on PATH everywhere, requires sudo
+#   3. Fallback: write export to shell rc files (last resort)
+#
+# Symlinking means `dgc-pro`, `dg-pro`, `graperoot-pro` work instantly in
+# any new shell — no sourcing, no terminal restart.
+
+SHIMS=(dgc-pro dg-pro graperoot-pro)
+SYMLINK_DIR=""
+
+# Try ~/.local/bin first (no sudo, works on Ubuntu/Debian/WSL out of the box)
+if mkdir -p "$HOME/.local/bin" 2>/dev/null; then
+  SYMLINK_DIR="$HOME/.local/bin"
+elif command -v sudo >/dev/null 2>&1 && sudo test -w /usr/local/bin 2>/dev/null; then
+  SYMLINK_DIR="/usr/local/bin"
+fi
+
+if [[ -n "$SYMLINK_DIR" ]]; then
+  for shim in "${SHIMS[@]}"; do
+    # Remove stale symlink or old copy before re-creating
+    rm -f "$SYMLINK_DIR/$shim" 2>/dev/null || sudo rm -f "$SYMLINK_DIR/$shim" 2>/dev/null || true
+    if ln -sf "$INSTALL_DIR/bin/$shim" "$SYMLINK_DIR/$shim" 2>/dev/null || \
+       sudo ln -sf "$INSTALL_DIR/bin/$shim" "$SYMLINK_DIR/$shim" 2>/dev/null; then
+      : # symlink created
+    fi
+  done
+  echo "[install] Symlinked dgc-pro, dg-pro, graperoot-pro → $SYMLINK_DIR"
+fi
+
+# ~/.local/bin is guaranteed on PATH for NEW terminals on Ubuntu/Debian/WSL
+# (default ~/.profile checks for it). For the CURRENT shell session we also
+# need to add it — export here so commands work without reopening terminal.
+if [[ "$SYMLINK_DIR" == "$HOME/.local/bin" ]]; then
+  export PATH="$PATH:$HOME/.local/bin"
+fi
+
+# Also write to shell rc files as a belt-and-suspenders fallback (covers edge
+# cases like minimal containers, non-standard distros, custom ~/.profile).
 _add_path_to_rc() {
-  local rc="$1"
-  if ! grep -q ".graperoot-pro/bin" "$rc" 2>/dev/null; then
-    {
-      echo ""
-      echo "# GrapeRoot Pro"
-      echo "export PATH=\"\$PATH:\$HOME/.graperoot-pro/bin\""
-    } >> "$rc"
-    echo "[install] Added $INSTALL_DIR/bin to PATH in $rc"
+  local rc="$1" dir="$2"
+  if ! grep -q "$dir" "$rc" 2>/dev/null; then
+    { echo ""; echo "# GrapeRoot Pro"; echo "export PATH=\"\$PATH:$dir\""; } >> "$rc"
   fi
 }
 
-if [[ "$OS_TYPE" == "Darwin" ]]; then
-  if [[ "${SHELL:-}" == */bash ]]; then
-    _add_path_to_rc "$HOME/.bash_profile"
+if [[ -n "$SYMLINK_DIR" && "$SYMLINK_DIR" != "$HOME/.local/bin" ]]; then
+  : # /usr/local/bin is already on PATH everywhere — nothing to add to rc files
+elif [[ -z "$SYMLINK_DIR" ]]; then
+  # Could not symlink anywhere — fall back to PATH export in rc files
+  if [[ "$OS_TYPE" == "Darwin" ]]; then
+    [[ "${SHELL:-}" == */bash ]] \
+      && _add_path_to_rc "$HOME/.bash_profile" "$INSTALL_DIR/bin" \
+      || _add_path_to_rc "$HOME/.zshrc"        "$INSTALL_DIR/bin"
   else
-    _add_path_to_rc "$HOME/.zshrc"
+    _add_path_to_rc "$HOME/.profile" "$INSTALL_DIR/bin"
+    [[ -f "$HOME/.bashrc" || "${SHELL:-}" == */bash ]] && _add_path_to_rc "$HOME/.bashrc" "$INSTALL_DIR/bin"
+    command -v zsh >/dev/null 2>&1 && _add_path_to_rc "$HOME/.zshrc" "$INSTALL_DIR/bin"
+    echo "[install] Added $INSTALL_DIR/bin to PATH in shell rc files"
   fi
-else
-  # Linux / WSL — cover all common cases:
-  # ~/.profile  → login shells (WSL default, sh, bash --login, zsh --login)
-  # ~/.bashrc   → interactive non-login bash
-  # ~/.zshrc    → interactive zsh (if installed)
-  _add_path_to_rc "$HOME/.profile"
-  [[ -f "$HOME/.bashrc" || "${SHELL:-}" == */bash ]] && _add_path_to_rc "$HOME/.bashrc"
-  command -v zsh >/dev/null 2>&1 && _add_path_to_rc "$HOME/.zshrc"
 fi
 
-VER=$(cat "$INSTALL_DIR/bin/version.txt" 2>/dev/null || echo "1.0.26")
+VER=$(cat "$INSTALL_DIR/bin/version.txt" 2>/dev/null || echo "1.0.28")
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  Install complete.  GrapeRoot Pro v$VER                    ║"
@@ -360,13 +394,7 @@ if [[ -f "$DOCTOR" && -x "$VENV/bin/python3" ]]; then
   echo ""
 fi
 
-if [[ "$OS_TYPE" == "Darwin" ]]; then
-  echo "  Run once:       source ${HOME}/.zshrc   (or open a new terminal)"
-else
-  echo "  Run once:       source ${HOME}/.profile  (or open a new terminal)"
-  echo "                  (WSL: close and reopen the terminal window)"
-fi
-echo "  Then per project:"
+echo "  Commands are ready now. Per project:"
 echo "    dgc-pro /path/to/your/project       # Claude Code (default)"
 echo "    dg-pro  /path/to/your/project       # OpenAI Codex"
 echo "    graperoot-pro --gemini /path/...    # Gemini CLI"
