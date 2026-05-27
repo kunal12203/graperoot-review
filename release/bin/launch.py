@@ -183,29 +183,53 @@ def write_opencode_config(project: Path, port: int) -> Path:
 
 
 def write_codex_config(port: int) -> None:
-    """Inject graperoot-pro into Codex global MCP config (~/.codex/config.yaml)."""
+    """Inject graperoot-pro into Codex global MCP config (~/.codex/config.toml).
+
+    Codex uses TOML. Format:
+        [mcp_servers.graperoot-pro]
+        url = "http://127.0.0.1:PORT/mcp"
+    """
     import re
-    codex_cfg = Path.home() / ".codex" / "config.yaml"
+    codex_cfg = Path.home() / ".codex" / "config.toml"
     codex_cfg.parent.mkdir(exist_ok=True)
-    mcp_entry = (
-        f"  graperoot-pro:\n"
-        f"    type: sse\n"
-        f"    url: http://127.0.0.1:{port}/mcp\n"
+    new_block = (
+        f'\n[mcp_servers.graperoot-pro]\n'
+        f'url = "http://127.0.0.1:{port}/mcp"\n'
     )
     if codex_cfg.exists():
         content = codex_cfg.read_text(encoding="utf-8")
-        # Remove stale graperoot-pro entry (any port)
+        # Remove any stale graperoot-pro block (any port)
         content = re.sub(
-            r"  graperoot-pro:\n    type: sse\n    url: http://127\.0\.0\.1:\d+/mcp\n",
+            r'\n\[mcp_servers\.graperoot-pro\]\nurl = "http://127\.0\.0\.1:\d+/mcp"\n',
             "", content,
         )
-        if "mcpServers:" in content:
-            content = content.replace("mcpServers:\n", f"mcpServers:\n{mcp_entry}")
-        else:
-            content = content.rstrip("\n") + f"\nmcpServers:\n{mcp_entry}"
+        content = content.rstrip("\n") + new_block
     else:
-        content = f"mcpServers:\n{mcp_entry}"
+        content = new_block.lstrip("\n")
     codex_cfg.write_text(content, encoding="utf-8")
+
+
+def write_gemini_config(project: Path, port: int) -> Path:
+    """Inject graperoot-pro into project's .gemini/settings.json.
+
+    Gemini reads MCP servers from <project>/.gemini/settings.json:
+        {"mcpServers": {"name": {"url": "...", "type": "http"}}}
+    """
+    gemini_dir = project / ".gemini"
+    gemini_dir.mkdir(exist_ok=True)
+    cfg = gemini_dir / "settings.json"
+    existing = {}
+    if cfg.exists():
+        try:
+            existing = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    existing.setdefault("mcpServers", {})["graperoot-pro"] = {
+        "url": f"http://127.0.0.1:{port}/mcp",
+        "type": "http",
+    }
+    cfg.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    return cfg
 
 
 CODEX_MD_POLICY = """<!-- dg-policy-v1 -->
@@ -665,7 +689,7 @@ def main() -> None:
         print(f"[{label}] graperoot-pro injected into ~/.codex/config.yaml (port {port})", flush=True)
         doc, action = write_codex_md(project)
     elif tool == "gemini":
-        mcp_cfg = write_mcp_config(project, data_dir, port)
+        mcp_cfg = write_gemini_config(project, port)
         print(f"[{label}] graperoot-pro registered in {mcp_cfg}", flush=True)
         doc, action = write_gemini_md(project)
     elif tool == "opencode":
