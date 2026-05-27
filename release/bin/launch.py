@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.21: multi-platform support — --claude (default), --codex, --gemini, --opencode,
+--cursor. dg-pro shorthand for --codex. All platforms get full graph context.
+
 v1.0.20: cross_search tool, gate external-ref tracking, graph hooks auto-registration.
 
 v1.0.19: fix graph gate blocking CLI tools (vercel, aws, etc.), fix --resume flag,
@@ -12,8 +15,8 @@ no stale .mcp.json entries. Same pattern as filesystem/git/everyone-else MCPs.
 
 Responsibilities:
   * Build dual-graph index for the target project on first run (cached afterwards)
-  * Merge .mcp.json with a stdio command entry for `graperoot-pro`
-  * exec Claude Code (it owns the MCP lifecycle)
+  * Merge .mcp.json / config with graperoot-pro MCP entry for chosen tool
+  * exec chosen AI tool (it owns the MCP lifecycle)
 """
 import argparse
 import json
@@ -143,8 +146,8 @@ def build_graph(project: Path, data_dir: Path) -> None:
 def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
     """Merge graperoot-pro into project's .mcp.json as an HTTP MCP entry.
 
-    The server runs as a background HTTP process — Claude Code connects via HTTP transport.
-    Other MCP entries in the project are preserved.
+    The server runs as a background HTTP process — Claude Code / opencode / cursor
+    connect via HTTP transport. Other MCP entries in the project are preserved.
     """
     cfg = project / ".mcp.json"
     existing = {}
@@ -161,6 +164,100 @@ def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
     cfg.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     return cfg
 
+
+def write_opencode_config(project: Path, port: int) -> Path:
+    """Merge graperoot-pro into project's opencode.json MCP config."""
+    cfg = project / "opencode.json"
+    existing = {}
+    if cfg.exists():
+        try:
+            existing = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    existing.setdefault("mcp", {})["graperoot-pro"] = {
+        "type": "remote",
+        "url": f"http://127.0.0.1:{port}/mcp",
+    }
+    cfg.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    return cfg
+
+
+def write_codex_config(port: int) -> None:
+    """Inject graperoot-pro into Codex global MCP config (~/.codex/config.yaml)."""
+    import re
+    codex_cfg = Path.home() / ".codex" / "config.yaml"
+    codex_cfg.parent.mkdir(exist_ok=True)
+    mcp_entry = (
+        f"  graperoot-pro:\n"
+        f"    type: sse\n"
+        f"    url: http://127.0.0.1:{port}/mcp\n"
+    )
+    if codex_cfg.exists():
+        content = codex_cfg.read_text(encoding="utf-8")
+        # Remove stale graperoot-pro entry (any port)
+        content = re.sub(
+            r"  graperoot-pro:\n    type: sse\n    url: http://127\.0\.0\.1:\d+/mcp\n",
+            "", content,
+        )
+        if "mcpServers:" in content:
+            content = content.replace("mcpServers:\n", f"mcpServers:\n{mcp_entry}")
+        else:
+            content = content.rstrip("\n") + f"\nmcpServers:\n{mcp_entry}"
+    else:
+        content = f"mcpServers:\n{mcp_entry}"
+    codex_cfg.write_text(content, encoding="utf-8")
+
+
+CODEX_MD_POLICY = """<!-- dg-policy-v1 -->
+# Dual-Graph Context Policy
+
+This project uses a local dual-graph MCP server (graperoot-pro) for efficient,
+budget-aware context retrieval. Always prefer it over native file exploration.
+
+## MANDATORY: Always follow this order
+
+1. **Call `graph_continue` first** -- before any file exploration, grep, or code reading.
+
+2. **If `graph_continue` returns `needs_project=true`**: call `graph_scan` with the
+   current project directory. Do NOT ask the user.
+
+3. **If `graph_continue` returns `skip=true`**: project is too small. Explore normally.
+
+4. **Read `recommended_files`** using `graph_read` -- one call per file.
+   Pass `file::symbol` entries verbatim (reads only that symbol's lines).
+
+5. **Check `confidence` and obey the caps strictly:**
+   - `confidence=high` -> Stop. Do NOT grep or explore further.
+   - `confidence=medium` -> `fallback_rg` at most `max_supplementary_greps` time(s),
+     then `graph_read` at most `max_supplementary_files` file(s). Then stop.
+   - `confidence=low` -> same as medium.
+
+## Rules
+
+- Do NOT use native file exploration before calling `graph_continue`.
+- After edits, call `graph_register_edit(files: ["path/to/file"])`.
+<!-- /dg-policy-v1 -->
+"""
+
+GEMINI_MD_POLICY = """<!-- grp-policy-v1 -->
+# Dual-Graph Context Policy
+
+This project uses a local dual-graph MCP server (graperoot-pro) for efficient context retrieval.
+
+## MANDATORY: Always follow this order
+
+1. **Call `graph_continue` first** -- before any file exploration, grep, or code reading.
+2. **If `needs_project=true`**: call `graph_scan` with the current project directory.
+3. **If `skip=true`**: project is too small. Explore normally.
+4. **Read `recommended_files`** using `graph_read` -- one call per file.
+5. **Obey confidence caps**: high=stop, medium/low=limited fallback_rg + graph_read.
+
+## Rules
+
+- Do NOT use grep/bash/file exploration before `graph_continue`.
+- After edits, call `graph_register_edit(files: ["path/to/file"])`.
+<!-- /grp-policy-v1 -->
+"""
 
 CLAUDE_MD_POLICY = """<!-- dgc-policy-v1 -->
 # Dual-Graph Context Policy
@@ -233,6 +330,32 @@ def write_claude_md(project: Path) -> tuple[Path, str]:
     return cfg, "prepended"
 
 
+def write_codex_md(project: Path) -> tuple[Path, str]:
+    """Ensure CODEX.md instructs Codex to use graperoot-pro tools."""
+    cfg = project / "CODEX.md"
+    if not cfg.exists():
+        cfg.write_text(CODEX_MD_POLICY, encoding="utf-8")
+        return cfg, "created"
+    existing = cfg.read_text(encoding="utf-8", errors="replace")
+    if "dg-policy-v" in existing:
+        return cfg, "kept"
+    cfg.write_text(CODEX_MD_POLICY + "\n---\n\n" + existing, encoding="utf-8")
+    return cfg, "prepended"
+
+
+def write_gemini_md(project: Path) -> tuple[Path, str]:
+    """Ensure GEMINI.md instructs Gemini CLI to use graperoot-pro tools."""
+    cfg = project / "GEMINI.md"
+    if not cfg.exists():
+        cfg.write_text(GEMINI_MD_POLICY, encoding="utf-8")
+        return cfg, "created"
+    existing = cfg.read_text(encoding="utf-8", errors="replace")
+    if "grp-policy-v" in existing:
+        return cfg, "kept"
+    cfg.write_text(GEMINI_MD_POLICY + "\n---\n\n" + existing, encoding="utf-8")
+    return cfg, "prepended"
+
+
 def write_hooks(project: Path, data_dir: Path) -> None:
     """Register PreToolUse (graph gate) and PostToolUse (graph sync) hooks."""
     gate_script = PRO_HOME / "graph_gate.py"
@@ -299,6 +422,43 @@ def resolve_claude() -> str:
         if p:
             return p
     sys.exit("[dgc-pro] `claude` CLI not found. Install: npm install -g @anthropic-ai/claude-code")
+
+
+def resolve_codex() -> str:
+    for c in ("codex", "codex.cmd", "codex.exe"):
+        p = shutil.which(c)
+        if p:
+            return p
+    sys.exit("[dg-pro] `codex` CLI not found. Install: npm install -g @openai/codex")
+
+
+def resolve_gemini() -> str:
+    for c in ("gemini", "gemini.cmd", "gemini.exe"):
+        p = shutil.which(c)
+        if p:
+            return p
+    sys.exit("[graperoot-pro] `gemini` CLI not found. Install: npm install -g @google/generative-ai")
+
+
+def resolve_opencode() -> str:
+    for c in ("opencode", "opencode.cmd", "opencode.exe"):
+        p = shutil.which(c)
+        if p:
+            return p
+    sys.exit("[graperoot-pro] `opencode` CLI not found. Install: curl -fsSL https://opencode.ai/install.sh | bash")
+
+
+def resolve_cursor() -> str:
+    # Cursor on Mac/Linux uses `cursor` CLI; on Windows it may be `cursor.cmd`
+    for c in ("cursor", "cursor.cmd", "cursor.exe"):
+        p = shutil.which(c)
+        if p:
+            return p
+    # macOS app bundle fallback
+    mac_cursor = "/Applications/Cursor.app/Contents/MacOS/Cursor"
+    if Path(mac_cursor).exists():
+        return mac_cursor
+    sys.exit("[graperoot-pro] `cursor` not found. Install from https://www.cursor.com")
 
 
 def _local_version() -> str:
@@ -405,58 +565,84 @@ def auto_update() -> None:
         print(f"[dgc-pro] Update failed ({e}) — continuing with current version", flush=True)
 
 
+def _detect_tool_from_argv(argv: list[str]) -> str:
+    """Return tool name if a --tool flag is in argv, else 'claude'."""
+    for a in argv:
+        if a in ("--codex", "codex", "--dg-pro", "dg-pro"):
+            return "codex"
+        if a in ("--gemini", "gemini"):
+            return "gemini"
+        if a in ("--opencode", "opencode"):
+            return "opencode"
+        if a in ("--cursor", "cursor"):
+            return "cursor"
+        if a in ("--claude", "claude"):
+            return "claude"
+    return "claude"
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="dgc-pro",
-        description="GrapeRoot Pro — Claude Code + dual-graph context engine (Pro v1.0).")
+    # Detect tool early so we can set prog name for help text
+    tool = _detect_tool_from_argv(sys.argv[1:])
+    prog = {"claude": "dgc-pro", "codex": "dg-pro"}.get(tool, "graperoot-pro")
+
+    ap = argparse.ArgumentParser(prog=prog,
+        description=f"GrapeRoot Pro — dual-graph context engine (v1.0). Tool: {tool}.")
     ap.add_argument("project", nargs="?", default=".")
     ap.add_argument("--version", action="store_true")
     ap.add_argument("--skip-update", action="store_true", help="Skip auto-update check")
-    # Declare claude flags that take a value argument so argparse doesn't
-    # accidentally consume their value as the positional "project" arg.
+    # Tool selection (stripped before passthrough)
+    ap.add_argument("--claude", dest="_tool", action="store_const", const="claude")
+    ap.add_argument("--codex", "--dg-pro", dest="_tool", action="store_const", const="codex")
+    ap.add_argument("--gemini", dest="_tool", action="store_const", const="gemini")
+    ap.add_argument("--opencode", dest="_tool", action="store_const", const="opencode")
+    ap.add_argument("--cursor", dest="_tool", action="store_const", const="cursor")
+    # Claude-specific passthrough flags (prevent positional confusion)
     ap.add_argument("--resume", "-r", dest="_resume", default=None)
     ap.add_argument("--model", dest="_model", default=None)
     ap.add_argument("--prompt", "-p", dest="_prompt", default=None)
     ap.add_argument("--max-turns", dest="_max_turns", default=None)
     ap.add_argument("--system-prompt", dest="_system_prompt", default=None)
-    # Everything else passes through to claude
     args, passthrough = ap.parse_known_args()
-    # Re-inject declared claude flags into passthrough
-    if args._resume:
-        passthrough = ["--resume", args._resume] + passthrough
-    if args._model:
-        passthrough = ["--model", args._model] + passthrough
-    if args._prompt:
-        passthrough = ["--prompt", args._prompt] + passthrough
-    if args._max_turns:
-        passthrough = ["--max-turns", args._max_turns] + passthrough
-    if args._system_prompt:
-        passthrough = ["--system-prompt", args._system_prompt] + passthrough
 
-    # Wipe any MCP servers left behind by a previous run that was hard-killed
-    # (Force Quit, kill -9, crash). Runs before anything else — cheap no-op when clean.
+    tool = args._tool or tool  # honour explicit flag if present
+
+    # Re-inject Claude-specific flags into passthrough (only used when tool=claude)
+    if tool == "claude":
+        if args._resume:
+            passthrough = ["--resume", args._resume] + passthrough
+        if args._model:
+            passthrough = ["--model", args._model] + passthrough
+        if args._prompt:
+            passthrough = ["--prompt", args._prompt] + passthrough
+        if args._max_turns:
+            passthrough = ["--max-turns", args._max_turns] + passthrough
+        if args._system_prompt:
+            passthrough = ["--system-prompt", args._system_prompt] + passthrough
+
+    label = {"claude": "dgc-pro", "codex": "dg-pro"}.get(tool, "graperoot-pro")
+
     cleanup_orphan_servers()
 
-    # Auto-update before anything else (fast — just one HTTP call to check version)
     if not args.skip_update:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.19"
-        print(f"dgc-pro v{ver}")
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.21"
+        print(f"{label} v{ver}  (platform: {tool})")
         return
 
     project = Path(args.project).resolve()
     if not project.is_dir():
-        sys.exit(f"[dgc-pro] {project} is not a directory")
+        sys.exit(f"[{label}] {project} is not a directory")
     data_dir = project / ".dual-graph-pro"
 
     build_graph(project, data_dir)
 
     port = find_free_port()
     proc = start_mcp_server(port, project, data_dir)
-    print(f"[dgc-pro] MCP server started on port {port} (pid {proc.pid})", flush=True)
+    print(f"[{label}] MCP server started on port {port} (pid {proc.pid})", flush=True)
 
-    # Ensure server is killed on ANY exit — normal, Ctrl+C, terminal close, SIGHUP
     def _cleanup(*_args):
         try:
             proc.terminate()
@@ -473,19 +659,53 @@ def main() -> None:
         signal.signal(signal.SIGHUP, lambda *_: (_cleanup(), sys.exit(1)))
         signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(1)))
 
-    mcp_cfg = write_mcp_config(project, data_dir, port)
-    print(f"[dgc-pro] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
+    # ── Per-tool MCP wiring + policy file ──────────────────────────────────
+    if tool == "codex":
+        write_codex_config(port)
+        print(f"[{label}] graperoot-pro injected into ~/.codex/config.yaml (port {port})", flush=True)
+        doc, action = write_codex_md(project)
+    elif tool == "gemini":
+        mcp_cfg = write_mcp_config(project, data_dir, port)
+        print(f"[{label}] graperoot-pro registered in {mcp_cfg}", flush=True)
+        doc, action = write_gemini_md(project)
+    elif tool == "opencode":
+        mcp_cfg = write_opencode_config(project, port)
+        print(f"[{label}] graperoot-pro registered in {mcp_cfg}", flush=True)
+        doc, action = write_claude_md(project)  # opencode reads CLAUDE.md
+    elif tool == "cursor":
+        mcp_cfg = write_mcp_config(project, data_dir, port)
+        print(f"[{label}] graperoot-pro registered in {mcp_cfg}", flush=True)
+        doc, action = write_claude_md(project)
+    else:  # claude (default)
+        mcp_cfg = write_mcp_config(project, data_dir, port)
+        print(f"[{label}] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
+        doc, action = write_claude_md(project)
 
-    claude_md, action = write_claude_md(project)
     if action == "created":
-        print(f"[dgc-pro] CLAUDE.md created with dual-graph policy ({claude_md})", flush=True)
+        print(f"[{label}] {doc.name} created with dual-graph policy", flush=True)
     elif action == "prepended":
-        print(f"[dgc-pro] dual-graph policy prepended to existing CLAUDE.md ({claude_md})", flush=True)
+        print(f"[{label}] dual-graph policy prepended to existing {doc.name}", flush=True)
 
-    write_hooks(project, data_dir)
+    # Hooks only apply to Claude Code (other tools don't support them)
+    if tool == "claude":
+        write_hooks(project, data_dir)
 
-    claude = resolve_claude()
-    exit_code = subprocess.call([claude] + passthrough, cwd=str(project))
+    # ── Launch the tool ─────────────────────────────────────────────────────
+    if tool == "codex":
+        cli = resolve_codex()
+        exit_code = subprocess.call([cli] + passthrough, cwd=str(project))
+    elif tool == "gemini":
+        cli = resolve_gemini()
+        exit_code = subprocess.call([cli] + passthrough, cwd=str(project))
+    elif tool == "opencode":
+        cli = resolve_opencode()
+        exit_code = subprocess.call([cli] + passthrough, cwd=str(project))
+    elif tool == "cursor":
+        cli = resolve_cursor()
+        exit_code = subprocess.call([cli, str(project)] + passthrough)
+    else:  # claude
+        cli = resolve_claude()
+        exit_code = subprocess.call([cli] + passthrough, cwd=str(project))
 
     _cleanup()
     sys.exit(exit_code)
