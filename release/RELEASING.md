@@ -23,9 +23,14 @@ graperoot-pro/
   mcp_graph_server_v7.5.py   ← the Pro MCP server (update this in build_tarball.sh when upgrading)
   graph_builder.py            ← copied from graph_builder_v6.2.py
   launch.py                   ← thin Python wrapper called by launch_pro.sh/.ps1
+  graph_gate.py               ← PreToolUse hook (Claude file-access gate)
+  graph_sync.py               ← PostToolUse hook (graph sync after edits)
   requirements.txt
   VERSION
   LICENSE.txt
+  bin/
+    dgc-pro-doctor            ← diagnostic + auto-fix tool
+    dgc-pro-doctor.py
 ```
 
 **Note:** The tarball ships plain `.py` files (no compilation). Source is protected by
@@ -136,18 +141,25 @@ version.txt pointing at v1.0.14 but the Worker still serves v1.0.13.
 
 ### 8. Push launcher files to pro-public
 ```bash
-cd /tmp && gh repo clone kunal12203/graperoot-pro-public grp-pub 2>/dev/null || git -C /tmp/grp-pub pull
-
 RELEASE="/Users/krishnakant/Documents/Personal Projects/GrapeRoot Pro/release"
-for f in version.txt changelog.txt launch_pro.sh launch_pro.ps1 dgc-pro dgc-pro.cmd dgc-pro.ps1; do
-  cp "$RELEASE/bin/$f" /tmp/grp-pub/bin/
+for f in version.txt changelog.txt launch_pro.sh launch_pro.ps1 \
+          dgc-pro dgc-pro.cmd dgc-pro.ps1 \
+          dg-pro dg-pro.cmd dg-pro.ps1 \
+          graperoot-pro graperoot-pro.cmd graperoot-pro.ps1; do
+  SHA=$(gh api repos/kunal12203/graperoot-pro-public/contents/bin/$f --jq '.sha' 2>/dev/null || echo "")
+  CONTENT=$(base64 < "$RELEASE/bin/$f")
+  if [ -n "$SHA" ]; then
+    gh api repos/kunal12203/graperoot-pro-public/contents/bin/$f -X PUT \
+      -f message="v1.0.XX: <description>" -f content="$CONTENT" -f sha="$SHA" --jq '.commit.sha'
+    echo "updated bin/$f"
+  fi
 done
-
-cd /tmp/grp-pub
-git add bin/
-git commit -m "v1.0.14: <one-line description>"
-git push
 ```
+
+All shims that must exist in `bin/`:
+- `dgc-pro` / `dgc-pro.cmd` / `dgc-pro.ps1` — Claude launcher
+- `dg-pro` / `dg-pro.cmd` / `dg-pro.ps1` — Codex launcher
+- `graperoot-pro` / `graperoot-pro.cmd` / `graperoot-pro.ps1` — multi-platform launcher
 
 ### 9. Smoke test (verify auto-update)
 On an existing install that has an older version:
@@ -187,9 +199,10 @@ gh release edit v1.0.14 \
 
 | File | Field | Current |
 |---|---|---|
-| `release/bin/version.txt` | entire file | `1.0.13` |
-| `release/worker/wrangler.toml` | `PRO_VERSION` | `"v1.0.13"` |
-| `release/bin/changelog.txt` | top entry version | `1.0.13` |
+| `release/bin/version.txt` | entire file | `1.0.26` |
+| `release/worker/wrangler.toml` | `PRO_VERSION` | `"v1.0.26"` |
+| `release/bin/changelog.txt` | top entry version | `1.0.26` |
+| `release/bin/launch.py` | version comment (line 4) + fallback string | `1.0.26` |
 | `release/build_tarball.sh` | `mcp_graph_server_v?.?.py` | `v7.5` |
 
 ---
@@ -213,10 +226,57 @@ Revocation takes effect within 24h (Worker cache TTL).
 
 ---
 
+## CI smoke tests (kunal12203/graperoot-pro-public)
+
+The `Windows install smoke test` workflow tests all 4 platforms (PS5.1, PS7, Ubuntu, Fedora) on every push.
+
+**Secret required:** `GRAPEROOT_LICENSE_KEY` must be set on `kunal12203/graperoot-pro-public`:
+```bash
+gh secret set GRAPEROOT_LICENSE_KEY --repo kunal12203/graperoot-pro-public --body "GRP-UREE-9YYZ-LRVF"
+```
+
+**Key used:** King (`GRP-UREE-9YYZ-LRVF`) with `seats: 0` (unlimited — CI runners get random hostnames every run, so a finite seat limit will fill up within a few runs).
+
+**Verify scripts** live at `.github/workflows/scripts/verify-install.ps1` and `verify-install.sh`. They check:
+- All expected files present (including `mcp_graph_server_v7.5.py` — update when upgrading server)
+- Server does NOT contain `0.0.0.0` (security regression guard)
+- Python imports work
+- `launch.py --version` exits cleanly
+
+**Trigger manually:**
+```bash
+gh workflow run "Windows install smoke test" --repo kunal12203/graperoot-pro-public --field license_key="GRP-UREE-9YYZ-LRVF"
+```
+
+---
+
+## KV key management
+
+License keys are in Cloudflare KV namespace `LICENSES` (binding id `273da98358724f30ada795f7d0e8713d`).
+
+```bash
+# Read a key
+cd release/worker && wrangler kv key get --remote --binding=LICENSES "GRP-XXXX-XXXX-XXXX"
+
+# Update a key (fetch → modify → put back)
+RECORD=$(wrangler kv key get --remote --binding=LICENSES "GRP-XXXX-XXXX-XXXX")
+UPDATED=$(echo "$RECORD" | python3 -c "import json,sys; r=json.load(sys.stdin); r['seats']=5; print(json.dumps(r))")
+wrangler kv key put --remote --binding=LICENSES "GRP-XXXX-XXXX-XXXX" "$UPDATED"
+```
+
+**Seat limit:** `seats: 0` = unlimited (bypasses the `if (record.seats && ...)` guard in the Worker).  
+**Never delete keys to clean up** — deleted keys can't be recovered from KV. Only revoke (`revoked: true`).
+
+---
+
 ## Common pitfalls
 
 - **Changelog not updated** → users upgrade silently, can't see what changed
 - **Worker not deployed before pro-public pushed** → launcher fetches new version.txt, Worker still returns old tarball URL
 - **build_tarball.sh pointing at old server version** → tarball ships outdated MCP server
-- **Trailing newline in version.txt** → `printf` not `echo`, version comparison breaks
+- **Trailing newline in version.txt** → use `printf` not `echo`, version comparison breaks
 - **Pushing pro-public before tarball exists in releases** → fresh installs 404 on download
+- **CI seat limit hit** → King key must have `seats: 0`; each CI run uses a fresh random hostname
+- **Verify scripts check old server version** → update `.github/workflows/scripts/verify-install.{ps1,sh}` when upgrading MCP server
+- **Server binding 0.0.0.0** → mcp_graph_server must have no `0.0.0.0` strings; verify script enforces this
+- **launch.py fallback version stale** → update the `else "1.0.XX"` fallback on line ~732 when bumping version
