@@ -419,6 +419,42 @@ def write_hooks(project: Path, data_dir: Path) -> None:
     print(f"[dgc-pro] Graph Gate + Sync hooks registered", flush=True)
 
 
+def write_gemini_hooks(project: Path, data_dir: Path) -> None:
+    """Register BeforeTool (graph gate) hook in .gemini/settings.json.
+
+    Gemini's equivalent of Claude's PreToolUse hook. Tool names differ:
+      Bash → run_shell_command,  Read → read_file
+    """
+    gate_script = PRO_HOME / "graph_gate.py"
+    if not gate_script.exists():
+        return
+    gemini_dir = project / ".gemini"
+    gemini_dir.mkdir(exist_ok=True)
+    cfg = gemini_dir / "settings.json"
+    existing = {}
+    if cfg.exists():
+        try:
+            existing = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    python = sys.executable
+    gate_cmd = f'DG_DATA_DIR="{data_dir}" GEMINI_PROJECT_DIR="{project}" {python} "{gate_script}"'
+    gate_entry = {"matcher": "run_shell_command|read_file|glob|grep|ls", "hooks": [{"type": "command", "command": gate_cmd}]}
+    hooks = existing.setdefault("hooks", {})
+    # Remove stale gate entries
+    old = hooks.get("BeforeTool", [])
+    hooks["BeforeTool"] = [e for e in old if not any(
+        "graph_gate" in h.get("command", "") for h in e.get("hooks", [])
+    )]
+    hooks["BeforeTool"].insert(0, gate_entry)
+    existing["hooks"] = hooks
+    cfg.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    gc_active = data_dir / ".gc_active"
+    if gc_active.exists():
+        gc_active.unlink()
+    print(f"[graperoot-pro] Graph Gate hook registered for Gemini", flush=True)
+
+
 def start_mcp_server(port: int, project: Path, data_dir: Path) -> subprocess.Popen:
     server_py = PRO_HOME / "mcp_graph_server_v7.5.py"
     if not server_py.exists():
@@ -692,6 +728,7 @@ def main() -> None:
         mcp_cfg = write_gemini_config(project, port)
         print(f"[{label}] graperoot-pro registered in {mcp_cfg}", flush=True)
         doc, action = write_gemini_md(project)
+        write_gemini_hooks(project, data_dir)
     elif tool == "opencode":
         mcp_cfg = write_opencode_config(project, port)
         print(f"[{label}] graperoot-pro registered in {mcp_cfg}", flush=True)
@@ -710,7 +747,8 @@ def main() -> None:
     elif action == "prepended":
         print(f"[{label}] dual-graph policy prepended to existing {doc.name}", flush=True)
 
-    # Hooks only apply to Claude Code (other tools don't support them)
+    # Hooks: Claude uses write_hooks(), Gemini already called write_gemini_hooks() above.
+    # Codex and opencode have no hook mechanism — policy doc is the only enforcement.
     if tool == "claude":
         write_hooks(project, data_dir)
 
