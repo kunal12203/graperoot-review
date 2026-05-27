@@ -1319,7 +1319,7 @@ def _search_action_history(query: str, limit: int = 10) -> dict[str, Any]:
     return {"action_hits": action_hits, "file_hits": file_hits[:limit]}
 
 
-def build_server(host: str = "0.0.0.0", port: int = 8080) -> Any:
+def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
     if FastMCP is None:
         raise RuntimeError(
             "Missing dependency: 'mcp'. Install with: python3 -m pip install mcp"
@@ -3537,7 +3537,7 @@ def main() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
             _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                _s.bind(("0.0.0.0", _p))
+                _s.bind(("127.0.0.1", _p))
                 port = _p
                 break
             except OSError:
@@ -3553,7 +3553,8 @@ def main() -> int:
         except OSError:
             pass
     _ping_license_server()
-    mcp = build_server(host="0.0.0.0", port=port)
+    _bind_host = os.environ.get("HOST", "127.0.0.1")
+    mcp = build_server(host=_bind_host, port=port)
 
     # Custom /ingest-graph route: accepts pre-built graph JSON from local machine
     # so users can run: graph_builder.py locally -> POST here -> chat via MCP
@@ -3878,7 +3879,7 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
         # would each have their own _SESSION_STATES and _CURRENT_SID globals.
         # For multi-worker deployments, replace _CURRENT_SID with a proper
         # per-request ContextVar solution or Redis session store.
-        config = uvicorn.Config(mcp_app, host="0.0.0.0", port=port, log_level="error", workers=1)
+        config = uvicorn.Config(mcp_app, host=_bind_host, port=port, log_level="error", workers=1)
         await uvicorn.Server(config).serve()
 
     anyio.run(serve)

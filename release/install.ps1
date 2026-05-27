@@ -286,7 +286,7 @@ try {
     Remove-Item $tmpTgz -ErrorAction SilentlyContinue
 
     Write-Host "[install] Downloading launcher..."
-    foreach ($f in @("launch_pro.ps1","dgc-pro.cmd","dgc-pro.ps1","version.txt","changelog.txt")) {
+    foreach ($f in @("launch_pro.ps1","dgc-pro.cmd","dgc-pro.ps1","dg-pro.cmd","dg-pro.ps1","graperoot-pro.cmd","graperoot-pro.ps1","version.txt","changelog.txt")) {
         $dest = Join-Path "$INSTALL_DIR\bin" $f
         try { Invoke-WebRequestWithRetry -Uri "$R2/bin/$f" -OutFile $dest }
         catch { Invoke-WebRequestWithRetry -Uri "$BASE_URL/bin/$f" -OutFile $dest }
@@ -327,7 +327,10 @@ try {
     Write-Host "+==============================================================+" -ForegroundColor Green
     Write-Host ""
     Write-Host "  Open a new PowerShell window (PATH refresh), then:"
-    Write-Host "    dgc-pro C:\path\to\your\project" -ForegroundColor Cyan
+    Write-Host "    dgc-pro C:\path\to\your\project       # Claude Code (default)" -ForegroundColor Cyan
+    Write-Host "    dg-pro  C:\path\to\your\project       # OpenAI Codex" -ForegroundColor Cyan
+    Write-Host "    graperoot-pro --gemini C:\path\...    # Gemini CLI" -ForegroundColor Cyan
+    Write-Host "    graperoot-pro --opencode C:\path\...  # opencode" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Docs:    https://graperoot.dev/pro/docs"
     Write-Host "  Support: support@graperoot.dev"

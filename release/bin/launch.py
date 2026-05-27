@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.26: security fix — MCP server now binds 127.0.0.1 only (was 0.0.0.0)
+shims in install.sh/ps1 and self-update lists for Mac/Linux/Windows.
+
+v1.0.24: fix Windows self-update missing dg-pro.cmd/.ps1 shims.
+
+v1.0.23: fix MCP server crash when cached graph has wrong root directory.
+
+v1.0.22: fix Codex log message (config.yaml → config.toml).
+
 v1.0.21: multi-platform support — --claude (default), --codex, --gemini, --opencode,
 --cursor. dg-pro shorthand for --codex. All platforms get full graph context.
 
@@ -133,7 +142,29 @@ def build_graph(project: Path, data_dir: Path) -> None:
     """One-time graph scan. Cached in project's .dual-graph-pro/ folder."""
     graph_file = data_dir / "info_graph.json"
     if graph_file.exists():
-        return
+        # Validate the graph was built for this project, not a different root.
+        # A mismatched root means the graph was copied or built incorrectly —
+        # it will return irrelevant files and may be enormous (causing server crashes).
+        try:
+            with open(graph_file, encoding="utf-8") as _f:
+                _head = _f.read(512)
+            import re as _re
+            m = _re.search(r'"root"\s*:\s*"([^"]+)"', _head)
+            if m:
+                cached_root = Path(m.group(1)).resolve()
+                if cached_root != project.resolve():
+                    print(
+                        f"[dgc-pro] cached graph has wrong root ({cached_root}), "
+                        f"expected {project.resolve()} — rebuilding…",
+                        flush=True,
+                    )
+                    graph_file.unlink()
+                else:
+                    return  # root matches, cache is valid
+            else:
+                return  # no root field, trust the cache
+        except Exception:
+            return  # unreadable header, trust the cache
     print(f"[dgc-pro] scanning {project}…  (first-time index, ~2 min for 10k files)", flush=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     builder = PRO_HOME / "graph_builder.py"
@@ -166,7 +197,11 @@ def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
 
 
 def write_opencode_config(project: Path, port: int) -> Path:
-    """Merge graperoot-pro into project's opencode.json MCP config."""
+    """Merge graperoot-pro into project's opencode.json.
+
+    Also injects CLAUDE.md into `instructions` so the graph policy lands in
+    the system prompt — strongest available enforcement for opencode (no hooks).
+    """
     cfg = project / "opencode.json"
     existing = {}
     if cfg.exists():
@@ -178,6 +213,11 @@ def write_opencode_config(project: Path, port: int) -> Path:
         "type": "remote",
         "url": f"http://127.0.0.1:{port}/mcp",
     }
+    # Inject policy file into system prompt via instructions[]
+    instructions = existing.get("instructions", [])
+    if "CLAUDE.md" not in instructions:
+        instructions.append("CLAUDE.md")
+        existing["instructions"] = instructions
     cfg.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     return cfg
 
@@ -462,6 +502,7 @@ def start_mcp_server(port: int, project: Path, data_dir: Path) -> subprocess.Pop
     env = {
         **os.environ,
         "PORT": str(port),
+        "HOST": "127.0.0.1",
         "DG_DATA_DIR": str(data_dir),
         "DUAL_GRAPH_PROJECT_ROOT": str(project),
     }
@@ -688,7 +729,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.21"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.26"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
@@ -722,7 +763,7 @@ def main() -> None:
     # ── Per-tool MCP wiring + policy file ──────────────────────────────────
     if tool == "codex":
         write_codex_config(port)
-        print(f"[{label}] graperoot-pro injected into ~/.codex/config.yaml (port {port})", flush=True)
+        print(f"[{label}] graperoot-pro injected into ~/.codex/config.toml (port {port})", flush=True)
         doc, action = write_codex_md(project)
     elif tool == "gemini":
         mcp_cfg = write_gemini_config(project, port)

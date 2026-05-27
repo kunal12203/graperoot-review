@@ -44,7 +44,7 @@ self_update() {
         tar -xzf "$tmp" -C "$INSTALL_DIR" --strip-components=1 2>/dev/null || true
         rm -f "$tmp"
         # Also refresh launcher binaries — R2 first, GitHub fallback (R2 may not be set up)
-        for f in launch_pro.sh dgc-pro dg-pro version.txt changelog.txt; do
+        for f in launch_pro.sh dgc-pro dg-pro graperoot-pro version.txt changelog.txt; do
           if curl -fsSL --max-time 15 "$R2/bin/$f" -o "$BIN_DIR/$f.new" 2>/dev/null && [ -s "$BIN_DIR/$f.new" ]; then
             : # fetched from R2
           elif curl -fsSL --max-time 15 "$BASE_URL/bin/$f" -o "$BIN_DIR/$f.new" 2>/dev/null && [ -s "$BIN_DIR/$f.new" ]; then
@@ -55,7 +55,7 @@ self_update() {
           fi
           mv "$BIN_DIR/$f.new" "$BIN_DIR/$f"
         done
-        chmod +x "$BIN_DIR/launch_pro.sh" "$BIN_DIR/dgc-pro" "$BIN_DIR/dg-pro" 2>/dev/null || true
+        chmod +x "$BIN_DIR/launch_pro.sh" "$BIN_DIR/dgc-pro" "$BIN_DIR/dg-pro" "$BIN_DIR/graperoot-pro" 2>/dev/null || true
         # Show changelog
         [[ -f "$BIN_DIR/changelog.txt" ]] && head -20 "$BIN_DIR/changelog.txt" >&2
       fi

@@ -274,8 +274,9 @@ def main() -> int:
     # Command targets inside project (or no explicit path → assume cwd)
     if not _mcp_server_alive(data_dir):
         print(
-            "WARNING: GrapeRoot MCP server not running. "
-            "Allowing native tools. Run `dgc-pro` to restart.",
+            "WARNING: GrapeRoot MCP server not running — graph tools unavailable.\n"
+            "Native file tools are allowed for now, but context quality is degraded.\n"
+            "To restore full context: exit this session and run `dgc-pro` again.",
             file=sys.stderr,
         )
         return 0

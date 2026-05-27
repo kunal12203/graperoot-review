@@ -283,11 +283,11 @@ chmod 700 "$INSTALL_DIR"
 
 # Download launcher + shim from R2 (with GitHub fallback)
 echo "[install] Downloading launcher…"
-for f in launch_pro.sh dgc-pro version.txt changelog.txt; do
+for f in launch_pro.sh dgc-pro dg-pro graperoot-pro version.txt changelog.txt; do
   curl -fsSL "$R2/bin/$f" -o "$INSTALL_DIR/bin/$f" 2>/dev/null \
     || curl -fsSL "$BASE_URL/bin/$f" -o "$INSTALL_DIR/bin/$f"
 done
-chmod +x "$INSTALL_DIR/bin/launch_pro.sh" "$INSTALL_DIR/bin/dgc-pro"
+chmod +x "$INSTALL_DIR/bin/launch_pro.sh" "$INSTALL_DIR/bin/dgc-pro" "$INSTALL_DIR/bin/dg-pro" "$INSTALL_DIR/bin/graperoot-pro"
 
 # Python venv + dependencies
 echo "[install] Creating isolated Python venv…"
@@ -344,7 +344,10 @@ fi
 
 echo "  Run once:       source $SHELL_RC"
 echo "  Then per project:"
-echo "    dgc-pro /path/to/your/project"
+echo "    dgc-pro /path/to/your/project       # Claude Code (default)"
+echo "    dg-pro  /path/to/your/project       # OpenAI Codex"
+echo "    graperoot-pro --gemini /path/...    # Gemini CLI"
+echo "    graperoot-pro --opencode /path/...  # opencode"
 echo ""
 echo "  Troubleshooting:"
 echo "    dgc-pro-doctor          # Diagnose MCP issues"

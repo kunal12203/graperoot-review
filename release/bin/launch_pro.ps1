@@ -64,7 +64,7 @@ function Self-Update {
             Invoke-WebRequest $resp.download_url -OutFile $tmp -UseBasicParsing -TimeoutSec 60
             & tar -xzf $tmp -C $InstallDir --strip-components=1
             Remove-Item $tmp -ErrorAction SilentlyContinue
-            foreach ($f in @("launch_pro.ps1","dgc-pro.cmd","dgc-pro.ps1","version.txt","changelog.txt")) {
+            foreach ($f in @("launch_pro.ps1","dgc-pro.cmd","dgc-pro.ps1","dg-pro.cmd","dg-pro.ps1","graperoot-pro.cmd","graperoot-pro.ps1","version.txt","changelog.txt")) {
                 $dst = Join-Path $BinDir "$f.new"
                 $ok = $false
                 # R2 first, GitHub fallback

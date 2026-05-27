@@ -1,3 +1,42 @@
+1.0.26  (2026-05-27)
+- SECURITY: MCP server now binds to 127.0.0.1 only (was 0.0.0.0). On public wifi /
+  office LANs, other machines could previously call graph_read to exfiltrate source.
+  Fixed in mcp_graph_server_v7.5 — HOST env var (default 127.0.0.1) controls bind
+  address. launch.py explicitly passes HOST=127.0.0.1 to the server subprocess.
+- FIXED: CI smoke tests now pass — workflow uses GRAPEROOT_LICENSE_KEY secret on
+  push triggers (not just workflow_dispatch). King key has unlimited seats for CI.
+
+1.0.25  (2026-05-27)
+- FIXED: install.sh was missing dg-pro and graperoot-pro from the download + chmod
+  list. Fresh installs on Mac/Linux would get dgc-pro only; dg-pro (Codex) and
+  graperoot-pro --gemini/--opencode/--cursor were not installed.
+- FIXED: install.ps1 was missing dg-pro.cmd/.ps1 and graperoot-pro.cmd/.ps1 from
+  the download list. Fresh installs on Windows had same gap.
+- NEW: graperoot-pro shim added (Unix + Windows) — use for Gemini, opencode,
+  Cursor: graperoot-pro --gemini /path, graperoot-pro --opencode /path, etc.
+- FIXED: self-update lists in launch_pro.sh and launch_pro.ps1 now include
+  graperoot-pro shims so existing users get them on next dgc-pro run.
+- IMPROVED: installer usage instructions now show all four launch commands
+  (dgc-pro, dg-pro, graperoot-pro --gemini, graperoot-pro --opencode).
+
+1.0.24  (2026-05-27)
+- FIXED: Windows self-update was missing dg-pro.cmd and dg-pro.ps1 from the
+  refresh list in launch_pro.ps1. Windows users on v1.0.21+ would not get the
+  dg-pro Codex shim on auto-update. Now included alongside dgc-pro.cmd/.ps1.
+
+1.0.23  (2026-05-27)
+- FIXED: MCP server crash when a project's cached graph was built from a different root
+  directory (e.g. beads-main instead of admindash). Root cause: graph was copied/reused
+  across projects. Fix: launch.py now reads the "root" field from info_graph.json and
+  rebuilds the graph if it doesn't match the current project. Prevents 300MB wrong-project
+  graphs from being loaded, which caused uvicorn ASGI errors and a dead MCP server mid-session.
+- IMPROVED: graph gate warning message when MCP server is down is now more actionable —
+  tells Claude to exit and run dgc-pro again to restore context quality.
+
+1.0.22  (2026-05-27)
+- FIXED: cosmetic log message said "config.yaml" instead of "config.toml" for Codex MCP
+  injection. No functional change — the correct file was always written.
+
 1.0.21  (2026-05-27)
 - NEW: Multi-platform support — graperoot-pro now launches any AI tool, not just Claude.
   Flags: --claude (default), --codex, --gemini, --opencode, --cursor.
