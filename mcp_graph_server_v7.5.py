@@ -92,18 +92,16 @@ except Exception:  # noqa: BLE001
 
 DG_BASE = os.environ.get("DG_BASE_URL", "http://127.0.0.1:8787")
 DG_API_TOKEN = os.environ.get("DG_API_TOKEN", "").strip()
-PROJECT_ROOT = Path(
-    os.environ.get(
-        "DUAL_GRAPH_PROJECT_ROOT",
-        "/app/project",  # default clone target in Railway (set via GITHUB_REPO_URL)
-    )
-).resolve()
-# DG_DATA_DIR: where graph JSON + action graph + cache are stored.
-# Defaults to <script_dir>/data (Railway mode).
-# Set to PROJECT_ROOT/.dual-graph for local mode so data persists with the project.
 DG_DATA_DIR = Path(
     os.environ.get("DG_DATA_DIR", str(Path(__file__).resolve().parent / "data"))
 )
+_explicit_root = os.environ.get("DUAL_GRAPH_PROJECT_ROOT")
+if _explicit_root:
+    PROJECT_ROOT = Path(_explicit_root).resolve()
+elif DG_DATA_DIR.name in (".dual-graph", ".dual-graph-pro"):
+    PROJECT_ROOT = DG_DATA_DIR.parent.resolve()
+else:
+    PROJECT_ROOT = Path("/app/project").resolve()
 LOG_FILE = DG_DATA_DIR / "mcp_tool_calls.jsonl"
 ACTION_GRAPH_FILE = DG_DATA_DIR / "chat_action_graph.json"
 RETRIEVAL_CACHE_FILE = DG_DATA_DIR / "retrieval_cache.json"

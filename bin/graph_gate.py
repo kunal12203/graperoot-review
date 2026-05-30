@@ -244,9 +244,20 @@ def _classify_paths(cmd: str, project_root: Path) -> tuple[list, list]:
     return inside, outside
 
 
+# ── Remote execution (never touches local filesystem) ────────────────────────
+_REMOTE_EXEC = re.compile(
+    r"^\s*(?:ssh|scp|rsync)\b"
+    r"|^\s*(?:docker|podman)\s+(?:exec|run)\b"
+    r"|^\s*kubectl\s+exec\b"
+)
+
+
 # ── Main logic ────────────────────────────────────────────────────────────────
 def main() -> int:
     cmd = tool_input.get("command", "")
+
+    if _REMOTE_EXEC.search(cmd):
+        return 0  # Remote execution — always allow
 
     if not _is_exploration_bash(cmd):
         return 0  # Not exploration — allow

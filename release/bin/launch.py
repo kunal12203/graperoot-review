@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.30: fix SSH/docker/kubectl blocked by gate + fix multi-session project root confusion
+
 v1.0.29: self-update also re-creates ~/.local/bin symlinks
 shims in install.sh/ps1 and self-update lists for Mac/Linux/Windows.
 
@@ -729,7 +731,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.29"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.30"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
