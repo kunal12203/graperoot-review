@@ -253,6 +253,12 @@ _REMOTE_EXEC = re.compile(
 
 
 # ── Main logic ────────────────────────────────────────────────────────────────
+_INFRA_PATH = re.compile(
+    r"[/\\]\.(?:dual-graph-pro|dual-graph|claude|graperoot-pro)[/\\]?"
+    r"|[/\\]\.mcp\.json\b"
+)
+
+
 def main() -> int:
     cmd = tool_input.get("command", "")
 
@@ -261,6 +267,10 @@ def main() -> int:
 
     if not _is_exploration_bash(cmd):
         return 0  # Not exploration — allow
+
+    # Commands targeting GrapeRoot/Claude infrastructure dirs — always allow
+    if _INFRA_PATH.search(cmd):
+        return 0
 
     data_dir = _find_data_dir()
     if data_dir is None:

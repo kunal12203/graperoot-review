@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.36: gate exempts infrastructure paths (.dual-graph-pro, .claude, .mcp.json) from blocking
+
 v1.0.35: fix scan timeout deadlock — gate allows native tools when graph is sparse/empty,
          build_graph has 120s timeout, graph_scan has 90s timeout with graceful skip
 
@@ -754,7 +756,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.35"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.36"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
