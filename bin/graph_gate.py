@@ -283,6 +283,10 @@ def main() -> int:
         return 0
 
     # Command targets inside project (or no explicit path → assume cwd)
+    graph_file = data_dir / "info_graph.json"
+    if not graph_file.exists() or graph_file.stat().st_size < 100:
+        return 0  # No graph built yet — allow native tools (blocking is pointless)
+
     if not _mcp_server_alive(data_dir):
         print(
             "WARNING: GrapeRoot MCP server not running — graph tools unavailable.\n"
