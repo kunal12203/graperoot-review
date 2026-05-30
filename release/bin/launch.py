@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.33: gate allows native tools when graph is stale OR missing (fixes token bleed on project switch)
+
 v1.0.32: gate allows native tools when graph was never built (large repo scan timeout)
 
 v1.0.31: fix stale graph index when switching projects + remove global hook (teammate token bleed)
@@ -735,7 +737,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.32"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.33"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 

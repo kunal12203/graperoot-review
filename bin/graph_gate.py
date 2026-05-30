@@ -287,6 +287,19 @@ def main() -> int:
     if not graph_file.exists() or graph_file.stat().st_size < 100:
         return 0  # No graph built yet — allow native tools (blocking is pointless)
 
+    # Check if graph was built for a different project (stale from another session)
+    try:
+        import json as _json
+        _gdata = _json.loads(graph_file.read_bytes())
+        _stored_root = _gdata.get("root", "")
+        if _stored_root:
+            _current = str(Path(str(project_root)).resolve())
+            _stored = str(Path(_stored_root).resolve())
+            if _current != _stored:
+                return 0  # Stale graph from different project — allow native tools
+    except Exception:
+        pass
+
     if not _mcp_server_alive(data_dir):
         print(
             "WARNING: GrapeRoot MCP server not running — graph tools unavailable.\n"
