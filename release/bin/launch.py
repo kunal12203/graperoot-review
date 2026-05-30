@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.34: fix auto-update blocked by Cloudflare (add User-Agent header to urllib requests)
+
 v1.0.33: gate allows native tools when graph is stale OR missing (fixes token bleed on project switch)
 
 v1.0.32: gate allows native tools when graph was never built (large repo scan timeout)
@@ -604,7 +606,10 @@ def auto_update() -> None:
     # Check remote version (fast — just a JSON POST)
     try:
         body = json.dumps({"license_key": license_key, "host": socket.gethostname(), "os": sys.platform}).encode()
-        req = urllib.request.Request(api_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        req = urllib.request.Request(api_url, data=body, headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"GrapeRoot-Pro/{local_ver}",
+        }, method="POST")
         resp = urllib.request.urlopen(req, timeout=8)
         data = json.loads(resp.read())
     except Exception:
@@ -630,7 +635,9 @@ def auto_update() -> None:
     try:
         tmp = tempfile.mkdtemp(prefix="grp-pro-update-")
         tarball = os.path.join(tmp, "graperoot-pro.tar.gz")
-        urllib.request.urlretrieve(download_url, tarball)
+        dl_req = urllib.request.Request(download_url, headers={"User-Agent": f"GrapeRoot-Pro/{local_ver}"})
+        with urllib.request.urlopen(dl_req, timeout=60) as dl_resp, open(tarball, "wb") as f:
+            f.write(dl_resp.read())
 
         with tarfile.open(tarball, "r:gz") as tf:
             tf.extractall(tmp)
@@ -737,7 +744,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.33"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.34"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
