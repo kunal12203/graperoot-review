@@ -2002,6 +2002,16 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             except Exception:
                 graph_empty = True
         if graph_missing or graph_empty or graph_stale_root:
+            # If scan already timed out this session, don't loop — tell Claude to skip
+            if TURN_STATE.get("scan_timed_out"):
+                _write_gc_active()
+                TURN_STATE["graph_continue_called"] = True
+                return {
+                    "ok": True,
+                    "skip": True,
+                    "cold_start_reason": "scan_timeout",
+                    "hint": "Graph scan timed out for this project. Use native tools (Read, Bash) — the gate allows them.",
+                }
             gb_script = str(Path(__file__).resolve().parent / "graph_builder.py")
             ingest_url = f"{DG_BASE}/ingest-graph"
             resp: dict[str, Any] = {
@@ -2783,7 +2793,30 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             except Exception:
                 pass
 
-        graph = _gb_scan(root, existing_nodes=existing_nodes)
+        # Run scan with timeout to prevent MCP tool call from hanging on large repos
+        import concurrent.futures
+        _SCAN_TIMEOUT_SEC = 90
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_gb_scan, root, existing_nodes=existing_nodes)
+                graph = future.result(timeout=_SCAN_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            # Scan too slow (large repo or slow I/O like WSL /mnt/c/)
+            # Mark in session state so graph_continue won't loop asking for re-scan
+            PROJECT_ROOT = root
+            TURN_STATE["scan_timed_out"] = True
+            _write_gc_active()
+            TURN_STATE["graph_continue_called"] = True
+            return {
+                "ok": False,
+                "scan_timeout": True,
+                "skip": True,
+                "project_root": str(root),
+                "error": f"Scan exceeded {_SCAN_TIMEOUT_SEC}s timeout (project too large or slow I/O). "
+                         "Use native tools (Read, Bash grep) for this session — the graph gate will allow them.",
+                "hint": "Proceed with your task using standard file exploration. "
+                        "The graph is not available for this project.",
+            }
 
         # v7: Doc enrichment — extract path+heading mappings from .md files,
         # patch file node keywords so BM25 retrieval uses them automatically.

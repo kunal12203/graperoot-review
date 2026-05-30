@@ -288,6 +288,7 @@ def main() -> int:
         return 0  # No graph built yet — allow native tools (blocking is pointless)
 
     # Check if graph was built for a different project (stale from another session)
+    # Also check if graph has enough content to be useful (scan may have timed out)
     try:
         import json as _json
         _gdata = _json.loads(graph_file.read_bytes())
@@ -297,8 +298,12 @@ def main() -> int:
             _stored = str(Path(_stored_root).resolve())
             if _current != _stored:
                 return 0  # Stale graph from different project — allow native tools
+        # If graph has fewer than 10 files indexed, it's not useful enough to block
+        _file_count = _gdata.get("file_count", _gdata.get("node_count", 0))
+        if _file_count < 10:
+            return 0  # Graph too sparse (scan likely timed out) — allow native tools
     except Exception:
-        pass
+        return 0  # Unreadable graph — allow native tools
 
     if not _mcp_server_alive(data_dir):
         print(
