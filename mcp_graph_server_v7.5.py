@@ -1990,23 +1990,30 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         graph_json = DG_DATA_DIR / "info_graph.json"
         graph_missing = not graph_json.exists()
         graph_empty = False
+        graph_stale_root = False
         gdata: dict[str, Any] = {}
         if not graph_missing:
             try:
                 gdata = json.loads(graph_json.read_text(encoding="utf-8"))
                 graph_empty = gdata.get("node_count", 0) == 0
+                stored_root = gdata.get("root", "")
+                if stored_root and str(PROJECT_ROOT) != stored_root:
+                    graph_stale_root = True
             except Exception:
                 graph_empty = True
-        if graph_missing or graph_empty:
+        if graph_missing or graph_empty or graph_stale_root:
             gb_script = str(Path(__file__).resolve().parent / "graph_builder.py")
             ingest_url = f"{DG_BASE}/ingest-graph"
-            return {
+            resp: dict[str, Any] = {
                 "ok": False,
                 "needs_project": True,
                 "query": query,
                 "graph_builder": gb_script,
                 "ingest_url": ingest_url,
             }
+            if graph_stale_root:
+                resp["reason"] = f"Graph was built for {stored_root} but current project is {PROJECT_ROOT}. Re-scan needed."
+            return resp
 
         # Phase 0: Handle truly empty/greenfield projects (< 5 files).
         # Projects with 5+ files get full graph treatment regardless of prior edits.
@@ -2786,6 +2793,9 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         except Exception:
             dir_terms = {}
             enriched_count = 0
+
+        # Ensure graph always stores the project root it was built against.
+        graph["root"] = str(root)
 
         # Write to the same JSON the dashboard serves.
         graph_json = DG_DATA_DIR / "info_graph.json"
