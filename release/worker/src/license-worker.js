@@ -345,14 +345,18 @@ async function issueLicense(req, env) {
   const body = await req.json();
   const { customer, email, tier = "pro", seats = 3, expires = "perpetual" } = body;
   if (!customer || !email) return jsonResp({ error: "customer and email required" }, 400);
-  const key = generateKey();
-  const record = {
+  const key = body.key || generateKey();
+  const existing = await env.LICENSES.get(key, { type: "json" });
+  if (existing && !body.key) {
+    return jsonResp({ error: "key collision, retry" }, 409);
+  }
+  const record = existing ? { ...existing, customer, email, tier, seats, expires } : {
     key, customer, email, tier, seats, expires,
     issued: new Date().toISOString().slice(0, 10),
     revoked: false, activations: [],
   };
   await env.LICENSES.put(key, JSON.stringify(record));
-  await audit(env, req, "license_issued", { key, customer, email, tier, seats, expires });
+  await audit(env, req, "license_issued", { key, customer, email, tier, seats, expires, synced: !!body.key });
   return jsonResp({ ok: true, license: record });
 }
 
