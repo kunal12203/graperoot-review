@@ -365,7 +365,7 @@ elif [[ -z "$SYMLINK_DIR" ]]; then
   fi
 fi
 
-VER=$(cat "$INSTALL_DIR/bin/version.txt" 2>/dev/null || echo "1.0.36")
+VER=$(cat "$INSTALL_DIR/bin/version.txt" 2>/dev/null || echo "1.0.37")
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  Install complete.  GrapeRoot Pro v$VER                    ║"

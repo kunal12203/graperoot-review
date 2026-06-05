@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.37: gap-aware query intent routing — detects content/control-flow/absence/dynamic queries
+         and adjusts confidence so the right exploration tool is used (no more blind file reads)
+
 v1.0.36: gate exempts infrastructure paths (.dual-graph-pro, .claude, .mcp.json) from blocking
 
 v1.0.35: fix scan timeout deadlock — gate allows native tools when graph is sparse/empty,
@@ -756,7 +759,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.36"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.37"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
