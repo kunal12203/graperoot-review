@@ -350,6 +350,57 @@ def _classify_task_type(query: str) -> str:
     return "targeted"
 
 
+def _detect_query_intent(query: str) -> str:
+    """Detect specific query intent for gap-aware routing.
+
+    Returns one of: content_search, control_flow, absence_query, dynamic_trace, general.
+    This runs BEFORE task_type classification and influences confidence + strategy hints.
+    """
+    q = query.lower()
+
+    content_signals = [
+        "hardcoded", "as any", "type assertion", "magic number", "magic string",
+        "string literal", "regex pattern", "console.log", "debugger statement",
+        "todo", "fixme", "hack", "xxx", "deprecated", "eslint-disable",
+        "ts-ignore", "ts-expect-error", "noqa", "nolint",
+        "hardcoded url", "hardcoded ip", "hardcoded secret", "hardcoded password",
+        "commented out", "dead comment",
+    ]
+    if any(s in q for s in content_signals):
+        return "content_search"
+
+    flow_signals = [
+        "empty catch", "swallow error", "silent catch", "catch block",
+        "inside loop", "in a loop", "db call in loop", "query in loop",
+        "await in loop", "n+1", "nested callback", "callback hell",
+        "deep nesting", "try without",
+    ]
+    if any(s in q for s in flow_signals):
+        return "control_flow"
+
+    absence_signals = [
+        "without auth", "without validation", "without middleware",
+        "missing auth", "missing validation", "missing test",
+        "no test", "no auth", "no middleware", "no validation",
+        "unprotected", "unchecked", "unvalidated", "unauthenticated",
+        "routes without", "endpoints without", "exports without",
+        "lacking", "not covered", "not tested",
+    ]
+    if any(s in q for s in absence_signals):
+        return "absence_query"
+
+    dynamic_signals = [
+        "container.resolve", "container.register", "dependency injection",
+        "emit event", "event emit", "event handler", "event listener",
+        "subscriber", "on event", ".on(", ".emit(",
+        "dynamic import", "lazy load", "register service",
+    ]
+    if any(s in q for s in dynamic_signals):
+        return "dynamic_trace"
+
+    return "general"
+
+
 def _post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     raw = json.dumps(payload).encode("utf-8")
     headers = {"content-type": "application/json"}
@@ -2297,6 +2348,30 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             TURN_STATE["explore_budget_chars"] = EXPLORE_READ_BUDGET_CHARS
             TURN_STATE["explore_hard_max_chars"] = EXPLORE_MAX_READ_CHARS
 
+        # v7.6: Gap-aware query intent routing — detects content/control-flow/absence/
+        # dynamic queries and adjusts confidence + strategy so the right tool is used.
+        gap_intent = _detect_query_intent(query)
+        TURN_STATE["gap_intent"] = gap_intent
+        if gap_intent == "content_search":
+            if confidence == "high":
+                confidence = "low"
+            elif confidence == "medium":
+                confidence = "low"
+            max_supp_greps = max(max_supp_greps, 5)
+        elif gap_intent == "control_flow":
+            if confidence == "high":
+                confidence = "medium"
+            max_supp_greps = max(max_supp_greps, 4)
+        elif gap_intent == "absence_query":
+            if confidence == "high":
+                confidence = "medium"
+            max_supp_greps = max(max_supp_greps, 3)
+            TURN_STATE["absence_hint"] = True
+        elif gap_intent == "dynamic_trace":
+            if confidence == "high":
+                confidence = "medium"
+            max_supp_greps = max(max_supp_greps, 3)
+
         # v7.2: exhaustive tasks MUST have exploration budget — graph retrieval alone
         # cannot cover "find all X" style audits, especially on unfamiliar codebases.
         # explore_budget_chars is set so graph_read uses the full 500k budget, not the
@@ -2359,35 +2434,55 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                     if d and d != "." and d not in seen_dirs:
                         seen_dirs.add(d)
                         search_hints.append(d)
+            _low_strategy = (
+                "Low confidence — graph is unsure where this lives. "
+                "DO NOT read files blindly. Instead: "
+                "1) Call fallback_rg with specific search terms. "
+                "   fallback_rg returns symbol-contextualized results with code bodies inline — "
+                "   you often won't need a follow-up graph_read. "
+                "2) If you need more detail on a specific symbol, call graph_read. "
+                "Never use native grep/cat/Read."
+            )
+            if gap_intent == "content_search":
+                _low_strategy = (
+                    "Content pattern search detected. "
+                    "Call fallback_rg with the pattern — it returns hits with enclosing "
+                    "symbol bodies inline. The results are self-sufficient; no graph_read needed "
+                    "unless you need surrounding context. Never use native grep/cat/Read."
+                )
             out: dict[str, Any] = {
                 "ok": True,
                 "mode": "search_first",
                 "confidence": confidence,
                 "recommended_files": [],
                 "task_type": task_type,
+                "query_intent": gap_intent,
                 "search_hints": search_hints[:4],
-                "strategy": (
-                    "Low confidence — graph is unsure where this lives. "
-                    "DO NOT read files blindly. Instead: "
-                    "1) Call fallback_rg with specific search terms to locate the right files. "
-                    "2) Then call graph_read on the files fallback_rg found. "
-                    "This is cheaper than guessing. Never use native grep/cat/Read."
-                ),
+                "strategy": _low_strategy,
             }
         elif confidence == "medium":
+            _med_strategy = (
+                "Medium confidence — these files are likely relevant but may not be complete. "
+                "1) Read recommended_files with graph_read first. "
+                "2) If they don't fully answer the question, call fallback_rg to find more. "
+                "3) Then graph_read the files fallback_rg found. "
+                "Never use native grep/cat/Read."
+            )
+            if TURN_STATE.get("absence_hint"):
+                _med_strategy = (
+                    "Absence query detected. Use graph_find_missing(have=..., lack=...) "
+                    "to find symbols that have a property but lack another. "
+                    "Example: graph_find_missing(have='api_route', lack='auth') for unprotected routes. "
+                    "Then graph_read the results for details. Never use native grep/cat/Read."
+                )
             out: dict[str, Any] = {
                 "ok": True,
                 "mode": "retrieve_then_read",
                 "confidence": confidence,
                 "recommended_files": rec_slice,
                 "task_type": task_type,
-                "strategy": (
-                    "Medium confidence — these files are likely relevant but may not be complete. "
-                    "1) Read recommended_files with graph_read first. "
-                    "2) If they don't fully answer the question, call fallback_rg to find more. "
-                    "3) Then graph_read the files fallback_rg found. "
-                    "Never use native grep/cat/Read."
-                ),
+                "query_intent": gap_intent,
+                "strategy": _med_strategy,
             }
         else:
             out: dict[str, Any] = {
@@ -2429,8 +2524,9 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         return out
 
     @mcp.tool()
-    def fallback_rg(pattern: str, max_hits: int = 30) -> dict[str, Any]:
+    def fallback_rg(pattern: str, max_hits: int = 30, include_symbol_bodies: bool = True) -> dict[str, Any]:
         """Use instead of Bash grep/rg when graph_continue confidence is medium or low.
+        Returns contextualized hits with enclosing symbol info and bodies.
         Do NOT use Bash grep directly — always use this tool for pattern search."""
         if not TURN_STATE.get("graph_continue_called"):
             return {
@@ -2439,35 +2535,30 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                 "action_required": "graph_continue",
             }
         calls = int(TURN_STATE.get("fallback_calls", 0))
-        # Scope to graph-retrieved directories first — cheaper and more relevant.
-        # Fall back to full PROJECT_ROOT if graph dirs yield no results.
         retrieved = list(TURN_STATE.get("retrieved_files", []))
         graph_dirs: list[str] = []
         if retrieved:
             import os as _os
             seen: set[str] = set()
             for fp in retrieved:
-                # Strip file::symbol notation to get bare file path
                 bare = fp.split("::")[0] if "::" in fp else fp
                 rel_dir = str(_os.path.dirname(bare))
                 if not rel_dir or rel_dir == ".":
                     continue
-                # Only include if directory actually exists in PROJECT_ROOT
                 abs_dir = PROJECT_ROOT / rel_dir
                 if abs_dir.exists() and rel_dir not in seen:
                     seen.add(rel_dir)
                     graph_dirs.append(rel_dir)
 
-        # Try PCRE2 engine first (handles [\s\S], lookaheads, etc.).
-        # Fall back to default engine if PCRE2 not available.
         def _run_rg(search_paths: list[str]) -> subprocess.CompletedProcess:
             base = ["rg", "-n", "-S", "--engine", "pcre2",
+                    "-B2", "-A2",
                     "--max-count", str(max_hits), pattern]
             r = subprocess.run(base + search_paths, cwd=str(PROJECT_ROOT),
                                capture_output=True, text=True, timeout=30, check=False)
             if r.returncode == 2 and "PCRE2" in r.stderr:
-                # PCRE2 not compiled in — retry with default engine
-                base2 = ["rg", "-n", "-S", "--max-count", str(max_hits), pattern]
+                base2 = ["rg", "-n", "-S", "-B2", "-A2",
+                          "--max-count", str(max_hits), pattern]
                 r = subprocess.run(base2 + search_paths, cwd=str(PROJECT_ROOT),
                                    capture_output=True, text=True, timeout=30, check=False)
             return r
@@ -2478,9 +2569,11 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         # Phase 1: search graph-relevant directories
         proc = _run_rg(graph_dirs) if graph_dirs else None
 
-        hits = []
+        hits: list[dict[str, Any]] = []
         if proc and proc.stdout.strip():
             for line in proc.stdout.splitlines():
+                if line.startswith("--"):
+                    continue
                 parts = line.split(":", 2)
                 if len(parts) == 3:
                     hits.append({"file": parts[0], "line": parts[1], "text": parts[2]})
@@ -2491,11 +2584,119 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         if not hits:
             proc = _run_rg(["."])
             for line in proc.stdout.splitlines():
+                if line.startswith("--"):
+                    continue
                 parts = line.split(":", 2)
                 if len(parts) == 3:
                     hits.append({"file": parts[0], "line": parts[1], "text": parts[2]})
                 if len(hits) >= max_hits:
                     break
+
+        # ── Symbol contextualization ──────────────────────────────────────
+        # Map each hit to its enclosing symbol and optionally include bodies
+        sym_idx = _load_symbol_index()
+        if sym_idx and hits:
+            # Build per-file symbol ranges for fast lookup
+            file_symbols: dict[str, list[tuple[int, int, str]]] = {}
+            for sym_id, meta in sym_idx.items():
+                path = meta.get("path", sym_id.split("::")[0])
+                ls, le = int(meta.get("line_start", 0)), int(meta.get("line_end", 0))
+                if ls and le:
+                    file_symbols.setdefault(path, []).append((ls, le, sym_id))
+            for syms in file_symbols.values():
+                syms.sort(key=lambda x: x[0])
+
+            # Annotate hits with enclosing symbol
+            seen_symbols: dict[str, int] = {}
+            for hit in hits:
+                fpath = hit["file"]
+                try:
+                    hit_line = int(hit["line"])
+                except (ValueError, TypeError):
+                    continue
+                syms = file_symbols.get(fpath, [])
+                for ls, le, sym_id in syms:
+                    if ls <= hit_line <= le:
+                        hit["symbol"] = sym_id
+                        hit["symbol_range"] = f"L{ls}-L{le}"
+                        seen_symbols[sym_id] = seen_symbols.get(sym_id, 0) + 1
+                        break
+
+            # Include full bodies for top hit symbols (budget-tracked)
+            # Cap: skip symbols > 80 lines (too large, agent should graph_read those)
+            MAX_BODY_LINES = 80
+            symbol_bodies: list[dict[str, Any]] = []
+            skipped_large: list[str] = []
+            if include_symbol_bodies and seen_symbols:
+                budget_used = int(TURN_STATE.get("used_chars", 0))
+                budget_max = int(TURN_STATE.get("char_budget", 60000))
+                remaining = budget_max - budget_used
+                top_syms = sorted(seen_symbols.items(), key=lambda x: -x[1])[:5]
+                for sym_id, hit_count in top_syms:
+                    if remaining <= 2000:
+                        break
+                    meta = sym_idx.get(sym_id, {})
+                    path = meta.get("path", sym_id.split("::")[0])
+                    ls = int(meta.get("line_start", 0))
+                    le = int(meta.get("line_end", 0))
+                    if not ls or not le:
+                        continue
+                    sym_lines = le - ls + 1
+                    if sym_lines > MAX_BODY_LINES:
+                        skipped_large.append(f"{sym_id} ({sym_lines} lines)")
+                        continue
+                    abs_path = PROJECT_ROOT / path
+                    if not abs_path.exists():
+                        continue
+                    try:
+                        lines = abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                        body = "\n".join(lines[ls - 1:le])
+                        if len(body) > remaining:
+                            body = body[:remaining] + "\n... [truncated]"
+                        symbol_bodies.append({
+                            "symbol": sym_id,
+                            "file": path,
+                            "lines": f"{ls}-{le}",
+                            "hit_count": hit_count,
+                            "body": body,
+                        })
+                        remaining -= len(body)
+                        TURN_STATE["used_chars"] = budget_used + (budget_max - remaining)
+                    except Exception:
+                        continue
+
+            # For hits NOT inside any symbol, read surrounding context (±5 lines)
+            # so the agent has enough context without needing graph_read
+            uncontextualized_expanded: list[dict[str, Any]] = []
+            if hits:
+                unctx_files: dict[str, list[dict]] = {}
+                for hit in hits:
+                    if "symbol" not in hit:
+                        unctx_files.setdefault(hit["file"], []).append(hit)
+                for fpath, file_hits in list(unctx_files.items())[:5]:
+                    abs_path = PROJECT_ROOT / fpath
+                    if not abs_path.exists():
+                        continue
+                    try:
+                        all_lines = abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    except Exception:
+                        continue
+                    for hit in file_hits[:3]:
+                        try:
+                            hl = int(hit["line"]) - 1
+                        except (ValueError, TypeError):
+                            continue
+                        ctx_start = max(0, hl - 5)
+                        ctx_end = min(len(all_lines), hl + 6)
+                        snippet = "\n".join(
+                            f"{'>' if i == hl else ' '} {i+1}: {all_lines[i]}"
+                            for i in range(ctx_start, ctx_end)
+                        )
+                        uncontextualized_expanded.append({
+                            "file": fpath,
+                            "line": hit["line"],
+                            "context": snippet,
+                        })
 
         TURN_STATE["fallback_calls"] = calls + 1
         TURN_STATE["total_grep_calls"] = int(TURN_STATE.get("total_grep_calls", 0)) + 1
@@ -2505,15 +2706,282 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             "searched_dirs": graph_dirs if hits and graph_dirs else ["(full project)"],
             "hit_files": list({h["file"] for h in hits[:10]}),
         })
-        # Deduplicate hit files for the next_step hint
-        hit_files_unique = list(dict.fromkeys(h["file"] for h in hits))[:5]
-        return {
+
+        result: dict[str, Any] = {
             "ok": True,
             "pattern": pattern,
             "hits": hits,
             "searched_dirs": graph_dirs if hits and graph_dirs else ["(full project)"],
-            "next_step": f"Now call graph_read on the relevant files found: {hit_files_unique}" if hit_files_unique else "No hits found. Try a different search term.",
         }
+        if symbol_bodies:
+            result["symbol_bodies"] = symbol_bodies
+            result["note"] = "Symbol bodies included inline — no need to call graph_read for these."
+        if skipped_large:
+            result["large_symbols_skipped"] = skipped_large
+            result["large_symbol_hint"] = "These symbols are too large to inline. Use graph_read(file::symbol) for details."
+        if uncontextualized_expanded:
+            result["expanded_context"] = uncontextualized_expanded
+        if not symbol_bodies and not uncontextualized_expanded:
+            hit_files_unique = list(dict.fromkeys(h["file"] for h in hits))[:5]
+            if hit_files_unique:
+                result["next_step"] = f"Call graph_read on: {hit_files_unique}"
+            else:
+                result["next_step"] = "No hits found. Try a different search term."
+        return result
+
+    @mcp.tool()
+    def graph_find_missing(have: str, lack: str, scope: str = "") -> dict[str, Any]:
+        """Find symbols that HAVE a property but LACK another (absence queries).
+
+        Examples:
+          graph_find_missing(have="api_route", lack="auth")
+            → routes without auth middleware
+          graph_find_missing(have="exported", lack="test")
+            → exported symbols without test coverage
+          graph_find_missing(have="api_route", lack="validate")
+            → endpoints without input validation
+
+        Args:
+            have: What symbols must have. Values: "api_route", "hook", "model",
+                  "use_case", "exported", or any keyword/annotation substring.
+            lack: What symbols must NOT have. Checked against annotations and
+                  importers. Values: "auth", "validate", "test", or any substring.
+            scope: Optional file path prefix to scope the search (e.g. "src/api/").
+        """
+        graph = _local_info_graph()
+        if not graph:
+            return {"ok": False, "error": "Graph not available. Run graph_scan first."}
+
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+
+        # Build importer index: who imports each file?
+        # Use resolved_to (absolute file ID) when available, fall back to raw 'to'.
+        importers: dict[str, set[str]] = {}
+        for e in edges:
+            if e.get("rel") in ("imports", "requires"):
+                target = e.get("resolved_to") or e.get("to", "")
+                if target:
+                    importers.setdefault(target, set()).add(e["from"])
+
+        # Collect candidate symbols matching `have`
+        have_lower = have.lower()
+        candidates: list[dict] = []
+        for node in nodes:
+            if node.get("kind") != "symbol":
+                continue
+            if scope and not node.get("path", "").startswith(scope):
+                continue
+            match = False
+            if have_lower == "exported" and node.get("exported"):
+                match = True
+            elif have_lower == node.get("symbol_type", ""):
+                match = True
+            elif have_lower in (node.get("symbol_type", "") or ""):
+                match = True
+            elif any(have_lower in kw for kw in node.get("keywords", [])):
+                match = True
+            elif any(have_lower in (a or "").lower() for a in (node.get("annotations") or [])):
+                match = True
+            if match:
+                candidates.append(node)
+
+        # Filter to those that LACK the specified property
+        lack_lower = lack.lower()
+        missing: list[dict] = []
+        for node in candidates:
+            has_it = False
+            # Check annotations
+            for ann in (node.get("annotations") or []):
+                if lack_lower in ann.lower():
+                    has_it = True
+                    break
+            # Check keywords
+            if not has_it:
+                for kw in node.get("keywords", []):
+                    if lack_lower in kw:
+                        has_it = True
+                        break
+            # For "test": check if any importer is a test file
+            if not has_it and lack_lower == "test":
+                file_path = node.get("path", "")
+                file_importers = importers.get(file_path, set())
+                for imp in file_importers:
+                    if "test" in imp.lower() or "spec" in imp.lower() or "__tests__" in imp:
+                        has_it = True
+                        break
+            if not has_it:
+                missing.append({
+                    "symbol": node.get("id", ""),
+                    "file": node.get("path", ""),
+                    "name": node.get("name", ""),
+                    "symbol_type": node.get("symbol_type", ""),
+                    "line": node.get("line_start", 0),
+                    "annotations": node.get("annotations") or [],
+                })
+
+        _log_tool("graph_find_missing", {"have": have, "lack": lack, "scope": scope,
+                                          "candidates": len(candidates), "missing": len(missing)})
+        return {
+            "ok": True,
+            "have": have,
+            "lack": lack,
+            "scope": scope or "(all)",
+            "total_matching_have": len(candidates),
+            "missing_count": len(missing),
+            "missing": missing[:50],
+            "note": f"Found {len(missing)} symbols that have '{have}' but lack '{lack}'."
+                    + (" (showing first 50)" if len(missing) > 50 else ""),
+        }
+
+    @mcp.tool()
+    def graph_dynamic_trace(key: str, kind: str = "auto") -> dict[str, Any]:
+        """Trace runtime/dynamic patterns: DI container resolution or event flow.
+
+        Examples:
+          graph_dynamic_trace(key="orderService", kind="di")
+            → shows who registers and who resolves "orderService"
+          graph_dynamic_trace(key="order.created", kind="event")
+            → shows who emits and who subscribes to "order.created"
+          graph_dynamic_trace(key="order")
+            → auto-detects: searches both DI keys and event names
+
+        Args:
+            key: The DI service key or event name to trace.
+            kind: "di", "event", or "auto" (searches both).
+        """
+        graph = _local_info_graph()
+        if not graph:
+            return {"ok": False, "error": "Graph not available. Run graph_scan first."}
+
+        dyn = graph.get("dynamic_registry", {})
+        if not dyn:
+            return {"ok": False, "error": "Dynamic registry not built. Re-run graph_scan.",
+                    "hint": "The graph was built before this feature. Rebuild with latest graph_builder."}
+
+        di_reg = dyn.get("di", {})
+        events_reg = dyn.get("events", {})
+        results: dict[str, Any] = {"ok": True, "key": key, "kind": kind}
+
+        if kind in ("di", "auto"):
+            # Search DI registry — exact match and partial match
+            di_matches: dict[str, dict] = {}
+            for dk, data in di_reg.items():
+                if dk == key or key.lower() in dk.lower():
+                    di_matches[dk] = data
+            if di_matches:
+                results["di"] = di_matches
+
+        if kind in ("event", "auto"):
+            # Search event registry — exact match and partial match
+            event_matches: dict[str, dict] = {}
+            for ek, data in events_reg.items():
+                if ek == key or key.lower() in ek.lower():
+                    event_matches[ek] = data
+            if event_matches:
+                results["events"] = event_matches
+
+        found_di = bool(results.get("di"))
+        found_events = bool(results.get("events"))
+        if not found_di and not found_events:
+            # Try broader search
+            all_di_keys = list(di_reg.keys())
+            all_event_keys = list(events_reg.keys())
+            results["found"] = False
+            results["note"] = f"No matches for '{key}'. Available DI keys: {len(all_di_keys)}, event names: {len(all_event_keys)}."
+            results["similar_di"] = [k for k in all_di_keys if any(w in k.lower() for w in key.lower().split("."))][:10]
+            results["similar_events"] = [k for k in all_event_keys if any(w in k.lower() for w in key.lower().split("."))][:10]
+        else:
+            results["found"] = True
+            parts = []
+            if found_di:
+                for dk, data in results["di"].items():
+                    parts.append(f"DI '{dk}': {len(data.get('registers',[]))} registers, {len(data.get('resolves',[]))} resolves")
+            if found_events:
+                for ek, data in results["events"].items():
+                    parts.append(f"Event '{ek}': {len(data.get('emitters',[]))} emitters, {len(data.get('subscribers',[]))} subscribers")
+            results["note"] = "; ".join(parts)
+
+        _log_tool("graph_dynamic_trace", {"key": key, "kind": kind, "found": results.get("found", False)})
+        return results
+
+    @mcp.tool()
+    def graph_external_usage(package: str, symbol: str = "") -> dict[str, Any]:
+        """Find which files import a specific symbol from an external package.
+
+        Examples:
+          graph_external_usage(package="@medusajs/framework", symbol="container")
+          graph_external_usage(package="zod")  # all imports from zod
+          graph_external_usage(package="react", symbol="useState")
+
+        Args:
+            package: The package name (e.g., "@medusajs/framework", "zod", "express").
+            symbol: Optional specific export to look up. If empty, returns all symbols
+                    imported from that package.
+        """
+        graph = _local_info_graph()
+        if not graph:
+            return {"ok": False, "error": "Graph not available. Run graph_scan first."}
+
+        ext_idx = graph.get("external_usage_index", {})
+        if not ext_idx:
+            return {"ok": False, "error": "External usage index not built. Re-run graph_scan to generate it.",
+                    "hint": "The graph was built before this feature existed. Rebuild with the latest graph_builder."}
+
+        # Find matching packages (support partial match for scoped packages)
+        matched_pkgs: dict[str, dict[str, list[str]]] = {}
+        for pkg_name, symbols in ext_idx.items():
+            if pkg_name == package or pkg_name.startswith(package + "/") or package in pkg_name:
+                matched_pkgs[pkg_name] = symbols
+
+        if not matched_pkgs:
+            return {"ok": True, "package": package, "symbol": symbol,
+                    "found": False, "note": f"No imports from '{package}' found in this codebase."}
+
+        if symbol:
+            # Look up specific symbol across matched packages
+            files: list[str] = []
+            for pkg_name, symbols_map in matched_pkgs.items():
+                for sym_name, file_list in symbols_map.items():
+                    if sym_name == symbol or symbol.lower() in sym_name.lower():
+                        files.extend(file_list)
+            # If not found in matched packages, search ALL packages for this symbol
+            # (handles re-exports: same symbol exported from different subpaths)
+            if not files:
+                for pkg_name, symbols_map in ext_idx.items():
+                    if pkg_name in matched_pkgs:
+                        continue
+                    for sym_name, file_list in symbols_map.items():
+                        if sym_name == symbol:
+                            files.extend(file_list)
+            files = list(dict.fromkeys(files))  # dedupe
+            return {
+                "ok": True,
+                "package": package,
+                "symbol": symbol,
+                "found": bool(files),
+                "files": files[:30],
+                "count": len(files),
+                "note": f"'{symbol}' from '{package}' is imported in {len(files)} files."
+                        + (" (showing first 30)" if len(files) > 30 else "")
+                        + (" (includes re-exports from related packages)" if len(files) > 0 and not matched_pkgs else ""),
+            }
+        else:
+            # Return all symbols imported from this package
+            all_symbols: dict[str, int] = {}
+            for pkg_name, symbols_map in matched_pkgs.items():
+                for sym_name, file_list in symbols_map.items():
+                    all_symbols[sym_name] = all_symbols.get(sym_name, 0) + len(file_list)
+            sorted_syms = sorted(all_symbols.items(), key=lambda x: -x[1])
+            return {
+                "ok": True,
+                "package": package,
+                "found": bool(all_symbols),
+                "symbols": [{"name": s, "import_count": c} for s, c in sorted_syms[:40]],
+                "total_symbols": len(all_symbols),
+                "matched_packages": list(matched_pkgs.keys()),
+                "note": f"{len(all_symbols)} symbols imported from '{package}' across the codebase.",
+            }
 
     @mcp.tool()
     def cross_search(pattern: str, path: str, max_hits: int = 50) -> dict[str, Any]:

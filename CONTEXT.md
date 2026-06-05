@@ -1,25 +1,14 @@
 # Session Context
 
 ## Current Task
-Building GrapeRoot Enterprise: full project intelligence layer targeting enterprise engineering teams.
-`graperoot-enterprise/` folder created with CONTEXT.md, MIGRATION.md, CLAUDE.md, plan.md.
-
-## Competitive Intel (scraped May 28 2026)
-- Graphify: 55,370 stars, 900k downloads, YC S26, solo founder
-- Tagline: "Any input. One graph. Complete recall."
-- Enterprise product "Penpax" = waitlist only, NOT shipped — we ship first
-- Pricing: free MIT forever, no paid tier announced
+License server fully operational: KV sync, dedup, Razorpay removed, Railway on GitHub auto-deploy.
 
 ## Key Decisions
-- **Enterprise = Pro + 16 new features**: full Graphify parity + 8 exclusive intel features
-- **30/34 features matched or exceeded** vs Graphify (23/34)
-- Added from scrape: design rationale extraction (WHY/NOTE/HACK), confidence tags (EXTRACTED/INFERRED/AMBIGUOUS), god nodes, surprising connections, suggested questions, SQL ingestion, MCP config ingestion, Google Workspace, Neo4j export, SVG export
-- **New server: mcp_graph_server_v7.6.py** (8 new MCP tools, 23 total)
-- **New builder: graph_builder_v6.3.py** (multi-modal + Leiden + rationale + confidence + intel)
-- **First-scan setup: 5 prompts** (added GWS prompt)
+- **Railway deploys via GitHub** (`kunal12203/graperoot-license-server`) — `git push` = auto-deploy. Never use `railway up` (gitignore breaks uploads).
+- **KV sync fixed**: Cloudflare blocked bare `urllib.request` (no User-Agent) → added `GrapeRoot-License-Server/1.0` header.
+- **Duplicate key/email fix**: `INSERT OR IGNORE` + `welcome_email_sent` flag + unique index on `lemonsqueezy_subscription_id`. Razorpay code fully removed.
 
 ## Next Steps
-- Implement Phase 1: graph_watcher.py + graph_watch MCP tool
-- Implement Phase 2: graph_multimodal.py + SQL/GWS/MCP config ingestion + 5-prompt setup
-- Implement Phase 3: Leiden + design rationale + confidence tags in graph_builder_v6.3.py
-- Then Phase 4 (viz: god nodes, surprising connections, suggested questions) and Phase 5 (8 intel)
+- Fix 4 remaining bugs from adversarial testing: comment-@auth false positive, @author false positive, empty string in graph_find_missing, unicode identifiers
+- Implement Phase 5: control flow annotations (empty catch, await-in-loop, N+1)
+- Test on coir repo (https://github.com/coir-team/coir)
