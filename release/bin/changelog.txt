@@ -1,3 +1,10 @@
+1.0.37  (2026-06-05)
+- Added: gap-aware query intent routing — detects content_search, control_flow,
+  absence_query, and dynamic_trace queries before confidence classification.
+  Adjusts confidence and strategy so the right exploration tool is used instead
+  of blind file reads. Fixes false-high-confidence on "find empty catch blocks",
+  "routes without auth", "hardcoded secrets", etc.
+
 1.0.29  (2026-05-27)
 - FIXED: existing users who installed before v1.0.28 can now run `dgc-pro .`
   to get dg-pro and graperoot-pro working immediately — no reinstall needed.
