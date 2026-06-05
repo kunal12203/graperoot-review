@@ -1,3 +1,23 @@
+import {
+  claimWelcomeEmail,
+  getLicense,
+  insertAudit,
+  isExpired,
+  issueLicenseRecord,
+  licenseStats,
+  listLicenses,
+  markWelcomeEmailSent,
+  recordActivation,
+  recordWebhookEvent,
+  releaseWelcomeEmailClaim,
+  removeActivation,
+  setSubscriptionState,
+  updateLicenseFields,
+  upsertLicense,
+  upsertSubscriptionLicense,
+} from "./storage.js";
+import { sendWelcomeEmail } from "./email.js";
+
 /**
  * GrapeRoot Pro — License + Release + Dashboard Worker
  *
@@ -92,6 +112,15 @@ function clientIp(req) {
          "unknown";
 }
 
+function normalizeActivationHost(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized || "unknown";
+}
+
+function activationSeatKey(value) {
+  return normalizeActivationHost(value).toLowerCase();
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Rate limiting (KV-backed, per-IP, per-bucket, per-window)
 // Uses fixed windows of `windowSec` seconds (good enough for our threat model).
@@ -128,7 +157,6 @@ async function rateLimit(req, env, bucket, limit, windowSec) {
 const AUDIT_TTL_S = 90 * 24 * 3600;
 
 async function audit(env, req, action, details = {}) {
-  if (!env.AUDIT_LOG) return;  // optional — fail silently if not bound yet
   const entry = {
     ts: new Date().toISOString(),
     action,
@@ -138,7 +166,10 @@ async function audit(env, req, action, details = {}) {
   };
   const k = `audit:${entry.ts}-${Math.random().toString(36).slice(2, 10)}`;
   try {
-    await env.AUDIT_LOG.put(k, JSON.stringify(entry), { expirationTtl: AUDIT_TTL_S });
+    if (env.AUDIT_LOG) {
+      await env.AUDIT_LOG.put(k, JSON.stringify(entry), { expirationTtl: AUDIT_TTL_S });
+    }
+    await insertAudit(env, entry);
   } catch {}  // never let logging failure break an operation
 }
 
@@ -201,7 +232,7 @@ async function requireSession(req, env) {
   if (!env.SESSION_SECRET) return null;
   const payload = await verifySession(token, env.SESSION_SECRET);
   if (!payload?.key) return null;
-  const record = await env.LICENSES.get(payload.key, { type: "json" });
+  const record = await getLicense(env, payload.key);
   if (!record || record.revoked) return null;
   return { payload, record };
 }
@@ -212,28 +243,25 @@ async function verifyLicense(req, env) {
   const body = await req.json().catch(() => ({}));
   const { license_key, host, os } = body;
   if (!license_key) return jsonResp({ valid: false, reason: "missing license_key" }, 400);
+  const safeHost = String(host || "").trim();
 
-  const record = await env.LICENSES.get(license_key, { type: "json" });
+  const record = await getLicense(env, license_key, { withActivations: true });
   if (!record) return jsonResp({ valid: false, reason: "unknown license key" }, 404);
   if (record.revoked) return jsonResp({ valid: false, reason: "license revoked — contact support" }, 403);
 
-  if (record.expires && record.expires !== "perpetual") {
-    if (new Date(record.expires) < new Date()) {
-      return jsonResp({ valid: false, reason: `license expired on ${record.expires}` }, 403);
-    }
+  if (isExpired(record)) {
+    return jsonResp({ valid: false, reason: `license expired on ${record.expires}` }, 403);
   }
 
   // Seat enforcement — unique hostnames, bounded by `seats`
   if (record.seats && Array.isArray(record.activations)) {
-    const uniqueHosts = new Set(record.activations.map(a => a.host));
-    if (host && !uniqueHosts.has(host) && uniqueHosts.size >= record.seats) {
+    const uniqueHosts = new Set(record.activations.map(a => activationSeatKey(a.host)));
+    if (safeHost && !uniqueHosts.has(activationSeatKey(safeHost)) && uniqueHosts.size >= record.seats) {
       return jsonResp({ valid: false, reason: `seat limit (${record.seats}) reached — contact support` }, 403);
     }
   }
 
-  record.activations = (record.activations || []).slice(-500);
-  record.activations.push({ host: host || "unknown", os: os || "unknown", ts: new Date().toISOString() });
-  await env.LICENSES.put(license_key, JSON.stringify(record));
+  await recordActivation(env, record, safeHost || "unknown", os || "unknown");
 
   const download_url = `${new URL(req.url).origin}/v1/release/asset?k=${encodeURIComponent(license_key)}`;
   return jsonResp({
@@ -257,13 +285,13 @@ async function streamAsset(req, env) {
   // the /verify call hasn't propagated yet.
   let record = null;
   for (let i = 0; i < 4; i++) {
-    record = await env.LICENSES.get(key, { type: "json" });
+    record = await getLicense(env, key);
     if (record) break;
     await new Promise(r => setTimeout(r, 200 * (i + 1)));   // 200, 400, 600, 800 ms
   }
   if (!record) return new Response(`license not found in KV after retries (key=${key})`, { status: 403 });
   if (record.revoked) return new Response("license revoked", { status: 403 });
-  if (record.expires !== "perpetual" && record.expires && new Date(record.expires) < new Date()) {
+  if (isExpired(record)) {
     return new Response("license expired", { status: 403 });
   }
 
@@ -335,6 +363,36 @@ async function requireAdmin(req, env) {
   return safeEquals(got, want);
 }
 
+function dateOnlyString(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value).slice(0, 10);
+  return d.toISOString().slice(0, 10);
+}
+
+function bytesToHex(bytes) {
+  return [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function hmacSha256Hex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return bytesToHex(sig);
+}
+
+async function verifyLemonSqueezySignature(req, env, raw) {
+  if (!env.LEMONSQUEEZY_WEBHOOK_SECRET) return false;
+  const got = req.headers.get("X-Signature") || "";
+  const expected = await hmacSha256Hex(env.LEMONSQUEEZY_WEBHOOK_SECRET, raw);
+  return safeEquals(got, expected);
+}
+
 async function issueLicense(req, env) {
   const rl = await rateLimit(req, env, "admin", 60, 60);
   if (rl) return rl;
@@ -346,7 +404,7 @@ async function issueLicense(req, env) {
   const { customer, email, tier = "pro", seats = 3, expires = "perpetual" } = body;
   if (!customer || !email) return jsonResp({ error: "customer and email required" }, 400);
   const key = body.key || generateKey();
-  const existing = await env.LICENSES.get(key, { type: "json" });
+  const existing = await getLicense(env, key);
   if (existing && !body.key) {
     return jsonResp({ error: "key collision, retry" }, 409);
   }
@@ -355,7 +413,7 @@ async function issueLicense(req, env) {
     issued: new Date().toISOString().slice(0, 10),
     revoked: false, activations: [],
   };
-  await env.LICENSES.put(key, JSON.stringify(record));
+  await issueLicenseRecord(env, record, { source: body.key ? "sync" : "admin_api" });
   await audit(env, req, "license_issued", { key, customer, email, tier, seats, expires, synced: !!body.key });
   return jsonResp({ ok: true, license: record });
 }
@@ -368,15 +426,137 @@ async function revokeLicense(req, env) {
     return jsonResp({ error: "unauthorized" }, 401);
   }
   const { license_key } = await req.json();
-  const record = await env.LICENSES.get(license_key, { type: "json" });
+  const record = await getLicense(env, license_key);
   if (!record) {
     await audit(env, req, "revoke_not_found", { key: license_key });
     return jsonResp({ error: "not found" }, 404);
   }
   record.revoked = true;
-  await env.LICENSES.put(license_key, JSON.stringify(record));
+  await upsertLicense(env, record, { source: "admin_api" });
   await audit(env, req, "license_revoked", { key: license_key, customer: record.customer });
   return jsonResp({ ok: true, license: record });
+}
+
+async function handleLemonSqueezyWebhook(req, env) {
+  const raw = await req.text();
+  if (!(await verifyLemonSqueezySignature(req, env, raw))) {
+    await audit(env, req, "lemonsqueezy_bad_signature");
+    return jsonResp({ ok: false, error: "invalid signature" }, 401);
+  }
+
+  let body;
+  try {
+    body = JSON.parse(raw || "{}");
+  } catch {
+    return jsonResp({ ok: false, error: "invalid json" }, 400);
+  }
+
+  const meta = body.meta || {};
+  const data = body.data || {};
+  const attrs = data.attributes || {};
+  const event = req.headers.get("X-Event-Name") || meta.event_name || "";
+  const subId = String(data.id || "").trim();
+  const eventId = String(
+    meta.webhook_id || meta.event_id || body.id ||
+    `${event}:${subId}:${attrs.updated_at || attrs.created_at || attrs.status || ""}`,
+  );
+
+  if (env.LEMONSQUEEZY_VARIANT_ID) {
+    const variantId = String(attrs.variant_id || "");
+    if (event === "subscription_created" && !variantId) {
+      await audit(env, req, "lemonsqueezy_missing_variant", { event });
+      return jsonResp({ ok: true, ignored: "missing_variant" });
+    }
+    if (variantId && variantId !== String(env.LEMONSQUEEZY_VARIANT_ID)) {
+      await audit(env, req, "lemonsqueezy_wrong_variant", { event, variantId });
+      return jsonResp({ ok: true, ignored: "wrong_variant" });
+    }
+  }
+
+  if (!subId) return jsonResp({ ok: false, error: "missing subscription id" }, 400);
+
+  // Record the webhook event for audit/idempotency. subscription_created is still
+  // handled below because the subscription unique constraint is the real guard.
+  const firstDelivery = await recordWebhookEvent(env, "lemonsqueezy", eventId, event, body);
+  if (!firstDelivery && event !== "subscription_created") {
+    return jsonResp({ ok: true, duplicate: true, event });
+  }
+
+  if (event === "subscription_created") {
+    const email = String(attrs.user_email || "").trim().toLowerCase();
+    const userName = String(attrs.user_name || "").trim();
+    const firstName = userName.split(/\s+/)[0] || "";
+    const trialEndsAt = attrs.trial_ends_at || "";
+    const isTrial = !!trialEndsAt;
+    if (!email) return jsonResp({ ok: false, error: "missing user_email" }, 400);
+
+    const key = generateKey();
+    const record = await upsertSubscriptionLicense(env, {
+      key,
+      customer: userName || email.split("@")[0],
+      email,
+      tier: "pro",
+      seats: 3,
+      expires: isTrial ? dateOnlyString(trialEndsAt) : "perpetual",
+      issued: new Date().toISOString().slice(0, 10),
+      revoked: false,
+      activations: [],
+    }, subId);
+
+    const claimed = await claimWelcomeEmail(env, record.key);
+    if (claimed) {
+      try {
+        await sendWelcomeEmail(env, {
+          email,
+          firstName,
+          key: record.key,
+          isTrial,
+          trialEndsAt,
+          seats: record.seats,
+        });
+        await markWelcomeEmailSent(env, record.key);
+        await audit(env, req, "lemonsqueezy_welcome_email_sent", { key: record.key, email, subId });
+      } catch (e) {
+        await releaseWelcomeEmailClaim(env, record.key);
+        await audit(env, req, "lemonsqueezy_welcome_email_failed", {
+          key: record.key,
+          email,
+          subId,
+          error: String(e?.message || e).slice(0, 300),
+        });
+      }
+    }
+
+    await audit(env, req, "lemonsqueezy_subscription_created", {
+      key: record.key,
+      email,
+      subId,
+      trial: isTrial,
+      duplicate: record.key !== key,
+    });
+    return jsonResp({ ok: true, key: record.key, is_trial: isTrial, duplicate: record.key !== key });
+  }
+
+  if (event === "subscription_payment_success") {
+    const record = await setSubscriptionState(env, subId, { tier: "pro", expires: "perpetual", revoked: false });
+    await audit(env, req, "lemonsqueezy_payment_success", { subId, key: record?.key || "" });
+    return jsonResp({ ok: true, event: "payment_success" });
+  }
+
+  if (event === "subscription_cancelled") {
+    const record = await setSubscriptionState(env, subId, { revoked: true });
+    await audit(env, req, "lemonsqueezy_cancelled", { subId, key: record?.key || "" });
+    return jsonResp({ ok: true, event: "cancelled" });
+  }
+
+  if (event === "subscription_resumed") {
+    const record = await setSubscriptionState(env, subId, { revoked: false });
+    await audit(env, req, "lemonsqueezy_resumed", { subId, key: record?.key || "" });
+    return jsonResp({ ok: true, event: "resumed" });
+  }
+
+  await audit(env, req, "lemonsqueezy_ignored", { event, subId });
+  return jsonResp({ ok: true, event, ignored: true });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -393,7 +573,7 @@ async function dashboardLogin(req, env) {
     await audit(env, req, "dashboard_login_bad_format");
     return jsonResp({ ok: false, error: "invalid key format" }, 400, cors);
   }
-  const record = await env.LICENSES.get(key, { type: "json" });
+  const record = await getLicense(env, key);
   if (!record) {
     await audit(env, req, "dashboard_login_unknown", { key });
     return jsonResp({ ok: false, error: "unknown license key" }, 404, cors);
@@ -402,11 +582,9 @@ async function dashboardLogin(req, env) {
     await audit(env, req, "dashboard_login_revoked", { key });
     return jsonResp({ ok: false, error: "license revoked — contact support" }, 403, cors);
   }
-  if (record.expires && record.expires !== "perpetual") {
-    if (new Date(record.expires) < new Date()) {
-      await audit(env, req, "dashboard_login_expired", { key });
-      return jsonResp({ ok: false, error: `license expired on ${record.expires}` }, 403, cors);
-    }
+  if (isExpired(record)) {
+    await audit(env, req, "dashboard_login_expired", { key });
+    return jsonResp({ ok: false, error: `license expired on ${record.expires}` }, 403, cors);
   }
   if (!env.SESSION_SECRET) {
     return jsonResp({ ok: false, error: "session signing not configured" }, 500, cors);
@@ -444,11 +622,12 @@ async function dashboardLicense(req, env) {
   const cors = corsHeaders(req, env);
   const session = await requireSession(req, env);
   if (!session) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
-  const r = session.record;
+  const r = await getLicense(env, session.record.key, { withActivations: true });
+  if (!r) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
   // Unique device count from activations
   const unique = {};
   for (const a of (r.activations || [])) {
-    const k = `${a.host}|${a.os}`;
+    const k = activationSeatKey(a.host);
     if (!unique[k] || a.ts > unique[k].ts) unique[k] = a;
   }
   const devices = Object.values(unique).sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
@@ -516,25 +695,16 @@ async function adminWebListLicenses(req, env) {
   const cors = corsHeaders(req, env);
   if (!(await requireAdminWeb(req, env))) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
   const url = new URL(req.url);
-  const cursor = url.searchParams.get("cursor") || undefined;
   const limit  = Math.min(parseInt(url.searchParams.get("limit") || "100", 10), 1000);
-  const list = await env.LICENSES.list({ prefix: "GRP-", cursor, limit });
-  const records = await Promise.all(
-    list.keys.map(async k => {
-      const r = await env.LICENSES.get(k.name, { type: "json" });
-      if (!r) return null;
-      const seats_used = new Set((r.activations || []).map(a => a.host)).size;
-      return {
-        key: r.key, customer: r.customer, email: r.email, tier: r.tier,
-        seats: r.seats, seats_used, expires: r.expires, issued: r.issued,
-        revoked: !!r.revoked,
-      };
-    })
-  );
+  const records = await listLicenses(env, { limit });
   return jsonResp({
     ok: true,
-    licenses: records.filter(Boolean).sort((a, b) => (b.issued || "").localeCompare(a.issued || "")),
-    cursor: list.list_complete ? null : list.cursor,
+    licenses: records.map(r => ({
+      key: r.key, customer: r.customer, email: r.email, tier: r.tier,
+      seats: r.seats, seats_used: r.seats_used ?? new Set((r.activations || []).map(a => activationSeatKey(a.host))).size,
+      expires: r.expires, issued: r.issued, revoked: !!r.revoked,
+    })),
+    cursor: null,
   }, 200, cors);
 }
 
@@ -542,11 +712,11 @@ async function adminWebGetLicense(req, env) {
   const cors = corsHeaders(req, env);
   if (!(await requireAdminWeb(req, env))) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
   const key = new URL(req.url).pathname.split("/").pop();
-  const r = await env.LICENSES.get(key, { type: "json" });
+  const r = await getLicense(env, key, { withActivations: true });
   if (!r) return jsonResp({ ok: false, error: "not found" }, 404, cors);
   const unique = {};
   for (const a of (r.activations || [])) {
-    const k = `${a.host}|${a.os}`;
+    const k = activationSeatKey(a.host);
     if (!unique[k] || a.ts > unique[k].ts) unique[k] = a;
   }
   return jsonResp({
@@ -566,14 +736,13 @@ async function adminWebUpdateLicense(req, env) {
   const parts = new URL(req.url).pathname.split("/");
   const key = parts[parts.length - 2];
   const body = await req.json().catch(() => ({}));
-  const r = await env.LICENSES.get(key, { type: "json" });
-  if (!r) return jsonResp({ ok: false, error: "not found" }, 404, cors);
   const allowed = ["customer", "email", "tier", "seats", "expires", "revoked"];
   const changed = {};
   for (const f of allowed) {
-    if (Object.prototype.hasOwnProperty.call(body, f)) { changed[f] = body[f]; r[f] = body[f]; }
+    if (Object.prototype.hasOwnProperty.call(body, f)) changed[f] = body[f];
   }
-  await env.LICENSES.put(key, JSON.stringify(r));
+  const r = await updateLicenseFields(env, key, changed);
+  if (!r) return jsonResp({ ok: false, error: "not found" }, 404, cors);
   await audit(env, req, "admin_web_license_updated", { key, changed });
   return jsonResp({ ok: true, license: r }, 200, cors);
 }
@@ -587,11 +756,11 @@ async function adminWebRevokeDevice(req, env) {
   const body = await req.json().catch(() => ({}));
   const host = body.host;
   if (!host) return jsonResp({ ok: false, error: "missing host" }, 400, cors);
-  const r = await env.LICENSES.get(key, { type: "json" });
+  const existing = await getLicense(env, key, { withActivations: true });
+  if (!existing) return jsonResp({ ok: false, error: "not found" }, 404, cors);
+  const before = (existing.activations || []).length;
+  const r = await removeActivation(env, key, host);
   if (!r) return jsonResp({ ok: false, error: "not found" }, 404, cors);
-  const before = (r.activations || []).length;
-  r.activations = (r.activations || []).filter(a => a.host !== host);
-  await env.LICENSES.put(key, JSON.stringify(r));
   await audit(env, req, "admin_web_device_revoked", { key, host });
   return jsonResp({ ok: true, removed: before - r.activations.length }, 200, cors);
 }
@@ -599,22 +768,9 @@ async function adminWebRevokeDevice(req, env) {
 async function adminWebStats(req, env) {
   const cors = corsHeaders(req, env);
   if (!(await requireAdminWeb(req, env))) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
-  const list = await env.LICENSES.list({ prefix: "GRP-", limit: 1000 });
-  let total = 0, active = 0, revoked = 0, expired = 0, totalSeats = 0, usedSeats = 0;
-  const now = new Date();
-  for (const k of list.keys) {
-    const r = await env.LICENSES.get(k.name, { type: "json" });
-    if (!r) continue;
-    total++;
-    if (r.revoked) { revoked++; continue; }
-    if (r.expires && r.expires !== "perpetual" && new Date(r.expires) < now) { expired++; continue; }
-    active++;
-    totalSeats += (r.seats || 0);
-    usedSeats += new Set((r.activations || []).map(a => a.host)).size;
-  }
   return jsonResp({
     ok: true,
-    stats: { total_licenses: total, active, revoked, expired, total_seats: totalSeats, used_seats: usedSeats },
+    stats: await licenseStats(env),
   }, 200, cors);
 }
 
@@ -651,7 +807,7 @@ async function adminWebIssue(req, env) {
     issued: new Date().toISOString().slice(0, 10),
     revoked: false, activations: [],
   };
-  await env.LICENSES.put(key, JSON.stringify(record));
+  await issueLicenseRecord(env, record, { source: "admin_web" });
   await audit(env, req, "admin_web_license_issued", { key, customer, email, tier, seats, expires });
   return jsonResp({ ok: true, license: record }, 200, cors);
 }
@@ -664,11 +820,11 @@ async function dashboardRevokeDevice(req, env) {
   const body = await req.json().catch(() => ({}));
   const host = body.host;
   if (!host) return jsonResp({ ok: false, error: "missing host" }, 400, cors);
-  const r = session.record;
-  const before = (r.activations || []).length;
-  r.activations = (r.activations || []).filter(a => a.host !== host);
-  await env.LICENSES.put(r.key, JSON.stringify(r));
-  await audit(env, req, "device_revoked", { key: r.key, host, removed: before - r.activations.length });
+  const current = await getLicense(env, session.record.key, { withActivations: true });
+  if (!current) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
+  const before = (current.activations || []).length;
+  const r = await removeActivation(env, current.key, host);
+  await audit(env, req, "device_revoked", { key: current.key, host, removed: before - r.activations.length });
   return jsonResp({ ok: true, removed: before - r.activations.length, remaining_activations: r.activations.length }, 200, cors);
 }
 
@@ -687,6 +843,9 @@ async function route(req, env) {
     if (url.pathname === "/v1/release/asset"          && req.method === "GET")  return streamAsset(req, env);
     if (url.pathname === "/v1/admin/issue"            && req.method === "POST") return issueLicense(req, env);
     if (url.pathname === "/v1/admin/revoke"           && req.method === "POST") return revokeLicense(req, env);
+    if ((url.pathname === "/lemonsqueezy-webhook" || url.pathname === "/v1/lemonsqueezy/webhook") && req.method === "POST") {
+      return handleLemonSqueezyWebhook(req, env);
+    }
 
     // Customer dashboard
     if (url.pathname === "/v1/dashboard/login"        && req.method === "POST") return dashboardLogin(req, env);
