@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.38: usage telemetry pipeline — NeonDB ingest + dashboard API for savings visualization
+
 v1.0.37: gap-aware query intent routing — detects content/control-flow/absence/dynamic queries
          and adjusts confidence so the right exploration tool is used (no more blind file reads)
 
@@ -484,6 +486,45 @@ def write_hooks(project: Path, data_dir: Path) -> None:
     print(f"[dgc-pro] Graph Gate + Sync hooks registered", flush=True)
 
 
+def write_stop_hook(project: Path, port: int) -> None:
+    """Register a Stop hook that pushes session usage to /session/end on the MCP server."""
+    settings_dir = project / ".claude"
+    settings_dir.mkdir(exist_ok=True)
+    settings_file = settings_dir / "settings.local.json"
+    existing = {}
+    if settings_file.exists():
+        try:
+            existing = json.loads(settings_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    python = sys.executable
+    stop_script = (
+        f'{python} -c "'
+        "import sys,json,urllib.request;"
+        "d=json.load(sys.stdin);"
+        "u=d.get('usage',{});"
+        "p=json.dumps({"
+        "'session_id':d.get('session_id',''),"
+        "'model':d.get('model','claude-sonnet-4-6'),"
+        "'input_tokens':u.get('input_tokens',0),"
+        "'output_tokens':u.get('output_tokens',0),"
+        "'cache_creation_input_tokens':u.get('cache_creation_input_tokens',0),"
+        "'cache_read_input_tokens':u.get('cache_read_input_tokens',0),"
+        "'total_turns':d.get('total_turns',0)"
+        "}).encode();"
+        f"urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:{port}/session/end',"
+        "data=p,headers={'Content-Type':'application/json'},method='POST'),timeout=5)"
+        '"'
+    )
+    stop_entry = {"matcher": "", "hooks": [{"type": "command", "command": stop_script}]}
+    hooks = existing.setdefault("hooks", {})
+    old_stop = hooks.get("Stop", [])
+    hooks["Stop"] = [e for e in old_stop if "session/end" not in json.dumps(e)]
+    hooks["Stop"].append(stop_entry)
+    existing["hooks"] = hooks
+    settings_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+
+
 def write_gemini_hooks(project: Path, data_dir: Path) -> None:
     """Register BeforeTool (graph gate) hook in .gemini/settings.json.
 
@@ -759,7 +800,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.37"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.38"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
@@ -822,6 +863,7 @@ def main() -> None:
     # Codex and opencode have no hook mechanism — policy doc is the only enforcement.
     if tool == "claude":
         write_hooks(project, data_dir)
+        write_stop_hook(project, port)
 
     # ── Launch the tool ─────────────────────────────────────────────────────
     if tool == "codex":

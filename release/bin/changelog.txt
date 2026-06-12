@@ -1,3 +1,11 @@
+1.0.38  (2026-06-12)
+- Added: usage telemetry pipeline — per-session savings data pushed to NeonDB
+  via webhook (POST /api/usage). Powers the live dashboard at pro.graperoot.dev.
+- Added: GET /api/usage/stats (monthly summary + by_day + recent 50 sessions),
+  GET /api/usage/export (CSV download).
+- Added: stop.sh hook now calls POST /session/end on the MCP server after each
+  turn, combining token usage with savings algorithm output into one payload.
+
 1.0.37  (2026-06-05)
 - Added: gap-aware query intent routing — detects content_search, control_flow,
   absence_query, and dynamic_trace queries before confidence classification.
