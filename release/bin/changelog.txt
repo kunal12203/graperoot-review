@@ -1,3 +1,9 @@
+1.0.43  (2026-06-12)
+- Fixed: telemetry now logs one row per prompt (not cumulative per session).
+  Each Stop hook fire captures only the last transcript entry (this turn's tokens).
+- Fixed: project_hash now computed from cwd in the hook payload (not hardcoded at
+  launch time) — correctly tracks per-project usage across all projects.
+
 1.0.42  (2026-06-12)
 - Fixed: usage telemetry was logging zero tokens for all sessions. Root cause:
   Claude Code's Stop hook sends session metadata only (no usage field). Fix reads

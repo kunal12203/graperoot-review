@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.43: per-prompt rows in DB (not cumulative), project_hash from cwd (not hardcoded),
+         task_type='prompt' for per-turn granularity
+
 v1.0.42: fix zero token counts — read transcript JSONL instead of Stop hook payload
          (Claude Code Stop hook sends session metadata only, not usage)
 
@@ -652,36 +655,37 @@ def write_stop_hook(project: Path, port: int) -> None:
     # Write stop hook as a proper script file — avoids shell quoting / newline issues with -c
     stop_py = PRO_HOME / "stop_hook.py"
     stop_py.write_text(
-        "import sys, json, urllib.request\n"
+        "import sys, json, urllib.request, hashlib\n"
         "try:\n"
         "    d = json.loads(sys.stdin.read())\n"
         "    session_id = d.get('session_id', '')\n"
         "    transcript_path = d.get('transcript_path', '')\n"
+        "    cwd = d.get('cwd', '')\n"
+        "    project_hash = hashlib.sha256(cwd.encode()).hexdigest()[:16] if cwd else 'unknown'\n"
         "    model = 'claude-sonnet-4-6'\n"
         "    inp = out = cr = cw = 0\n"
+        "    # Read only the LAST usage entry in the transcript (this turn's tokens only)\n"
         "    if transcript_path:\n"
         "        try:\n"
+        "            last_u = None\n"
         "            with open(transcript_path, 'r', encoding='utf-8') as f:\n"
         "                for line in f:\n"
         "                    line = line.strip()\n"
         "                    if not line: continue\n"
         "                    try: entry = json.loads(line)\n"
         "                    except Exception: continue\n"
-        "                    u = entry.get('usage', {})\n"
-        "                    if u:\n"
-        "                        inp += u.get('input_tokens', 0)\n"
-        "                        out += u.get('output_tokens', 0)\n"
-        "                        cr  += u.get('cache_read_input_tokens', 0)\n"
-        "                        cw  += u.get('cache_creation_input_tokens', 0)\n"
+        "                    u = entry.get('usage')\n"
+        "                    if u: last_u = u\n"
         "                    msg = entry.get('message', {})\n"
         "                    if isinstance(msg, dict):\n"
-        "                        mu = msg.get('usage', {})\n"
-        "                        if mu:\n"
-        "                            inp += mu.get('input_tokens', 0)\n"
-        "                            out += mu.get('output_tokens', 0)\n"
-        "                            cr  += mu.get('cache_read_input_tokens', 0)\n"
-        "                            cw  += mu.get('cache_creation_input_tokens', 0)\n"
+        "                        mu = msg.get('usage')\n"
+        "                        if mu: last_u = mu\n"
         "                        if msg.get('model'): model = msg['model']\n"
+        "            if last_u:\n"
+        "                inp = last_u.get('input_tokens', 0)\n"
+        "                out = last_u.get('output_tokens', 0)\n"
+        "                cr  = last_u.get('cache_read_input_tokens', 0)\n"
+        "                cw  = last_u.get('cache_creation_input_tokens', 0)\n"
         "        except Exception: pass\n"
         "    op  = 'opus' in model.lower()\n"
         "    tc  = (inp*(15 if op else 3) + cw*(18.75 if op else 3.75) + cr*(1.5 if op else 0.3) + out*(75 if op else 15)) / 1e6\n"
@@ -695,8 +699,8 @@ def write_stop_hook(project: Path, port: int) -> None:
         "        'total_cost_usd': round(tc, 6), 'naive_cost_usd': round(nc, 6),\n"
         "        'savings_pct': round(sp, 4), 'tokens_served': inp+cw+cr+out,\n"
         "        'tokens_avoided': 0, 'tool_hits': '{}',\n"
-        "        'task_type': 'session', 'confidence': 'none',\n"
-        f"        'project_hash': '{project_hash}',\n"
+        "        'task_type': 'prompt', 'confidence': 'none',\n"
+        "        'project_hash': project_hash,\n"
         "    }).encode()\n"
         "    urllib.request.urlopen(urllib.request.Request(\n"
         "        'https://graperoot-review-production.up.railway.app/api/usage',\n"

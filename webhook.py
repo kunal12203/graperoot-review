@@ -296,7 +296,6 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_served INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tool_hits TEXT",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id) WHERE session_id IS NOT NULL",
     ]
     pro_cols_sq = [
         "ALTER TABLE usage_events ADD COLUMN tokens_served INTEGER DEFAULT 0",
@@ -926,50 +925,24 @@ def api_usage_ingest():
     key  = data.get("license_key", "")
     if not key or not key.startswith("GRP-"):
         return jsonify({"error": "invalid license_key"}), 400
-    ts  = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
-    sid = data.get("session_id")
-    is_pg = _pro_is_pg()
-    if is_pg:
-        _pro_query_write(
-            "INSERT INTO usage_events (license_key, session_id, timestamp, model, "
-            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
-            "total_cost_usd, naive_cost_usd, savings_pct, "
-            "tokens_served, tokens_avoided, tool_hits, "
-            "task_type, confidence, project_hash) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-            "ON CONFLICT (session_id) DO UPDATE SET "
-            "input_tokens=EXCLUDED.input_tokens, output_tokens=EXCLUDED.output_tokens, "
-            "cache_read_tokens=EXCLUDED.cache_read_tokens, cache_write_tokens=EXCLUDED.cache_write_tokens, "
-            "total_cost_usd=EXCLUDED.total_cost_usd, naive_cost_usd=EXCLUDED.naive_cost_usd, "
-            "savings_pct=EXCLUDED.savings_pct, tokens_served=EXCLUDED.tokens_served, "
-            "model=EXCLUDED.model, timestamp=EXCLUDED.timestamp",
-            (key, sid, ts, data.get("model"),
-             int(data.get("input_tokens", 0)), int(data.get("output_tokens", 0)),
-             int(data.get("cache_read_tokens", 0)), int(data.get("cache_write_tokens", 0)),
-             float(data.get("total_cost_usd", 0.0)), float(data.get("naive_cost_usd", 0.0)),
-             float(data.get("savings_pct", 0.0)),
-             int(data.get("tokens_served", 0)), int(data.get("tokens_avoided", 0)),
-             data.get("tool_hits"),
-             data.get("task_type"), data.get("confidence"), data.get("project_hash"))
-        )
-    else:
-        ph = _pro_ph(17)
-        _pro_query_write(
-            f"INSERT OR REPLACE INTO usage_events (license_key, session_id, timestamp, model, "
-            f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
-            f"total_cost_usd, naive_cost_usd, savings_pct, "
-            f"tokens_served, tokens_avoided, tool_hits, "
-            f"task_type, confidence, project_hash) "
-            f"VALUES ({ph})",
-            (key, sid, ts, data.get("model"),
-             int(data.get("input_tokens", 0)), int(data.get("output_tokens", 0)),
-             int(data.get("cache_read_tokens", 0)), int(data.get("cache_write_tokens", 0)),
-             float(data.get("total_cost_usd", 0.0)), float(data.get("naive_cost_usd", 0.0)),
-             float(data.get("savings_pct", 0.0)),
-             int(data.get("tokens_served", 0)), int(data.get("tokens_avoided", 0)),
-             data.get("tool_hits"),
-             data.get("task_type"), data.get("confidence"), data.get("project_hash"))
-        )
+    ph = _pro_ph(17)
+    ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    _pro_query_write(
+        f"INSERT INTO usage_events (license_key, session_id, timestamp, model, "
+        f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        f"total_cost_usd, naive_cost_usd, savings_pct, "
+        f"tokens_served, tokens_avoided, tool_hits, "
+        f"task_type, confidence, project_hash) "
+        f"VALUES ({ph})",
+        (key, data.get("session_id"), ts, data.get("model"),
+         int(data.get("input_tokens", 0)), int(data.get("output_tokens", 0)),
+         int(data.get("cache_read_tokens", 0)), int(data.get("cache_write_tokens", 0)),
+         float(data.get("total_cost_usd", 0.0)), float(data.get("naive_cost_usd", 0.0)),
+         float(data.get("savings_pct", 0.0)),
+         int(data.get("tokens_served", 0)), int(data.get("tokens_avoided", 0)),
+         data.get("tool_hits"),
+         data.get("task_type"), data.get("confidence"), data.get("project_hash"))
+    )
     return jsonify({"ok": True})
 
 
