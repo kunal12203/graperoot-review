@@ -43,7 +43,8 @@ FALLBACK_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
 OAUTH_CLIENT_ID     = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "")
 SESSION_SECRET  = os.environ.get("SESSION_SECRET", secrets.token_hex(32))
-DATABASE_URL    = os.environ.get("DATABASE_URL", "")          # NeonDB / any Postgres
+DATABASE_URL    = os.environ.get("DATABASE_URL", "")          # NeonDB — leaderboard / reviews
+PRO_DATABASE_URL = os.environ.get("PRO_DATABASE_URL", "")    # NeonDB — Pro telemetry (usage_events)
 DB_PATH         = os.environ.get("DB_PATH", "/app/data/reviews.db")  # SQLite fallback
 
 app = Flask(__name__)
@@ -68,6 +69,7 @@ def _api_preflight(path):
 # ── Database ───────────────────────────────────────────────────────────────────
 # Uses PostgreSQL (NeonDB) when DATABASE_URL is set, SQLite otherwise.
 
+# ── Leaderboard DB schema (reviews + users only) ──────────────────────────────
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
     id           SERIAL PRIMARY KEY,
@@ -99,28 +101,6 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_repo     ON reviews(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_reviews_created  ON reviews(created_at DESC);
-CREATE TABLE IF NOT EXISTS usage_events (
-    id                  SERIAL PRIMARY KEY,
-    license_key         TEXT NOT NULL,
-    session_id          TEXT,
-    timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    model               TEXT,
-    input_tokens        INTEGER DEFAULT 0,
-    output_tokens       INTEGER DEFAULT 0,
-    cache_read_tokens   INTEGER DEFAULT 0,
-    cache_write_tokens  INTEGER DEFAULT 0,
-    total_cost_usd      REAL DEFAULT 0,
-    naive_cost_usd      REAL DEFAULT 0,
-    savings_pct         REAL DEFAULT 0,
-    tokens_served       INTEGER DEFAULT 0,
-    tokens_avoided      INTEGER DEFAULT 0,
-    tool_hits           TEXT,
-    task_type           TEXT,
-    confidence          TEXT,
-    project_hash        TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_usage_license ON usage_events(license_key);
-CREATE INDEX IF NOT EXISTS idx_usage_ts      ON usage_events(timestamp DESC);
 """
 
 SCHEMA_SQLITE = """
@@ -154,6 +134,35 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_repo ON reviews(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at DESC);
+"""
+
+# ── Pro telemetry DB schema (usage_events only) ────────────────────────────────
+PRO_SCHEMA = """
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                  SERIAL PRIMARY KEY,
+    license_key         TEXT NOT NULL,
+    session_id          TEXT,
+    timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    model               TEXT,
+    input_tokens        INTEGER DEFAULT 0,
+    output_tokens       INTEGER DEFAULT 0,
+    cache_read_tokens   INTEGER DEFAULT 0,
+    cache_write_tokens  INTEGER DEFAULT 0,
+    total_cost_usd      REAL DEFAULT 0,
+    naive_cost_usd      REAL DEFAULT 0,
+    savings_pct         REAL DEFAULT 0,
+    tokens_served       INTEGER DEFAULT 0,
+    tokens_avoided      INTEGER DEFAULT 0,
+    tool_hits           TEXT,
+    task_type           TEXT,
+    confidence          TEXT,
+    project_hash        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_license ON usage_events(license_key);
+CREATE INDEX IF NOT EXISTS idx_usage_ts      ON usage_events(timestamp DESC);
+"""
+
+PRO_SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS usage_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     license_key         TEXT NOT NULL,
@@ -181,6 +190,12 @@ CREATE INDEX IF NOT EXISTS idx_usage_ts      ON usage_events(timestamp DESC);
 
 def _pg_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def _pro_pg_conn():
+    """Connect to the Pro telemetry database (PRO_DATABASE_URL)."""
+    url = PRO_DATABASE_URL or DATABASE_URL  # fall back to main DB if not set
+    return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def get_db():
@@ -213,13 +228,14 @@ def _ph(n: int) -> str:
 
 
 def init_db():
+    # Leaderboard DB (reviews + users)
     if DATABASE_URL and _HAS_PG:
         con = _pg_conn()
         cur = con.cursor()
         cur.execute(SCHEMA)
         con.commit()
         cur.close(); con.close()
-        print("[db] PostgreSQL (NeonDB) initialized", flush=True)
+        print("[db] PostgreSQL leaderboard DB initialized", flush=True)
     else:
         import sqlite3 as _sq
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -227,38 +243,76 @@ def init_db():
         con.executescript(SCHEMA_SQLITE)
         con.commit(); con.close()
         print(f"[db] SQLite fallback at {DB_PATH}", flush=True)
+
+    # Pro telemetry DB (usage_events) — separate database
+    if _pro_is_pg():
+        con = _pro_pg_conn()
+        cur = con.cursor()
+        cur.execute(PRO_SCHEMA)
+        con.commit()
+        cur.close(); con.close()
+        db_label = "PRO_DATABASE_URL" if PRO_DATABASE_URL else "DATABASE_URL (shared)"
+        print(f"[db] PostgreSQL Pro telemetry DB initialized ({db_label})", flush=True)
+    else:
+        import sqlite3 as _sq
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        con = _sq.connect(DB_PATH)
+        con.executescript(PRO_SCHEMA_SQLITE)
+        con.commit(); con.close()
+
     _migrate_db()
 
 
 def _migrate_db():
     """Add columns introduced after initial schema deploy."""
-    new_cols_pg = [
+    # Leaderboard DB migrations (users table only)
+    leaderboard_cols_pg = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_limit INTEGER DEFAULT 5",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free'",
-        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_served INTEGER DEFAULT 0",
-        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided INTEGER DEFAULT 0",
-        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tool_hits TEXT",
     ]
-    new_cols_sq = [
+    leaderboard_cols_sq = [
         "ALTER TABLE users ADD COLUMN session_token TEXT",
         "ALTER TABLE users ADD COLUMN monthly_limit INTEGER DEFAULT 5",
         "ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'",
-        "ALTER TABLE usage_events ADD COLUMN tokens_served INTEGER DEFAULT 0",
-        "ALTER TABLE usage_events ADD COLUMN tokens_avoided INTEGER DEFAULT 0",
-        "ALTER TABLE usage_events ADD COLUMN tool_hits TEXT",
     ]
     if DATABASE_URL and _HAS_PG:
         con = _pg_conn()
         cur = con.cursor()
-        for sql in new_cols_pg:
+        for sql in leaderboard_cols_pg:
             try: cur.execute(sql)
             except Exception: pass
         con.commit(); cur.close(); con.close()
     else:
         import sqlite3 as _sq
         con = _sq.connect(DB_PATH)
-        for sql in new_cols_sq:
+        for sql in leaderboard_cols_sq:
+            try: con.execute(sql)
+            except Exception: pass
+        con.commit(); con.close()
+
+    # Pro telemetry DB migrations (usage_events table)
+    pro_cols_pg = [
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_served INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tool_hits TEXT",
+    ]
+    pro_cols_sq = [
+        "ALTER TABLE usage_events ADD COLUMN tokens_served INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN tokens_avoided INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN tool_hits TEXT",
+    ]
+    if _pro_is_pg():
+        con = _pro_pg_conn()
+        cur = con.cursor()
+        for sql in pro_cols_pg:
+            try: cur.execute(sql)
+            except Exception: pass
+        con.commit(); cur.close(); con.close()
+    else:
+        import sqlite3 as _sq
+        con = _sq.connect(DB_PATH)
+        for sql in pro_cols_sq:
             try: con.execute(sql)
             except Exception: pass
         con.commit(); con.close()
@@ -326,6 +380,55 @@ def _query_write(sql: str, params=()):
         con = _sq.connect(DB_PATH)
         con.execute(sql, params)
         con.commit(); con.close()
+
+
+# ── Pro telemetry DB helpers ───────────────────────────────────────────────────
+
+def _pro_is_pg() -> bool:
+    return _HAS_PG and bool(PRO_DATABASE_URL or DATABASE_URL)
+
+
+def _pro_ph(n: int) -> str:
+    return ",".join(["%s"] * n) if _pro_is_pg() else ",".join(["?"] * n)
+
+
+def _pro_query(sql: str, params=(), one=False):
+    """SELECT from the Pro telemetry database."""
+    if _pro_is_pg():
+        con = _pro_pg_conn()
+        cur = con.cursor()
+        cur.execute(sql, params)
+        rows = [dict(r) for r in (cur.fetchall() if not one else [cur.fetchone()])]
+        cur.close(); con.close()
+    else:
+        import sqlite3 as _sq
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        con = _sq.connect(DB_PATH)
+        con.row_factory = _sq.Row
+        cur = con.execute(sql, params)
+        raw = cur.fetchall()
+        rows = [dict(r) for r in raw]
+        if one:
+            rows = [rows[0]] if rows else [{}]
+        con.close()
+    return rows[0] if one else rows
+
+
+def _pro_query_write(sql: str, params=()):
+    """INSERT/UPDATE into the Pro telemetry database."""
+    if _pro_is_pg():
+        con = _pro_pg_conn()
+        cur = con.cursor()
+        cur.execute(sql, params)
+        con.commit()
+        cur.close(); con.close()
+    else:
+        import sqlite3 as _sq
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        con = _sq.connect(DB_PATH)
+        con.execute(sql, params)
+        con.commit(); con.close()
+
 
 # ── GitHub App auth ────────────────────────────────────────────────────────────
 
@@ -822,9 +925,9 @@ def api_usage_ingest():
     key  = data.get("license_key", "")
     if not key or not key.startswith("GRP-"):
         return jsonify({"error": "invalid license_key"}), 400
-    ph = _ph(17)
+    ph = _pro_ph(17)
     ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
-    _query_write(
+    _pro_query_write(
         f"INSERT INTO usage_events (license_key, session_id, timestamp, model, "
         f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
         f"total_cost_usd, naive_cost_usd, savings_pct, "
@@ -850,7 +953,7 @@ def api_usage_stats():
     if not key or not key.startswith("GRP-"):
         return jsonify({"error": "invalid license_key"}), 400
 
-    is_pg = bool(DATABASE_URL and _HAS_PG)
+    is_pg = _pro_is_pg()
     ph1   = "%s" if is_pg else "?"
 
     # Date window
@@ -863,7 +966,7 @@ def api_usage_stats():
 
     window = f"timestamp >= {ph1} AND timestamp < {ph1}"
 
-    summary_row = _query(
+    summary_row = _pro_query(
         f"SELECT COUNT(*) AS turns, "
         f"SUM(input_tokens) AS total_input, SUM(output_tokens) AS total_output, "
         f"SUM(cache_read_tokens) AS total_cache_read, SUM(cache_write_tokens) AS total_cache_write, "
@@ -874,7 +977,7 @@ def api_usage_stats():
         (key, start, end), one=True
     )
 
-    by_day = _query(
+    by_day = _pro_query(
         f"SELECT "
         f"{'DATE(timestamp)' if is_pg else 'substr(timestamp,1,10)'} AS date, "
         f"COUNT(*) AS turns, SUM(input_tokens) AS input_tokens, "
@@ -888,7 +991,7 @@ def api_usage_stats():
         (key, start, end)
     )
 
-    recent = _query(
+    recent = _pro_query(
         f"SELECT id, timestamp, model, input_tokens, output_tokens, "
         f"cache_read_tokens, cache_write_tokens, total_cost_usd, naive_cost_usd, savings_pct, "
         f"tokens_served, tokens_avoided, tool_hits, "
@@ -932,13 +1035,12 @@ def api_usage_export():
     if not key or not key.startswith("GRP-"):
         return jsonify({"error": "invalid license_key"}), 400
 
-    is_pg = bool(DATABASE_URL and _HAS_PG)
-    ph1   = "%s" if is_pg else "?"
+    ph1   = "%s" if _pro_is_pg() else "?"
     start = f"{month}-01"
     year, mon = int(month.split("-")[0]), int(month.split("-")[1])
     end   = f"{year + 1}-01-01" if mon == 12 else f"{year}-{mon + 1:02d}-01"
 
-    rows = _query(
+    rows = _pro_query(
         f"SELECT timestamp, model, input_tokens, output_tokens, cache_read_tokens, "
         f"cache_write_tokens, total_cost_usd, savings_pct, "
         f"tokens_served, tokens_avoided, task_type, confidence, session_id "
