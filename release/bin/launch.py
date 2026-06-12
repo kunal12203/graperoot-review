@@ -642,32 +642,42 @@ def write_stop_hook(project: Path, port: int) -> None:
 
     python = sys.executable
     project_hash = hashlib.sha256(str(project).encode()).hexdigest()[:16]
-    stop_script = (
-        f'{python} -c "'
-        "import sys,json,urllib.request,hashlib\n"
+    # Write stop hook as a proper script file — avoids shell quoting / newline issues with -c
+    stop_py = PRO_HOME / "stop_hook.py"
+    stop_py.write_text(
+        "import sys, json, urllib.request\n"
         "try:\n"
-        " d=json.load(sys.stdin);u=d.get('usage',{});"
-        "inp=u.get('input_tokens',0);out=u.get('output_tokens',0);"
-        "cr=u.get('cache_read_input_tokens',0);cw=u.get('cache_creation_input_tokens',0);"
-        "m=d.get('model','claude-sonnet-4-6');op='opus' in m.lower();"
-        "tc=(inp*(15 if op else 3)+cw*(18.75 if op else 3.75)+cr*(1.5 if op else 0.3)+out*(75 if op else 15))/1e6;"
-        "nc=((inp+cw+cr)*(15 if op else 3)+out*(75 if op else 15))/1e6;"
-        "sp=(nc-tc)/nc if nc>0 else 0;"
-        f"lk=open('{license_file}').read().strip();"
-        "p=json.dumps({"
-        "'license_key':lk,'session_id':d.get('session_id',''),'model':m,"
-        "'input_tokens':inp,'output_tokens':out,'cache_read_tokens':cr,'cache_write_tokens':cw,"
-        "'total_cost_usd':round(tc,6),'naive_cost_usd':round(nc,6),'savings_pct':round(sp,4),"
-        "'tokens_served':inp+cw+cr+out,'tokens_avoided':0,'tool_hits':'{}',"
-        f"'task_type':'session','confidence':'none','project_hash':'{project_hash}'"
-        "}).encode();"
-        "urllib.request.urlopen(urllib.request.Request("
-        "'https://graperoot-review-production.up.railway.app/api/usage',"
-        "data=p,headers={'Content-Type':'application/json'},method='POST'),timeout=5)\n"
+        "    d = json.load(sys.stdin)\n"
+        "    u = d.get('usage', {})\n"
+        "    inp = u.get('input_tokens', 0)\n"
+        "    out = u.get('output_tokens', 0)\n"
+        "    cr  = u.get('cache_read_input_tokens', 0)\n"
+        "    cw  = u.get('cache_creation_input_tokens', 0)\n"
+        "    m   = d.get('model', 'claude-sonnet-4-6')\n"
+        "    op  = 'opus' in m.lower()\n"
+        "    tc  = (inp*(15 if op else 3) + cw*(18.75 if op else 3.75) + cr*(1.5 if op else 0.3) + out*(75 if op else 15)) / 1e6\n"
+        "    nc  = ((inp+cw+cr)*(15 if op else 3) + out*(75 if op else 15)) / 1e6\n"
+        "    sp  = (nc-tc)/nc if nc > 0 else 0\n"
+        f"    lk  = open('{license_file}').read().strip()\n"
+        "    p   = json.dumps({\n"
+        "        'license_key': lk, 'session_id': d.get('session_id', ''), 'model': m,\n"
+        "        'input_tokens': inp, 'output_tokens': out,\n"
+        "        'cache_read_tokens': cr, 'cache_write_tokens': cw,\n"
+        "        'total_cost_usd': round(tc, 6), 'naive_cost_usd': round(nc, 6),\n"
+        "        'savings_pct': round(sp, 4), 'tokens_served': inp+cw+cr+out,\n"
+        "        'tokens_avoided': 0, 'tool_hits': '{}',\n"
+        "        'task_type': 'session', 'confidence': 'none',\n"
+        f"        'project_hash': '{project_hash}',\n"
+        "    }).encode()\n"
+        "    urllib.request.urlopen(urllib.request.Request(\n"
+        "        'https://graperoot-review-production.up.railway.app/api/usage',\n"
+        "        data=p, headers={'Content-Type': 'application/json'}, method='POST'\n"
+        "    ), timeout=5)\n"
         "except Exception:\n"
-        " pass"
-        '"'
+        "    pass\n",
+        encoding="utf-8",
     )
+    stop_script = f'{python} "{stop_py}"'
     stop_entry = {"matcher": "", "hooks": [{"type": "command", "command": stop_script}]}
     hooks = existing.setdefault("hooks", {})
     old_stop = hooks.get("Stop", [])
