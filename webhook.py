@@ -99,6 +99,28 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_repo     ON reviews(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_reviews_created  ON reviews(created_at DESC);
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                  SERIAL PRIMARY KEY,
+    license_key         TEXT NOT NULL,
+    session_id          TEXT,
+    timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    model               TEXT,
+    input_tokens        INTEGER DEFAULT 0,
+    output_tokens       INTEGER DEFAULT 0,
+    cache_read_tokens   INTEGER DEFAULT 0,
+    cache_write_tokens  INTEGER DEFAULT 0,
+    total_cost_usd      REAL DEFAULT 0,
+    naive_cost_usd      REAL DEFAULT 0,
+    savings_pct         REAL DEFAULT 0,
+    tokens_served       INTEGER DEFAULT 0,
+    tokens_avoided      INTEGER DEFAULT 0,
+    tool_hits           TEXT,
+    task_type           TEXT,
+    confidence          TEXT,
+    project_hash        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_license ON usage_events(license_key);
+CREATE INDEX IF NOT EXISTS idx_usage_ts      ON usage_events(timestamp DESC);
 """
 
 SCHEMA_SQLITE = """
@@ -132,6 +154,28 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_repo ON reviews(owner, repo);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at DESC);
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_key         TEXT NOT NULL,
+    session_id          TEXT,
+    timestamp           TEXT NOT NULL,
+    model               TEXT,
+    input_tokens        INTEGER DEFAULT 0,
+    output_tokens       INTEGER DEFAULT 0,
+    cache_read_tokens   INTEGER DEFAULT 0,
+    cache_write_tokens  INTEGER DEFAULT 0,
+    total_cost_usd      REAL DEFAULT 0,
+    naive_cost_usd      REAL DEFAULT 0,
+    savings_pct         REAL DEFAULT 0,
+    tokens_served       INTEGER DEFAULT 0,
+    tokens_avoided      INTEGER DEFAULT 0,
+    tool_hits           TEXT,
+    task_type           TEXT,
+    confidence          TEXT,
+    project_hash        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_license ON usage_events(license_key);
+CREATE INDEX IF NOT EXISTS idx_usage_ts      ON usage_events(timestamp DESC);
 """
 
 
@@ -192,11 +236,17 @@ def _migrate_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_limit INTEGER DEFAULT 5",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free'",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_served INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tool_hits TEXT",
     ]
     new_cols_sq = [
         "ALTER TABLE users ADD COLUMN session_token TEXT",
         "ALTER TABLE users ADD COLUMN monthly_limit INTEGER DEFAULT 5",
         "ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'",
+        "ALTER TABLE usage_events ADD COLUMN tokens_served INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN tokens_avoided INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN tool_hits TEXT",
     ]
     if DATABASE_URL and _HAS_PG:
         con = _pg_conn()
@@ -260,6 +310,22 @@ def _query(sql: str, params=(), one=False):
         if one:
             rows = [rows[0]] if rows else [{}]
     return rows[0] if one else rows
+
+
+def _query_write(sql: str, params=()):
+    """Run an INSERT/UPDATE outside request context (usable from background threads)."""
+    if DATABASE_URL and _HAS_PG:
+        con = _pg_conn()
+        cur = con.cursor()
+        cur.execute(sql, params)
+        con.commit()
+        cur.close(); con.close()
+    else:
+        import sqlite3 as _sq
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        con = _sq.connect(DB_PATH)
+        con.execute(sql, params)
+        con.commit(); con.close()
 
 # ── GitHub App auth ────────────────────────────────────────────────────────────
 
@@ -747,6 +813,155 @@ def api_graph_status(owner, repo):
     if _HAS_GRAPH_SVC:
         return jsonify(graph_summary(owner, repo))
     return jsonify({"exists": False, "reason": "graph_service_unavailable"})
+
+# ── Usage telemetry ────────────────────────────────────────────────────────────
+
+@app.route("/api/usage", methods=["POST"])
+def api_usage_ingest():
+    data = request.get_json(silent=True) or {}
+    key  = data.get("license_key", "")
+    if not key or not key.startswith("GRP-"):
+        return jsonify({"error": "invalid license_key"}), 400
+    ph = _ph(17)
+    ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    _query_write(
+        f"INSERT INTO usage_events (license_key, session_id, timestamp, model, "
+        f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        f"total_cost_usd, naive_cost_usd, savings_pct, "
+        f"tokens_served, tokens_avoided, tool_hits, "
+        f"task_type, confidence, project_hash) "
+        f"VALUES ({ph})",
+        (key, data.get("session_id"), ts, data.get("model"),
+         int(data.get("input_tokens", 0)), int(data.get("output_tokens", 0)),
+         int(data.get("cache_read_tokens", 0)), int(data.get("cache_write_tokens", 0)),
+         float(data.get("total_cost_usd", 0.0)), float(data.get("naive_cost_usd", 0.0)),
+         float(data.get("savings_pct", 0.0)),
+         int(data.get("tokens_served", 0)), int(data.get("tokens_avoided", 0)),
+         data.get("tool_hits"),
+         data.get("task_type"), data.get("confidence"), data.get("project_hash"))
+    )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/usage/stats")
+def api_usage_stats():
+    key   = request.args.get("license_key", "")
+    month = request.args.get("month", datetime.now(timezone.utc).strftime("%Y-%m"))
+    if not key or not key.startswith("GRP-"):
+        return jsonify({"error": "invalid license_key"}), 400
+
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph1   = "%s" if is_pg else "?"
+
+    # Date window
+    start = f"{month}-01"
+    year, mon = int(month.split("-")[0]), int(month.split("-")[1])
+    if mon == 12:
+        end = f"{year + 1}-01-01"
+    else:
+        end = f"{year}-{mon + 1:02d}-01"
+
+    window = f"timestamp >= {ph1} AND timestamp < {ph1}"
+
+    summary_row = _query(
+        f"SELECT COUNT(*) AS turns, "
+        f"SUM(input_tokens) AS total_input, SUM(output_tokens) AS total_output, "
+        f"SUM(cache_read_tokens) AS total_cache_read, SUM(cache_write_tokens) AS total_cache_write, "
+        f"SUM(total_cost_usd) AS total_cost, SUM(naive_cost_usd) AS total_naive, "
+        f"AVG(savings_pct) AS avg_savings, "
+        f"SUM(tokens_served) AS total_tokens_served, SUM(tokens_avoided) AS total_tokens_avoided "
+        f"FROM usage_events WHERE license_key = {ph1} AND {window}",
+        (key, start, end), one=True
+    )
+
+    by_day = _query(
+        f"SELECT "
+        f"{'DATE(timestamp)' if is_pg else 'substr(timestamp,1,10)'} AS date, "
+        f"COUNT(*) AS turns, SUM(input_tokens) AS input_tokens, "
+        f"SUM(cache_read_tokens) AS cache_read_tokens, "
+        f"SUM(total_cost_usd) AS total_cost_usd, SUM(naive_cost_usd) AS naive_cost_usd, "
+        f"AVG(savings_pct) AS savings_pct, "
+        f"SUM(tokens_served) AS tokens_served, SUM(tokens_avoided) AS tokens_avoided "
+        f"FROM usage_events WHERE license_key = {ph1} AND {window} "
+        f"GROUP BY {'DATE(timestamp)' if is_pg else 'substr(timestamp,1,10)'} "
+        f"ORDER BY date DESC",
+        (key, start, end)
+    )
+
+    recent = _query(
+        f"SELECT id, timestamp, model, input_tokens, output_tokens, "
+        f"cache_read_tokens, cache_write_tokens, total_cost_usd, naive_cost_usd, savings_pct, "
+        f"tokens_served, tokens_avoided, tool_hits, "
+        f"task_type, confidence, project_hash, session_id "
+        f"FROM usage_events WHERE license_key = {ph1} AND {window} "
+        f"ORDER BY timestamp DESC LIMIT 50",
+        (key, start, end)
+    )
+
+    total_cost  = float(summary_row.get("total_cost")  or 0)
+    total_naive = float(summary_row.get("total_naive") or 0)
+    total_served  = int(summary_row.get("total_tokens_served")  or 0)
+    total_avoided = int(summary_row.get("total_tokens_avoided") or 0)
+    return jsonify({
+        "license_key": key,
+        "month": month,
+        "summary": {
+            "total_turns":              summary_row.get("turns") or 0,
+            "total_input_tokens":       summary_row.get("total_input") or 0,
+            "total_output_tokens":      summary_row.get("total_output") or 0,
+            "total_cache_read_tokens":  summary_row.get("total_cache_read") or 0,
+            "total_cache_write_tokens": summary_row.get("total_cache_write") or 0,
+            "total_cost_usd":           round(total_cost, 6),
+            "total_naive_cost_usd":     round(total_naive, 6),
+            "total_saved_usd":          round(total_naive - total_cost, 6),
+            "avg_savings_pct":          round(float(summary_row.get("avg_savings") or 0) * 100, 2),
+            "total_tokens_served":      total_served,
+            "total_tokens_avoided":     total_avoided,
+            "tool_savings_pct":         round(total_avoided / (total_served + total_avoided) * 100, 2)
+                                        if (total_served + total_avoided) > 0 else 0,
+        },
+        "by_day":  by_day,
+        "recent":  recent,
+    })
+
+
+@app.route("/api/usage/export")
+def api_usage_export():
+    key   = request.args.get("license_key", "")
+    month = request.args.get("month", datetime.now(timezone.utc).strftime("%Y-%m"))
+    if not key or not key.startswith("GRP-"):
+        return jsonify({"error": "invalid license_key"}), 400
+
+    is_pg = bool(DATABASE_URL and _HAS_PG)
+    ph1   = "%s" if is_pg else "?"
+    start = f"{month}-01"
+    year, mon = int(month.split("-")[0]), int(month.split("-")[1])
+    end   = f"{year + 1}-01-01" if mon == 12 else f"{year}-{mon + 1:02d}-01"
+
+    rows = _query(
+        f"SELECT timestamp, model, input_tokens, output_tokens, cache_read_tokens, "
+        f"cache_write_tokens, total_cost_usd, savings_pct, "
+        f"tokens_served, tokens_avoided, task_type, confidence, session_id "
+        f"FROM usage_events WHERE license_key = {ph1} AND timestamp >= {ph1} AND timestamp < {ph1} "
+        f"ORDER BY timestamp DESC",
+        (key, start, end)
+    )
+
+    def _csv():
+        cols = ["timestamp", "model", "input_tokens", "output_tokens",
+                "cache_read_tokens", "cache_write_tokens", "total_cost_usd",
+                "savings_pct", "tokens_served", "tokens_avoided",
+                "task_type", "confidence", "session_id"]
+        yield ",".join(cols) + "\n"
+        for r in rows:
+            yield ",".join(str(r.get(c, "")) for c in cols) + "\n"
+
+    return app.response_class(
+        _csv(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=graperoot-usage-{month}.csv"}
+    )
+
 
 # ── Webhook ────────────────────────────────────────────────────────────────────
 

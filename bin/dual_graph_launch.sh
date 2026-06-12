@@ -1289,6 +1289,20 @@ PYEOF
       -H "Content-Type: application/json" \
       -d "\$USAGE" \
       >/dev/null 2>&1 || true
+    # Push savings + usage to NeonDB dashboard (graperoot-review webhook)
+    # Build session/end payload: merge USAGE fields with session_id
+    SESSION_ID=\$(echo "\$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id',''))" 2>/dev/null || echo "")
+    SESSION_PAYLOAD=\$(echo "\$USAGE" | python3 -c "
+import sys,json
+d=json.loads(sys.stdin.read())
+# rename cache_* fields to what session/end expects
+d['session_id'] = '''$SESSION_ID'''
+print(json.dumps(d))
+" 2>/dev/null || echo "\$USAGE")
+    curl -sf -X POST "http://localhost:\$MCP_PORT/session/end" \
+      -H "Content-Type: application/json" \
+      -d "\$SESSION_PAYLOAD" \
+      >/dev/null 2>&1 || true
   fi
 fi
 exit 0
