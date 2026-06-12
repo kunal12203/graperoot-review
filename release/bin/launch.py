@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.44: shims call launch.py directly (not launch_pro.sh), version.txt sync fixed,
+         cost calculation moved server-side (Railway webhook)
+
 v1.0.43: per-prompt rows in DB (not cumulative), project_hash from cwd (not hardcoded),
          task_type='prompt' for per-turn granularity
 

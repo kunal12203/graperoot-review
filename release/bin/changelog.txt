@@ -1,3 +1,13 @@
+1.0.44  (2026-06-13)
+- Fixed: all shims (dgc-pro, dg-pro, graperoot-pro + Windows .cmd/.ps1) now call
+  launch.py directly instead of launch_pro.sh which no longer ships in the tarball.
+  Fixes "No such file or directory: launch_pro.sh" on fresh installs.
+- Fixed: graperoot-pro-public/bin/version.txt was stuck at 1.0.29 since May 27.
+  Self-update and fresh installs now correctly receive v1.0.44.
+- Fixed: cost calculation moved to server (webhook.py). Stop hook sends raw tokens
+  only; Railway calculates cost with correct per-model pricing (Opus 4/4.1 $15/M,
+  Opus 4.8/4.7 $5/M, Fable 5 $10/M, Sonnet $3/M, Haiku $1/M).
+
 1.0.43  (2026-06-12)
 - Fixed: telemetry now logs one row per prompt (not cumulative per session).
   Each Stop hook fire captures only the last transcript entry (this turn's tokens).
