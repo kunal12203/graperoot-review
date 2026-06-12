@@ -922,12 +922,16 @@ def api_graph_status(owner, repo):
 def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int):
     """Return (total_cost_usd, naive_cost_usd, savings_pct) for the given token counts."""
     m = (model or "").lower()
-    if "opus" in m:
-        pr = (15.0, 18.75, 1.5, 75.0)
+    if "haiku" in m:
+        pr = (1.0,  1.25,  0.1,  5.0)   # Haiku 4.5
     elif "fable" in m:
-        pr = (10.0, 12.5,  1.0, 50.0)
-    else:  # sonnet / haiku / default
-        pr = (3.0,  3.75,  0.3, 15.0)
+        pr = (10.0, 12.5,  1.0,  50.0)  # Fable 5
+    elif "opus" in m and ("4-8" in m or "4-7" in m):
+        pr = (5.0,  6.25,  0.5,  25.0)  # Opus 4.8 / 4.7
+    elif "opus" in m:
+        pr = (15.0, 18.75, 1.5,  75.0)  # Opus 4 / 4.1
+    else:
+        pr = (3.0,  3.75,  0.3,  15.0)  # Sonnet 4.x / default
     tc = (inp * pr[0] + cw * pr[1] + cr * pr[2] + out * pr[3]) / 1e6
     nc = ((inp + cw + cr) * pr[0] + out * pr[3]) / 1e6
     sp = (nc - tc) / nc if nc > 0 else 0.0
