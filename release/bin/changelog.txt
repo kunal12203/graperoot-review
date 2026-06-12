@@ -1,3 +1,8 @@
+1.0.40  (2026-06-12)
+- Added: Auto-removes free-tier dual-graph MCP when Pro launches. Pro is a superset
+  (20 tools vs 10) — running both causes duplicate tools and Claude picks the wrong one.
+  Removes from ~/.claude.json, ~/.claude/settings.local.json, and kills its process.
+
 1.0.39  (2026-06-12)
 - Fixed: Stop hook now posts usage data directly to Railway webhook instead of
   localhost /session/end (which only exists in the Engine, not the Pro MCP server).

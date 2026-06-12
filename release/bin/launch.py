@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.40: auto-remove free-tier dual-graph when Pro is active (Pro is a superset)
+
 v1.0.39: fix Stop hook to POST directly to Railway webhook (not local /session/end)
 
 v1.0.38: usage telemetry pipeline — NeonDB ingest + dashboard API for savings visualization
@@ -202,6 +204,66 @@ def build_graph(project: Path, data_dir: Path) -> None:
         print(f"[dgc-pro] native tools (Read, grep) will work normally", flush=True)
     except subprocess.CalledProcessError:
         print(f"[dgc-pro] scan failed — starting without graph", flush=True)
+
+
+def _remove_free_tier_mcp() -> None:
+    """Remove dual-graph (free tier) from user-level MCP configs and kill its process.
+
+    Pro is a superset — running both causes duplicate tools and confusion.
+    """
+    removed = False
+
+    # 1. Remove from ~/.claude.json (user-level Claude Code config)
+    claude_cfg = Path.home() / ".claude.json"
+    if claude_cfg.exists():
+        try:
+            data = json.loads(claude_cfg.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers", {})
+            if "dual-graph" in servers:
+                del servers["dual-graph"]
+                data["mcpServers"] = servers
+                claude_cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                removed = True
+        except Exception:
+            pass
+
+    # 2. Remove from ~/.claude/settings.local.json (local MCPs section)
+    claude_local = Path.home() / ".claude" / "settings.local.json"
+    if claude_local.exists():
+        try:
+            data = json.loads(claude_local.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers", {})
+            if "dual-graph" in servers:
+                del servers["dual-graph"]
+                data["mcpServers"] = servers
+                claude_local.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                removed = True
+        except Exception:
+            pass
+
+    # 3. Kill any running dual-graph MCP server process
+    try:
+        if IS_WINDOWS:
+            r = subprocess.run(["wmic", "process", "where",
+                                "commandline like '%mcp_graph_server%' and commandline like '%dual-graph%'",
+                                "get", "processid"], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    subprocess.run(["taskkill", "/F", "/PID", line], capture_output=True, timeout=3)
+        else:
+            r = subprocess.run(["ps", "-axo", "pid=,command="],
+                               capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if "mcp_graph_server" in line and "dual-graph" in line and "graperoot-pro" not in line:
+                    parts = line.split(None, 1)
+                    if parts and parts[0].isdigit():
+                        os.kill(int(parts[0]), signal.SIGTERM)
+    except Exception:
+        pass
+
+    if removed:
+        print("[dgc-pro] Removed free-tier dual-graph (Pro replaces it)", flush=True)
 
 
 def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
@@ -833,7 +895,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.39"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.40"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
@@ -863,6 +925,9 @@ def main() -> None:
     if not IS_WINDOWS:
         signal.signal(signal.SIGHUP, lambda *_: (_cleanup(), sys.exit(1)))
         signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(1)))
+
+    # ── Remove free-tier dual-graph if present (Pro is a superset) ─────────
+    _remove_free_tier_mcp()
 
     # ── Per-tool MCP wiring + policy file ──────────────────────────────────
     if tool == "codex":
