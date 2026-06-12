@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.39: fix Stop hook to POST directly to Railway webhook (not local /session/end)
+
 v1.0.38: usage telemetry pipeline — NeonDB ingest + dashboard API for savings visualization
 
 v1.0.37: gap-aware query intent routing — detects content/control-flow/absence/dynamic queries
@@ -831,7 +833,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.38"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.39"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 

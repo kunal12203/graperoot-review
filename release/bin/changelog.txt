@@ -1,3 +1,9 @@
+1.0.39  (2026-06-12)
+- Fixed: Stop hook now posts usage data directly to Railway webhook instead of
+  localhost /session/end (which only exists in the Engine, not the Pro MCP server).
+  All platforms (Mac/Linux/Windows) now correctly push telemetry to NeonDB.
+- Fixed: Python 3.14 tarfile deprecation warning during auto-update.
+
 1.0.38  (2026-06-12)
 - Added: usage telemetry pipeline — per-session savings data pushed to NeonDB
   via webhook (POST /api/usage). Powers the live dashboard at pro.graperoot.dev.
