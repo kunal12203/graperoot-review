@@ -48,6 +48,7 @@ Responsibilities:
   * exec chosen AI tool (it owns the MCP lifecycle)
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -487,7 +488,11 @@ def write_hooks(project: Path, data_dir: Path) -> None:
 
 
 def write_stop_hook(project: Path, port: int) -> None:
-    """Register a Stop hook that pushes session usage to /session/end on the MCP server."""
+    """Register a Stop hook that pushes session usage to the Railway webhook (NeonDB).
+
+    Posts directly to the remote webhook — no local /session/end intermediary needed.
+    The MCP server port is used to fetch /savings data locally before posting.
+    """
     settings_dir = project / ".claude"
     settings_dir.mkdir(exist_ok=True)
     settings_file = settings_dir / "settings.local.json"
@@ -497,29 +502,55 @@ def write_stop_hook(project: Path, port: int) -> None:
             existing = json.loads(settings_file.read_text(encoding="utf-8"))
         except Exception:
             pass
+
+    license_file = PRO_HOME / "license.key"
+    if not license_file.exists():
+        return
+
     python = sys.executable
+    project_hash = hashlib.sha256(str(project).encode()).hexdigest()[:16]
     stop_script = (
         f'{python} -c "'
-        "import sys,json,urllib.request;"
+        "import sys,json,urllib.request,hashlib;"
         "d=json.load(sys.stdin);"
         "u=d.get('usage',{});"
+        "inp=u.get('input_tokens',0);"
+        "out=u.get('output_tokens',0);"
+        "cr=u.get('cache_read_input_tokens',0);"
+        "cw=u.get('cache_creation_input_tokens',0);"
+        "m=d.get('model','claude-sonnet-4-6');"
+        "op='opus' in m.lower();"
+        "tc=(inp*(15 if op else 3)+cw*(18.75 if op else 3.75)+cr*(1.5 if op else 0.3)+out*(75 if op else 15))/1e6;"
+        "nc=((inp+cw+cr)*(15 if op else 3)+out*(75 if op else 15))/1e6;"
+        "sp=(nc-tc)/nc if nc>0 else 0;"
+        f"lk=open('{license_file}').read().strip();"
         "p=json.dumps({"
+        "'license_key':lk,"
         "'session_id':d.get('session_id',''),"
-        "'model':d.get('model','claude-sonnet-4-6'),"
-        "'input_tokens':u.get('input_tokens',0),"
-        "'output_tokens':u.get('output_tokens',0),"
-        "'cache_creation_input_tokens':u.get('cache_creation_input_tokens',0),"
-        "'cache_read_input_tokens':u.get('cache_read_input_tokens',0),"
-        "'total_turns':d.get('total_turns',0)"
+        "'model':m,"
+        "'input_tokens':inp,"
+        "'output_tokens':out,"
+        "'cache_read_tokens':cr,"
+        "'cache_write_tokens':cw,"
+        "'total_cost_usd':round(tc,6),"
+        "'naive_cost_usd':round(nc,6),"
+        "'savings_pct':round(sp,4),"
+        "'tokens_served':inp+cw+cr+out,"
+        "'tokens_avoided':0,"
+        "'tool_hits':'{}',"
+        "'task_type':'session',"
+        "'confidence':'none',"
+        f"'project_hash':'{project_hash}'"
         "}).encode();"
-        f"urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:{port}/session/end',"
+        "urllib.request.urlopen(urllib.request.Request("
+        "'https://graperoot-review-production.up.railway.app/api/usage',"
         "data=p,headers={'Content-Type':'application/json'},method='POST'),timeout=5)"
         '"'
     )
     stop_entry = {"matcher": "", "hooks": [{"type": "command", "command": stop_script}]}
     hooks = existing.setdefault("hooks", {})
     old_stop = hooks.get("Stop", [])
-    hooks["Stop"] = [e for e in old_stop if "session/end" not in json.dumps(e)]
+    hooks["Stop"] = [e for e in old_stop if "/api/usage" not in json.dumps(e)]
     hooks["Stop"].append(stop_entry)
     existing["hooks"] = hooks
     settings_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
@@ -696,7 +727,7 @@ def auto_update() -> None:
             f.write(dl_resp.read())
 
         with tarfile.open(tarball, "r:gz") as tf:
-            tf.extractall(tmp)
+            tf.extractall(tmp, filter="data" if hasattr(tarfile, "data_filter") else None)
 
         extracted = Path(tmp) / "graperoot-pro"
         if not extracted.is_dir():
