@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dgc-pro — GrapeRoot Pro launcher (Unix shim)
+# graperoot-pro — GrapeRoot Pro multi-platform launcher (Unix shim)
 set -euo pipefail
 INSTALL_DIR="${GRAPEROOT_PRO_HOME:-$HOME/.graperoot-pro}"
 exec "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/launch.py" "${@}"

@@ -44,6 +44,12 @@ cp "$RELEASE_DIR/bin/dgc-pro-doctor.py" "$STAGE/bin/"
 cp "$RELEASE_DIR/bin/dgc-pro-doctor"    "$STAGE/bin/"
 chmod +x "$STAGE/bin/dgc-pro-doctor"
 
+# 5b. Shims — call launch.py directly (not launch_pro.sh which is not in tarball)
+for shim in dgc-pro dg-pro graperoot-pro; do
+  cp "$RELEASE_DIR/bin/$shim" "$STAGE/bin/$shim"
+  chmod +x "$STAGE/bin/$shim"
+done
+
 # 6. LICENSE / terms
 cat > "$STAGE/LICENSE.txt" <<'EOF'
 GrapeRoot Pro — Commercial License

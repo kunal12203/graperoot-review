@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
 # dg-pro — GrapeRoot Pro launcher for OpenAI Codex
-#
-# Usage:
-#   dg-pro                          # scan current directory, start codex
-#   dg-pro /path/to/project         # scan given project, start codex
-#   dg-pro /path/to/project "task"  # scan and start with a prompt
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$SCRIPT_DIR/launch_pro.sh" "${1:-.}" --codex "${@:2}"
+INSTALL_DIR="${GRAPEROOT_PRO_HOME:-$HOME/.graperoot-pro}"
+exec "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/launch.py" "${1:-.}" --codex "${@:2}"
