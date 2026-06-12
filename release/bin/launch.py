@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.42: fix zero token counts — read transcript JSONL instead of Stop hook payload
+         (Claude Code Stop hook sends session metadata only, not usage)
+
 v1.0.41: separate Pro telemetry DB (PRO_DATABASE_URL) from leaderboard DB,
          stop_hook.py as file (fixes zero token counts), silent stop hook errors,
          exhaustive free-tier dual-graph cleanup on launch (_is_free_tier_hook)
@@ -651,20 +654,42 @@ def write_stop_hook(project: Path, port: int) -> None:
     stop_py.write_text(
         "import sys, json, urllib.request\n"
         "try:\n"
-        "    d = json.load(sys.stdin)\n"
-        "    u = d.get('usage', {})\n"
-        "    inp = u.get('input_tokens', 0)\n"
-        "    out = u.get('output_tokens', 0)\n"
-        "    cr  = u.get('cache_read_input_tokens', 0)\n"
-        "    cw  = u.get('cache_creation_input_tokens', 0)\n"
-        "    m   = d.get('model', 'claude-sonnet-4-6')\n"
-        "    op  = 'opus' in m.lower()\n"
+        "    d = json.loads(sys.stdin.read())\n"
+        "    session_id = d.get('session_id', '')\n"
+        "    transcript_path = d.get('transcript_path', '')\n"
+        "    model = 'claude-sonnet-4-6'\n"
+        "    inp = out = cr = cw = 0\n"
+        "    if transcript_path:\n"
+        "        try:\n"
+        "            with open(transcript_path, 'r', encoding='utf-8') as f:\n"
+        "                for line in f:\n"
+        "                    line = line.strip()\n"
+        "                    if not line: continue\n"
+        "                    try: entry = json.loads(line)\n"
+        "                    except Exception: continue\n"
+        "                    u = entry.get('usage', {})\n"
+        "                    if u:\n"
+        "                        inp += u.get('input_tokens', 0)\n"
+        "                        out += u.get('output_tokens', 0)\n"
+        "                        cr  += u.get('cache_read_input_tokens', 0)\n"
+        "                        cw  += u.get('cache_creation_input_tokens', 0)\n"
+        "                    msg = entry.get('message', {})\n"
+        "                    if isinstance(msg, dict):\n"
+        "                        mu = msg.get('usage', {})\n"
+        "                        if mu:\n"
+        "                            inp += mu.get('input_tokens', 0)\n"
+        "                            out += mu.get('output_tokens', 0)\n"
+        "                            cr  += mu.get('cache_read_input_tokens', 0)\n"
+        "                            cw  += mu.get('cache_creation_input_tokens', 0)\n"
+        "                        if msg.get('model'): model = msg['model']\n"
+        "        except Exception: pass\n"
+        "    op  = 'opus' in model.lower()\n"
         "    tc  = (inp*(15 if op else 3) + cw*(18.75 if op else 3.75) + cr*(1.5 if op else 0.3) + out*(75 if op else 15)) / 1e6\n"
         "    nc  = ((inp+cw+cr)*(15 if op else 3) + out*(75 if op else 15)) / 1e6\n"
         "    sp  = (nc-tc)/nc if nc > 0 else 0\n"
         f"    lk  = open('{license_file}').read().strip()\n"
         "    p   = json.dumps({\n"
-        "        'license_key': lk, 'session_id': d.get('session_id', ''), 'model': m,\n"
+        "        'license_key': lk, 'session_id': session_id, 'model': model,\n"
         "        'input_tokens': inp, 'output_tokens': out,\n"
         "        'cache_read_tokens': cr, 'cache_write_tokens': cw,\n"
         "        'total_cost_usd': round(tc, 6), 'naive_cost_usd': round(nc, 6),\n"

@@ -1,3 +1,8 @@
+1.0.42  (2026-06-12)
+- Fixed: usage telemetry was logging zero tokens for all sessions. Root cause:
+  Claude Code's Stop hook sends session metadata only (no usage field). Fix reads
+  token counts directly from the session transcript JSONL file instead.
+
 1.0.41  (2026-06-12)
 - Added: Auto-removes free-tier dual-graph MCP when Pro launches. Pro is a superset
   (20 tools vs 10) — running both causes duplicate tools and Claude picks the wrong one.
