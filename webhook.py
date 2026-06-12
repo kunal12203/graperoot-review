@@ -919,12 +919,36 @@ def api_graph_status(owner, repo):
 
 # ── Usage telemetry ────────────────────────────────────────────────────────────
 
+def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int):
+    """Return (total_cost_usd, naive_cost_usd, savings_pct) for the given token counts."""
+    m = (model or "").lower()
+    if "opus" in m:
+        pr = (15.0, 18.75, 1.5, 75.0)
+    elif "fable" in m:
+        pr = (10.0, 12.5,  1.0, 50.0)
+    else:  # sonnet / haiku / default
+        pr = (3.0,  3.75,  0.3, 15.0)
+    tc = (inp * pr[0] + cw * pr[1] + cr * pr[2] + out * pr[3]) / 1e6
+    nc = ((inp + cw + cr) * pr[0] + out * pr[3]) / 1e6
+    sp = (nc - tc) / nc if nc > 0 else 0.0
+    return round(tc, 6), round(nc, 6), round(sp, 4)
+
+
 @app.route("/api/usage", methods=["POST"])
 def api_usage_ingest():
     data = request.get_json(silent=True) or {}
     key  = data.get("license_key", "")
     if not key or not key.startswith("GRP-"):
         return jsonify({"error": "invalid license_key"}), 400
+
+    inp = int(data.get("input_tokens", 0))
+    out = int(data.get("output_tokens", 0))
+    cr  = int(data.get("cache_read_tokens", 0))
+    cw  = int(data.get("cache_write_tokens", 0))
+    model = data.get("model") or ""
+
+    tc, nc, sp = _calc_cost(model, inp, out, cr, cw)
+
     ph = _pro_ph(17)
     ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
     _pro_query_write(
@@ -934,12 +958,11 @@ def api_usage_ingest():
         f"tokens_served, tokens_avoided, tool_hits, "
         f"task_type, confidence, project_hash) "
         f"VALUES ({ph})",
-        (key, data.get("session_id"), ts, data.get("model"),
-         int(data.get("input_tokens", 0)), int(data.get("output_tokens", 0)),
-         int(data.get("cache_read_tokens", 0)), int(data.get("cache_write_tokens", 0)),
-         float(data.get("total_cost_usd", 0.0)), float(data.get("naive_cost_usd", 0.0)),
-         float(data.get("savings_pct", 0.0)),
-         int(data.get("tokens_served", 0)), int(data.get("tokens_avoided", 0)),
+        (key, data.get("session_id"), ts, model,
+         inp, out, cr, cw,
+         tc, nc, sp,
+         int(data.get("tokens_served", inp + cw + cr + out)),
+         int(data.get("tokens_avoided", 0)),
          data.get("tool_hits"),
          data.get("task_type"), data.get("confidence"), data.get("project_hash"))
     )
