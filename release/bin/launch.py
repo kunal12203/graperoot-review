@@ -206,28 +206,51 @@ def build_graph(project: Path, data_dir: Path) -> None:
         print(f"[dgc-pro] scan failed — starting without graph", flush=True)
 
 
+def _is_free_tier_hook(cmd: str) -> bool:
+    """Return True if cmd belongs to the free-tier dual-graph (not Pro)."""
+    if ".dual-graph-pro" in cmd or "graperoot-pro" in cmd:
+        return False
+    if "/session/end" in cmd or "undo_shield" in cmd:
+        return True
+    # Match .dual-graph followed by path separator or quote (not .dual-graph-pro)
+    import re
+    return bool(re.search(r'\.dual-graph[/\\"\'\s]', cmd))
+
+
 def _remove_free_tier_mcp() -> None:
-    """Remove dual-graph (free tier) from user-level MCP configs and kill its process.
+    """Remove dual-graph (free tier) from all MCP configs and kill its process.
 
     Pro is a superset — running both causes duplicate tools and confusion.
+    Searches: top-level mcpServers, per-project mcpServers, and settings.local.json.
     """
     removed = False
 
-    # 1. Remove from ~/.claude.json (user-level Claude Code config)
+    # 1. Remove from ~/.claude.json — both top-level AND per-project entries
     claude_cfg = Path.home() / ".claude.json"
     if claude_cfg.exists():
         try:
             data = json.loads(claude_cfg.read_text(encoding="utf-8"))
+            # Top-level mcpServers
             servers = data.get("mcpServers", {})
             if "dual-graph" in servers:
                 del servers["dual-graph"]
                 data["mcpServers"] = servers
-                claude_cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
                 removed = True
+            # Per-project mcpServers (projects dict keyed by path)
+            projects = data.get("projects", {})
+            for proj_path, proj_data in projects.items():
+                if isinstance(proj_data, dict):
+                    proj_servers = proj_data.get("mcpServers", {})
+                    if "dual-graph" in proj_servers:
+                        del proj_servers["dual-graph"]
+                        proj_data["mcpServers"] = proj_servers
+                        removed = True
+            if removed:
+                claude_cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         except Exception:
             pass
 
-    # 2. Remove from ~/.claude/settings.local.json (local MCPs section)
+    # 2. Remove from ~/.claude/settings.local.json
     claude_local = Path.home() / ".claude" / "settings.local.json"
     if claude_local.exists():
         try:
@@ -241,7 +264,42 @@ def _remove_free_tier_mcp() -> None:
         except Exception:
             pass
 
-    # 3. Kill any running dual-graph MCP server process
+    # 3. Clean stale dual-graph hooks from project settings.local.json
+    project = Path.cwd()
+    proj_settings = project / ".claude" / "settings.local.json"
+    if proj_settings.exists():
+        try:
+            sdata = json.loads(proj_settings.read_text(encoding="utf-8"))
+            hooks = sdata.get("hooks", {})
+            dirty = False
+            for event in list(hooks.keys()):
+                entries = hooks[event]
+                if not isinstance(entries, list):
+                    continue
+                cleaned = []
+                for entry in entries:
+                    hook_list = entry.get("hooks", [])
+                    filtered = [h for h in hook_list
+                                if not (_is_free_tier_hook(h.get("command", "")))]
+                    if filtered:
+                        entry["hooks"] = filtered
+                        cleaned.append(entry)
+                    elif hook_list:
+                        dirty = True
+                if cleaned != entries:
+                    hooks[event] = cleaned
+                    dirty = True
+                if not hooks[event]:
+                    del hooks[event]
+                    dirty = True
+            if dirty:
+                sdata["hooks"] = hooks
+                proj_settings.write_text(json.dumps(sdata, indent=2) + "\n", encoding="utf-8")
+                removed = True
+        except Exception:
+            pass
+
+    # 4. Kill any running dual-graph MCP server process
     try:
         if IS_WINDOWS:
             r = subprocess.run(["wmic", "process", "where",
@@ -533,13 +591,24 @@ def write_hooks(project: Path, data_dir: Path) -> None:
     gate_entry = {"matcher": "Bash|Read", "hooks": [{"type": "command", "command": gate_cmd}]}
     sync_entry = {"matcher": "Write|Edit", "hooks": [{"type": "command", "command": sync_cmd}]}
     hooks = existing.setdefault("hooks", {})
-    # Clean stale entries
+    # Clean stale entries (Pro's own graph_gate/sync + free-tier dual-graph hooks)
     for hook_type in ("PreToolUse", "PostToolUse"):
         old = hooks.get(hook_type, [])
         hooks[hook_type] = [e for e in old if not any(
-            "graph_gate" in h.get("command", "") or "graph_sync" in h.get("command", "")
+            "graph_gate" in h.get("command", "")
+            or "graph_sync" in h.get("command", "")
+            or _is_free_tier_hook(h.get("command", ""))
             for h in e.get("hooks", [])
         )]
+    # Clean stale SessionStart/PreCompact (dual-graph prime.sh)
+    for hook_type in ("SessionStart", "PreCompact"):
+        old = hooks.get(hook_type, [])
+        hooks[hook_type] = [e for e in old if not any(
+            _is_free_tier_hook(h.get("command", ""))
+            for h in e.get("hooks", [])
+        )]
+        if not hooks[hook_type]:
+            del hooks[hook_type]
     hooks.setdefault("PreToolUse", []).insert(0, gate_entry)
     hooks.setdefault("PostToolUse", []).insert(0, sync_entry)
     existing["hooks"] = hooks
@@ -575,46 +644,37 @@ def write_stop_hook(project: Path, port: int) -> None:
     project_hash = hashlib.sha256(str(project).encode()).hexdigest()[:16]
     stop_script = (
         f'{python} -c "'
-        "import sys,json,urllib.request,hashlib;"
-        "d=json.load(sys.stdin);"
-        "u=d.get('usage',{});"
-        "inp=u.get('input_tokens',0);"
-        "out=u.get('output_tokens',0);"
-        "cr=u.get('cache_read_input_tokens',0);"
-        "cw=u.get('cache_creation_input_tokens',0);"
-        "m=d.get('model','claude-sonnet-4-6');"
-        "op='opus' in m.lower();"
+        "import sys,json,urllib.request,hashlib\n"
+        "try:\n"
+        " d=json.load(sys.stdin);u=d.get('usage',{});"
+        "inp=u.get('input_tokens',0);out=u.get('output_tokens',0);"
+        "cr=u.get('cache_read_input_tokens',0);cw=u.get('cache_creation_input_tokens',0);"
+        "m=d.get('model','claude-sonnet-4-6');op='opus' in m.lower();"
         "tc=(inp*(15 if op else 3)+cw*(18.75 if op else 3.75)+cr*(1.5 if op else 0.3)+out*(75 if op else 15))/1e6;"
         "nc=((inp+cw+cr)*(15 if op else 3)+out*(75 if op else 15))/1e6;"
         "sp=(nc-tc)/nc if nc>0 else 0;"
         f"lk=open('{license_file}').read().strip();"
         "p=json.dumps({"
-        "'license_key':lk,"
-        "'session_id':d.get('session_id',''),"
-        "'model':m,"
-        "'input_tokens':inp,"
-        "'output_tokens':out,"
-        "'cache_read_tokens':cr,"
-        "'cache_write_tokens':cw,"
-        "'total_cost_usd':round(tc,6),"
-        "'naive_cost_usd':round(nc,6),"
-        "'savings_pct':round(sp,4),"
-        "'tokens_served':inp+cw+cr+out,"
-        "'tokens_avoided':0,"
-        "'tool_hits':'{}',"
-        "'task_type':'session',"
-        "'confidence':'none',"
-        f"'project_hash':'{project_hash}'"
+        "'license_key':lk,'session_id':d.get('session_id',''),'model':m,"
+        "'input_tokens':inp,'output_tokens':out,'cache_read_tokens':cr,'cache_write_tokens':cw,"
+        "'total_cost_usd':round(tc,6),'naive_cost_usd':round(nc,6),'savings_pct':round(sp,4),"
+        "'tokens_served':inp+cw+cr+out,'tokens_avoided':0,'tool_hits':'{}',"
+        f"'task_type':'session','confidence':'none','project_hash':'{project_hash}'"
         "}).encode();"
         "urllib.request.urlopen(urllib.request.Request("
         "'https://graperoot-review-production.up.railway.app/api/usage',"
-        "data=p,headers={'Content-Type':'application/json'},method='POST'),timeout=5)"
+        "data=p,headers={'Content-Type':'application/json'},method='POST'),timeout=5)\n"
+        "except Exception:\n"
+        " pass"
         '"'
     )
     stop_entry = {"matcher": "", "hooks": [{"type": "command", "command": stop_script}]}
     hooks = existing.setdefault("hooks", {})
     old_stop = hooks.get("Stop", [])
-    hooks["Stop"] = [e for e in old_stop if "/api/usage" not in json.dumps(e)]
+    hooks["Stop"] = [e for e in old_stop
+                     if "/api/usage" not in json.dumps(e)
+                     and "/session/end" not in json.dumps(e)
+                     and "dual-graph/stop.sh" not in json.dumps(e)]
     hooks["Stop"].append(stop_entry)
     existing["hooks"] = hooks
     settings_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
