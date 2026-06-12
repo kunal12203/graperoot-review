@@ -1,4 +1,4 @@
-1.0.40  (2026-06-12)
+1.0.41  (2026-06-12)
 - Added: Auto-removes free-tier dual-graph MCP when Pro launches. Pro is a superset
   (20 tools vs 10) — running both causes duplicate tools and Claude picks the wrong one.
   Removes from ~/.claude.json, ~/.claude/settings.local.json, and kills its process.

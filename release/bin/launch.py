@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.41: separate Pro telemetry DB (PRO_DATABASE_URL) from leaderboard DB,
+         stop_hook.py as file (fixes zero token counts), silent stop hook errors,
+         exhaustive free-tier dual-graph cleanup on launch (_is_free_tier_hook)
+
 v1.0.40: auto-remove free-tier dual-graph when Pro is active (Pro is a superset)
 
 v1.0.39: fix Stop hook to POST directly to Railway webhook (not local /session/end)
@@ -965,7 +969,7 @@ def main() -> None:
         auto_update()
 
     if args.version:
-        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.40"
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.41"
         print(f"{label} v{ver}  (platform: {tool})")
         return
 
