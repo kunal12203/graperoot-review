@@ -698,6 +698,7 @@ def write_stop_hook(project: Path, port: int) -> None:
         "        'tokens_avoided': 0, 'tool_hits': '{}',\n"
         "        'task_type': 'prompt', 'confidence': 'none',\n"
         "        'project_hash': project_hash,\n"
+        "        'device_host': __import__('socket').gethostname(),\n"
         "    }).encode()\n"
         "    urllib.request.urlopen(urllib.request.Request(\n"
         "        'https://graperoot-review-production.up.railway.app/api/usage',\n"

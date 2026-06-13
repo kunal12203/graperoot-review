@@ -296,11 +296,23 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_served INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tool_hits TEXT",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS device_host TEXT DEFAULT 'unknown'",
+        """CREATE TABLE IF NOT EXISTS token_savings (
+            id             SERIAL PRIMARY KEY,
+            license_key    TEXT NOT NULL,
+            date           DATE NOT NULL,
+            tokens_saved   BIGINT DEFAULT 0,
+            requests_count INT DEFAULT 0,
+            device_host    TEXT DEFAULT 'unknown',
+            CONSTRAINT uq_ts_key_date_host UNIQUE (license_key, date, device_host)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_ts_license_date ON token_savings(license_key, date)",
     ]
     pro_cols_sq = [
         "ALTER TABLE usage_events ADD COLUMN tokens_served INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN tool_hits TEXT",
+        "ALTER TABLE usage_events ADD COLUMN device_host TEXT DEFAULT 'unknown'",
     ]
     if _pro_is_pg():
         con = _pro_pg_conn()
@@ -953,14 +965,15 @@ def api_usage_ingest():
 
     tc, nc, sp = _calc_cost(model, inp, out, cr, cw)
 
-    ph = _pro_ph(17)
+    device_host = (data.get("device_host") or "unknown")[:128]
+    ph = _pro_ph(18)
     ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
     _pro_query_write(
         f"INSERT INTO usage_events (license_key, session_id, timestamp, model, "
         f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
         f"total_cost_usd, naive_cost_usd, savings_pct, "
         f"tokens_served, tokens_avoided, tool_hits, "
-        f"task_type, confidence, project_hash) "
+        f"task_type, confidence, project_hash, device_host) "
         f"VALUES ({ph})",
         (key, data.get("session_id"), ts, model,
          inp, out, cr, cw,
@@ -968,8 +981,22 @@ def api_usage_ingest():
          int(data.get("tokens_served", inp + cw + cr + out)),
          int(data.get("tokens_avoided", 0)),
          data.get("tool_hits"),
-         data.get("task_type"), data.get("confidence"), data.get("project_hash"))
+         data.get("task_type"), data.get("confidence"), data.get("project_hash"),
+         device_host)
     )
+
+    # Write to token_savings for the Pro dashboard savings chart
+    if cr > 0:
+        ts_date = ts[:10]  # YYYY-MM-DD
+        _pro_query_write(
+            f"INSERT INTO token_savings (license_key, date, tokens_saved, requests_count, device_host) "
+            f"VALUES ({_pro_ph(5)}) "
+            f"ON CONFLICT (license_key, date, device_host) DO UPDATE SET "
+            f"tokens_saved = token_savings.tokens_saved + EXCLUDED.tokens_saved, "
+            f"requests_count = token_savings.requests_count + 1",
+            (key, ts_date, cr, 1, device_host)
+        )
+
     return jsonify({"ok": True})
 
 
