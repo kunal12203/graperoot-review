@@ -1078,7 +1078,7 @@ def api_usage_stats():
 
     by_day = _pro_query(
         f"SELECT "
-        f"{'DATE(timestamp)::text' if is_pg else 'substr(timestamp,1,10)'} AS date, "
+        f"{'TO_CHAR(DATE(timestamp), \'YYYY-MM-DD\')' if is_pg else 'substr(timestamp,1,10)'} AS date, "
         f"COUNT(*) AS turns, SUM(input_tokens) AS input_tokens, "
         f"SUM(cache_read_tokens) AS cache_read_tokens, "
         f"SUM(total_cost_usd) AS total_cost_usd, SUM(naive_cost_usd) AS naive_cost_usd, "
@@ -1089,7 +1089,7 @@ def api_usage_stats():
         f"SUM(shadow_tokens_avoided) AS shadow_tokens_avoided "
         f"FROM usage_events WHERE license_key = {ph1} AND {window} "
         f"GROUP BY {'DATE(timestamp)' if is_pg else 'substr(timestamp,1,10)'} "
-        f"ORDER BY date DESC",
+        f"ORDER BY {'DATE(timestamp)' if is_pg else 'date'} DESC",
         (key, start, end)
     )
 
