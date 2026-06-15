@@ -1026,20 +1026,6 @@ def api_usage_ingest():
          tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens)
     )
 
-    # Write to token_savings for the Pro dashboard savings chart
-    # Only count real graph savings (TAR + cross-turn + shadow), not cache reads
-    total_saved = tokens_avoided + tokens_avoided_compounding
-    if total_saved > 0:
-        ts_date = ts[:10]  # YYYY-MM-DD
-        saved_count = total_saved
-        _pro_query_write(
-            f"INSERT INTO token_savings (license_key, date, tokens_saved, requests_count, device_host) "
-            f"VALUES ({_pro_ph(5)}) "
-            f"ON CONFLICT (license_key, date, device_host) DO UPDATE SET "
-            f"tokens_saved = token_savings.tokens_saved + EXCLUDED.tokens_saved, "
-            f"requests_count = token_savings.requests_count + 1",
-            (key, ts_date, saved_count, 1, device_host)
-        )
 
     return jsonify({"ok": True})
 
@@ -1205,28 +1191,28 @@ def api_savings_chart():
 
     if is_pg:
         rows = _pro_query(
-            f"SELECT date::text AS date, "
-            f"SUM(tokens_saved) AS tokens_saved, SUM(requests_count) AS requests_count "
-            f"FROM token_savings WHERE license_key = {ph1} "
-            f"AND date >= CURRENT_DATE - INTERVAL '{days} days' "
-            f"GROUP BY date ORDER BY date ASC",
+            f"SELECT TO_CHAR(DATE(timestamp), 'YYYY-MM-DD') AS date, "
+            f"SUM(tokens_avoided) AS tokens_saved, COUNT(*) AS requests_count "
+            f"FROM usage_events WHERE license_key = {ph1} "
+            f"AND timestamp >= (CURRENT_DATE - INTERVAL '{days} days')::text "
+            f"AND tokens_avoided > 0 "
+            f"GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) ASC",
             (key,)
         )
     else:
         rows = _pro_query(
-            f"SELECT date, SUM(tokens_saved) AS tokens_saved, SUM(requests_count) AS requests_count "
-            f"FROM token_savings WHERE license_key = {ph1} "
-            f"AND date >= date('now', '-{days} days') "
-            f"GROUP BY date ORDER BY date ASC",
+            f"SELECT substr(timestamp,1,10) AS date, "
+            f"SUM(tokens_avoided) AS tokens_saved, COUNT(*) AS requests_count "
+            f"FROM usage_events WHERE license_key = {ph1} "
+            f"AND timestamp >= date('now', '-{days} days') "
+            f"AND tokens_avoided > 0 "
+            f"GROUP BY substr(timestamp,1,10) ORDER BY date ASC",
             (key,)
         )
 
     total_tokens_saved = sum(int(r.get("tokens_saved") or 0) for r in rows)
     total_requests     = sum(int(r.get("requests_count") or 0) for r in rows)
-
-    # Estimate USD saved: tokens_saved are vanilla-equivalent tokens at $15/M (Opus rate)
-    # Frontend can override with user's actual model price if known
-    tokens_saved_usd = round(total_tokens_saved * 15.0 / 1_000_000, 4)
+    tokens_saved_usd   = round(total_tokens_saved * 3.0 / 1_000_000, 4)
 
     return jsonify({
         "license_key":       key,
