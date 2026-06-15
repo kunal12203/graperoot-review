@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.46: stop_hook reads port from <project>/.dual-graph-pro/port — fixes 0
+         savings when switching projects or running concurrent sessions; dedup
+         Stop hooks so they don't accumulate across repeated dgc-pro invocations
+
 v1.0.45: real token savings telemetry — stop_hook reads /savings breakdown
          (tokens_avoided_tar, cross_turn, shadow) and sends to Railway;
          webhook stores breakdown columns + /api/usage/savings-chart endpoint
@@ -700,15 +704,19 @@ def write_stop_hook(project: Path, port: int) -> None:
         "    graperoot_overhead_tokens = 0\n"
         "    tool_hits_str = '{}'\n"
         "    try:\n"
-        f"        resp = urllib.request.urlopen('http://127.0.0.1:{port}/savings', timeout=3)\n"
-        "        savings = json.loads(resp.read())\n"
-        "        if savings.get('ok'):\n"
-        "            tokens_avoided = savings.get('tokens_avoided', 0)\n"
-        "            tokens_avoided_tar = savings.get('tokens_avoided_tar', 0)\n"
-        "            tokens_avoided_cross_turn = savings.get('tokens_avoided_cross_turn', 0)\n"
-        "            shadow_tokens_avoided = savings.get('shadow_savings', {}).get('total_tokens', 0)\n"
-        "            graperoot_overhead_tokens = savings.get('graperoot_overhead_tokens', 0)\n"
-        "            tool_hits_str = json.dumps(savings.get('tool_hits', {}))\n"
+        "        import os as _os\n"
+        "        _port_file = _os.path.join(cwd, '.dual-graph-pro', 'port') if cwd else ''\n"
+        "        _port = int(open(_port_file).read().strip()) if _port_file and _os.path.exists(_port_file) else 0\n"
+        "        if _port:\n"
+        "            resp = urllib.request.urlopen('http://127.0.0.1:%d/savings' % _port, timeout=3)\n"
+        "            savings = json.loads(resp.read())\n"
+        "            if savings.get('ok'):\n"
+        "                tokens_avoided = savings.get('tokens_avoided', 0)\n"
+        "                tokens_avoided_tar = savings.get('tokens_avoided_tar', 0)\n"
+        "                tokens_avoided_cross_turn = savings.get('tokens_avoided_cross_turn', 0)\n"
+        "                shadow_tokens_avoided = savings.get('shadow_savings', {}).get('total_tokens', 0)\n"
+        "                graperoot_overhead_tokens = savings.get('graperoot_overhead_tokens', 0)\n"
+        "                tool_hits_str = json.dumps(savings.get('tool_hits', {}))\n"
         "    except Exception: pass\n"
         f"    lk  = open('{license_file}').read().strip()\n"
         "    p   = json.dumps({\n"
@@ -740,7 +748,8 @@ def write_stop_hook(project: Path, port: int) -> None:
     hooks["Stop"] = [e for e in old_stop
                      if "/api/usage" not in json.dumps(e)
                      and "/session/end" not in json.dumps(e)
-                     and "dual-graph/stop.sh" not in json.dumps(e)]
+                     and "dual-graph/stop.sh" not in json.dumps(e)
+                     and "stop_hook.py" not in json.dumps(e)]
     hooks["Stop"].append(stop_entry)
     existing["hooks"] = hooks
     settings_file.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
@@ -801,6 +810,12 @@ def start_mcp_server(port: int, project: Path, data_dir: Path) -> subprocess.Pop
     if not wait_port(port, timeout=30):
         proc.terminate()
         sys.exit("[dgc-pro] MCP server failed to start within 30s (check ~/.graperoot-pro/server.log)")
+    # Write port so stop_hook can find it even if stop_hook.py was overwritten by another session
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "port").write_text(str(port))
+    except Exception:
+        pass
     return proc
 
 

@@ -1,3 +1,11 @@
+1.0.46  (2026-06-15)
+- Fixed: stop_hook now reads port from <project>/.dual-graph-pro/port so savings
+  are fetched from the correct MCP server even when multiple sessions run concurrently
+  or sessions switch projects. Old hardcoded port caused 0 savings in all cross-project
+  sessions.
+- Fixed: duplicate Stop hooks accumulating in .claude/settings.local.json across
+  repeated dgc-pro invocations on the same project.
+
 1.0.45  (2026-06-15)
 - Added: real token savings telemetry — stop_hook now reads /savings from the MCP
   server and sends full breakdown (tokens_avoided_tar, tokens_avoided_cross_turn,
