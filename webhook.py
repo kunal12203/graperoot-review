@@ -1036,19 +1036,28 @@ def api_usage_ingest():
 def api_usage_stats():
     key   = request.args.get("license_key", "")
     month = request.args.get("month", datetime.now(timezone.utc).strftime("%Y-%m"))
+    days  = request.args.get("days", None)
     if not key or not key.startswith("GRP-"):
         return jsonify({"error": "invalid license_key"}), 400
 
     is_pg = _pro_is_pg()
     ph1   = "%s" if is_pg else "?"
 
-    # Date window
-    start = f"{month}-01"
-    year, mon = int(month.split("-")[0]), int(month.split("-")[1])
-    if mon == 12:
-        end = f"{year + 1}-01-01"
+    # Date window — if days param provided, use rolling window instead of calendar month
+    if days:
+        try:
+            d = int(days)
+            from datetime import timedelta
+            start = (datetime.now(timezone.utc) - timedelta(days=d)).strftime("%Y-%m-%d")
+            end   = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        except Exception:
+            start = f"{month}-01"
+            year, mon = int(month.split("-")[0]), int(month.split("-")[1])
+            end = f"{year + 1}-01-01" if mon == 12 else f"{year}-{mon + 1:02d}-01"
     else:
-        end = f"{year}-{mon + 1:02d}-01"
+        start = f"{month}-01"
+        year, mon = int(month.split("-")[0]), int(month.split("-")[1])
+        end = f"{year + 1}-01-01" if mon == 12 else f"{year}-{mon + 1:02d}-01"
 
     window = f"timestamp >= {ph1} AND timestamp < {ph1}"
 
@@ -1089,7 +1098,7 @@ def api_usage_stats():
         f"cache_read_tokens, cache_write_tokens, total_cost_usd, naive_cost_usd, savings_pct, "
         f"tokens_served, tokens_avoided, tokens_avoided_tar, tokens_avoided_cross_turn, "
         f"shadow_tokens_avoided, graperoot_overhead_tokens, tool_hits, "
-        f"task_type, confidence, project_hash, session_id "
+        f"task_type, confidence, project_hash, session_id, device_host "
         f"FROM usage_events WHERE license_key = {ph1} AND {window} "
         f"ORDER BY timestamp DESC LIMIT 50",
         (key, start, end)
