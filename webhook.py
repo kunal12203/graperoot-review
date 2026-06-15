@@ -297,6 +297,10 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tool_hits TEXT",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS device_host TEXT DEFAULT 'unknown'",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided_tar INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided_cross_turn INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS shadow_tokens_avoided INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS graperoot_overhead_tokens INTEGER DEFAULT 0",
         """CREATE TABLE IF NOT EXISTS token_savings (
             id             SERIAL PRIMARY KEY,
             license_key    TEXT NOT NULL,
@@ -313,6 +317,10 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN tool_hits TEXT",
         "ALTER TABLE usage_events ADD COLUMN device_host TEXT DEFAULT 'unknown'",
+        "ALTER TABLE usage_events ADD COLUMN tokens_avoided_tar INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN tokens_avoided_cross_turn INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN shadow_tokens_avoided INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN graperoot_overhead_tokens INTEGER DEFAULT 0",
     ]
     if _pro_is_pg():
         con = _pro_pg_conn()
@@ -931,8 +939,16 @@ def api_graph_status(owner, repo):
 
 # ── Usage telemetry ────────────────────────────────────────────────────────────
 
-def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int):
-    """Return (total_cost_usd, naive_cost_usd, savings_pct) for the given token counts."""
+def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int,
+               tokens_avoided: int = 0, tokens_avoided_compounding: int = 0):
+    """Return (total_cost_usd, naive_cost_usd, savings_pct) for the given token counts.
+
+    tokens_avoided: one-time tokens never sent to context (priced at input_price)
+    tokens_avoided_compounding: cache re-bill savings on subsequent turns (priced at cache_read_price)
+
+    The formula: vanilla_cost = actual_cost + (avoided × input) + (compounding × cache_read)
+    This measures what the user WOULD have paid without GrapeRoot's excerpting.
+    """
     m = (model or "").lower()
     if "haiku" in m:
         pr = (1.0,  1.25,  0.1,  5.0)   # Haiku 4.5
@@ -945,7 +961,12 @@ def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int):
     else:
         pr = (3.0,  3.75,  0.3,  15.0)  # Sonnet 4.x / default
     tc = (inp * pr[0] + cw * pr[1] + cr * pr[2] + out * pr[3]) / 1e6
-    nc = ((inp + cw + cr) * pr[0] + out * pr[3]) / 1e6
+    if tokens_avoided > 0 or tokens_avoided_compounding > 0:
+        one_time_cost = tokens_avoided * pr[0] / 1e6
+        compounding_cost = tokens_avoided_compounding * pr[2] / 1e6
+        nc = tc + one_time_cost + compounding_cost
+    else:
+        nc = ((inp + cw + cr) * pr[0] + out * pr[3]) / 1e6
     sp = (nc - tc) / nc if nc > 0 else 0.0
     return round(tc, 6), round(nc, 6), round(sp, 4)
 
@@ -962,39 +983,49 @@ def api_usage_ingest():
     cr  = int(data.get("cache_read_tokens", 0))
     cw  = int(data.get("cache_write_tokens", 0))
     model = data.get("model") or ""
+    tokens_avoided = int(data.get("tokens_avoided", 0))
+    tokens_avoided_compounding = int(data.get("tokens_avoided_compounding", 0))
+    tokens_avoided_tar = int(data.get("tokens_avoided_tar", 0))
+    tokens_avoided_cross_turn = int(data.get("tokens_avoided_cross_turn", 0))
+    shadow_tokens_avoided = int(data.get("shadow_tokens_avoided", 0))
+    graperoot_overhead_tokens = int(data.get("graperoot_overhead_tokens", 0))
 
-    tc, nc, sp = _calc_cost(model, inp, out, cr, cw)
+    tc, nc, sp = _calc_cost(model, inp, out, cr, cw, tokens_avoided, tokens_avoided_compounding)
 
     device_host = (data.get("device_host") or "unknown")[:128]
-    ph = _pro_ph(18)
+    ph = _pro_ph(22)
     ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
     _pro_query_write(
         f"INSERT INTO usage_events (license_key, session_id, timestamp, model, "
         f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
         f"total_cost_usd, naive_cost_usd, savings_pct, "
         f"tokens_served, tokens_avoided, tool_hits, "
-        f"task_type, confidence, project_hash, device_host) "
+        f"task_type, confidence, project_hash, device_host, "
+        f"tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens) "
         f"VALUES ({ph})",
         (key, data.get("session_id"), ts, model,
          inp, out, cr, cw,
          tc, nc, sp,
          int(data.get("tokens_served", inp + cw + cr + out)),
-         int(data.get("tokens_avoided", 0)),
+         tokens_avoided + tokens_avoided_compounding,
          data.get("tool_hits"),
          data.get("task_type"), data.get("confidence"), data.get("project_hash"),
-         device_host)
+         device_host,
+         tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens)
     )
 
     # Write to token_savings for the Pro dashboard savings chart
-    if cr > 0:
+    total_saved = tokens_avoided + tokens_avoided_compounding
+    if total_saved > 0 or cr > 0:
         ts_date = ts[:10]  # YYYY-MM-DD
+        saved_count = total_saved if total_saved > 0 else cr
         _pro_query_write(
             f"INSERT INTO token_savings (license_key, date, tokens_saved, requests_count, device_host) "
             f"VALUES ({_pro_ph(5)}) "
             f"ON CONFLICT (license_key, date, device_host) DO UPDATE SET "
             f"tokens_saved = token_savings.tokens_saved + EXCLUDED.tokens_saved, "
             f"requests_count = token_savings.requests_count + 1",
-            (key, ts_date, cr, 1, device_host)
+            (key, ts_date, saved_count, 1, device_host)
         )
 
     return jsonify({"ok": True})
@@ -1026,7 +1057,11 @@ def api_usage_stats():
         f"SUM(cache_read_tokens) AS total_cache_read, SUM(cache_write_tokens) AS total_cache_write, "
         f"SUM(total_cost_usd) AS total_cost, SUM(naive_cost_usd) AS total_naive, "
         f"AVG(savings_pct) AS avg_savings, "
-        f"SUM(tokens_served) AS total_tokens_served, SUM(tokens_avoided) AS total_tokens_avoided "
+        f"SUM(tokens_served) AS total_tokens_served, SUM(tokens_avoided) AS total_tokens_avoided, "
+        f"SUM(tokens_avoided_tar) AS total_avoided_tar, "
+        f"SUM(tokens_avoided_cross_turn) AS total_avoided_cross_turn, "
+        f"SUM(shadow_tokens_avoided) AS total_shadow_avoided, "
+        f"SUM(graperoot_overhead_tokens) AS total_overhead "
         f"FROM usage_events WHERE license_key = {ph1} AND {window}",
         (key, start, end), one=True
     )
@@ -1038,7 +1073,10 @@ def api_usage_stats():
         f"SUM(cache_read_tokens) AS cache_read_tokens, "
         f"SUM(total_cost_usd) AS total_cost_usd, SUM(naive_cost_usd) AS naive_cost_usd, "
         f"AVG(savings_pct) AS savings_pct, "
-        f"SUM(tokens_served) AS tokens_served, SUM(tokens_avoided) AS tokens_avoided "
+        f"SUM(tokens_served) AS tokens_served, SUM(tokens_avoided) AS tokens_avoided, "
+        f"SUM(tokens_avoided_tar) AS tokens_avoided_tar, "
+        f"SUM(tokens_avoided_cross_turn) AS tokens_avoided_cross_turn, "
+        f"SUM(shadow_tokens_avoided) AS shadow_tokens_avoided "
         f"FROM usage_events WHERE license_key = {ph1} AND {window} "
         f"GROUP BY {'DATE(timestamp)' if is_pg else 'substr(timestamp,1,10)'} "
         f"ORDER BY date DESC",
@@ -1048,7 +1086,8 @@ def api_usage_stats():
     recent = _pro_query(
         f"SELECT id, timestamp, model, input_tokens, output_tokens, "
         f"cache_read_tokens, cache_write_tokens, total_cost_usd, naive_cost_usd, savings_pct, "
-        f"tokens_served, tokens_avoided, tool_hits, "
+        f"tokens_served, tokens_avoided, tokens_avoided_tar, tokens_avoided_cross_turn, "
+        f"shadow_tokens_avoided, graperoot_overhead_tokens, tool_hits, "
         f"task_type, confidence, project_hash, session_id "
         f"FROM usage_events WHERE license_key = {ph1} AND {window} "
         f"ORDER BY timestamp DESC LIMIT 50",
@@ -1059,6 +1098,10 @@ def api_usage_stats():
     total_naive = float(summary_row.get("total_naive") or 0)
     total_served  = int(summary_row.get("total_tokens_served")  or 0)
     total_avoided = int(summary_row.get("total_tokens_avoided") or 0)
+    total_avoided_tar         = int(summary_row.get("total_avoided_tar") or 0)
+    total_avoided_cross_turn  = int(summary_row.get("total_avoided_cross_turn") or 0)
+    total_shadow_avoided      = int(summary_row.get("total_shadow_avoided") or 0)
+    total_overhead            = int(summary_row.get("total_overhead") or 0)
     return jsonify({
         "license_key": key,
         "month": month,
@@ -1076,6 +1119,10 @@ def api_usage_stats():
             "total_tokens_avoided":     total_avoided,
             "tool_savings_pct":         round(total_avoided / (total_served + total_avoided) * 100, 2)
                                         if (total_served + total_avoided) > 0 else 0,
+            "tokens_avoided_tar":         total_avoided_tar,
+            "tokens_avoided_cross_turn":  total_avoided_cross_turn,
+            "shadow_tokens_avoided":      total_shadow_avoided,
+            "graperoot_overhead_tokens":  total_overhead,
         },
         "by_day":  by_day,
         "recent":  recent,
@@ -1117,6 +1164,63 @@ def api_usage_export():
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename=graperoot-usage-{month}.csv"}
     )
+
+
+@app.route("/api/usage/savings-chart")
+def api_savings_chart():
+    """Daily savings chart data from token_savings table.
+
+    Returns last N days of tokens_saved and requests_count aggregated per day.
+    Used for the savings trend chart on the Pro dashboard.
+    """
+    key  = request.args.get("license_key", "")
+    days = min(int(request.args.get("days", 30)), 90)
+    if not key or not key.startswith("GRP-"):
+        return jsonify({"error": "invalid license_key"}), 400
+
+    is_pg = _pro_is_pg()
+    ph1   = "%s" if is_pg else "?"
+
+    if is_pg:
+        rows = _pro_query(
+            f"SELECT date::text AS date, "
+            f"SUM(tokens_saved) AS tokens_saved, SUM(requests_count) AS requests_count "
+            f"FROM token_savings WHERE license_key = {ph1} "
+            f"AND date >= CURRENT_DATE - INTERVAL '{days} days' "
+            f"GROUP BY date ORDER BY date ASC",
+            (key,)
+        )
+    else:
+        rows = _pro_query(
+            f"SELECT date, SUM(tokens_saved) AS tokens_saved, SUM(requests_count) AS requests_count "
+            f"FROM token_savings WHERE license_key = {ph1} "
+            f"AND date >= date('now', '-{days} days') "
+            f"GROUP BY date ORDER BY date ASC",
+            (key,)
+        )
+
+    total_tokens_saved = sum(int(r.get("tokens_saved") or 0) for r in rows)
+    total_requests     = sum(int(r.get("requests_count") or 0) for r in rows)
+
+    # Estimate USD saved: tokens_saved are vanilla-equivalent tokens at $15/M (Opus rate)
+    # Frontend can override with user's actual model price if known
+    tokens_saved_usd = round(total_tokens_saved * 15.0 / 1_000_000, 4)
+
+    return jsonify({
+        "license_key":       key,
+        "days":              days,
+        "total_tokens_saved": total_tokens_saved,
+        "total_requests":    total_requests,
+        "estimated_saved_usd": tokens_saved_usd,
+        "chart": [
+            {
+                "date":           r["date"],
+                "tokens_saved":   int(r.get("tokens_saved") or 0),
+                "requests_count": int(r.get("requests_count") or 0),
+            }
+            for r in rows
+        ],
+    })
 
 
 # ── Webhook ────────────────────────────────────────────────────────────────────

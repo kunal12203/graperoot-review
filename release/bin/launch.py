@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.45: real token savings telemetry — stop_hook reads /savings breakdown
+         (tokens_avoided_tar, cross_turn, shadow) and sends to Railway;
+         webhook stores breakdown columns + /api/usage/savings-chart endpoint
+
 v1.0.44: shims call launch.py directly (not launch_pro.sh), version.txt sync fixed,
          cost calculation moved server-side (Railway webhook)
 
@@ -667,7 +671,6 @@ def write_stop_hook(project: Path, port: int) -> None:
         "    project_hash = hashlib.sha256(cwd.encode()).hexdigest()[:16] if cwd else 'unknown'\n"
         "    model = 'claude-sonnet-4-6'\n"
         "    inp = out = cr = cw = 0\n"
-        "    # Read only the LAST usage entry in the transcript (this turn's tokens only)\n"
         "    if transcript_path:\n"
         "        try:\n"
         "            last_u = None\n"
@@ -690,12 +693,34 @@ def write_stop_hook(project: Path, port: int) -> None:
         "                cr  = last_u.get('cache_read_input_tokens', 0)\n"
         "                cw  = last_u.get('cache_creation_input_tokens', 0)\n"
         "        except Exception: pass\n"
+        "    tokens_avoided = 0\n"
+        "    tokens_avoided_tar = 0\n"
+        "    tokens_avoided_cross_turn = 0\n"
+        "    shadow_tokens_avoided = 0\n"
+        "    graperoot_overhead_tokens = 0\n"
+        "    tool_hits_str = '{}'\n"
+        "    try:\n"
+        f"        resp = urllib.request.urlopen('http://127.0.0.1:{port}/savings', timeout=3)\n"
+        "        savings = json.loads(resp.read())\n"
+        "        if savings.get('ok'):\n"
+        "            tokens_avoided = savings.get('tokens_avoided', 0)\n"
+        "            tokens_avoided_tar = savings.get('tokens_avoided_tar', 0)\n"
+        "            tokens_avoided_cross_turn = savings.get('tokens_avoided_cross_turn', 0)\n"
+        "            shadow_tokens_avoided = savings.get('shadow_savings', {}).get('total_tokens', 0)\n"
+        "            graperoot_overhead_tokens = savings.get('graperoot_overhead_tokens', 0)\n"
+        "            tool_hits_str = json.dumps(savings.get('tool_hits', {}))\n"
+        "    except Exception: pass\n"
         f"    lk  = open('{license_file}').read().strip()\n"
         "    p   = json.dumps({\n"
         "        'license_key': lk, 'session_id': session_id, 'model': model,\n"
         "        'input_tokens': inp, 'output_tokens': out,\n"
         "        'cache_read_tokens': cr, 'cache_write_tokens': cw,\n"
-        "        'tokens_avoided': 0, 'tool_hits': '{}',\n"
+        "        'tokens_avoided': tokens_avoided,\n"
+        "        'tokens_avoided_tar': tokens_avoided_tar,\n"
+        "        'tokens_avoided_cross_turn': tokens_avoided_cross_turn,\n"
+        "        'shadow_tokens_avoided': shadow_tokens_avoided,\n"
+        "        'graperoot_overhead_tokens': graperoot_overhead_tokens,\n"
+        "        'tool_hits': tool_hits_str,\n"
         "        'task_type': 'prompt', 'confidence': 'none',\n"
         "        'project_hash': project_hash,\n"
         "        'device_host': __import__('socket').gethostname(),\n"

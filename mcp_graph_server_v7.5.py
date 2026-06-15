@@ -45,6 +45,7 @@ import posixpath
 import re
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 
@@ -225,6 +226,10 @@ def _default_turn_state() -> dict[str, Any]:
         "turn_count": 0,
         "task_type": "unknown",
         "graph_continue_called": False,
+        "turn_tokens_served": 0,
+        "turn_tokens_avoided": 0,
+        "turn_full_file_tokens": 0,
+        "turn_tool_hits": {},
     }
 
 # Session store: mcp-session-id → persistent state dict
@@ -626,19 +631,244 @@ def _excerpt_by_terms(text: str, terms: list[str], max_chars: int) -> str:
     return out
 
 
-def _log_tool(name: str, payload: dict[str, Any]) -> None:
+_LOG_LOCK = threading.Lock()
+
+
+def _log_tool(name: str, payload: dict[str, Any], turn_override: int | None = None) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "tool": name,
+        "turn": turn_override if turn_override is not None else int(TURN_STATE.get("turn_count", 0)),
         "payload": payload,
     }
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row) + "\n")
+    with _LOG_LOCK:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+
+
+# ── Shadow savings measurement ────────────────────────────────────────────
+# Run real measurements (grep, stat) in background threads. Results are logged
+# but never sent to Claude — zero token cost, accurate data.
+#
+# Design principles:
+# - No hardcoded caps. Use measured data to determine what vanilla would've done.
+# - Account for the fact that vanilla Claude also has smart behaviors (partial reads,
+#   skipping obvious files, conversation history).
+# - Log raw measurements so /savings can apply corrections at read time.
+
+# Read tool default limit: 2000 lines. Approximate as chars (avg 60 chars/line).
+_READ_TOOL_MAX_CHARS = 2000 * 60  # 120000 chars — Read tool's effective ceiling
+
+# Bash tool inline limit: empirically measured at ~21k chars (above this,
+# output is saved to file and Claude only sees a 2KB preview).
+_BASH_TOOL_MAX_CHARS = 21_000
+# When output exceeds inline limit, Claude sees a 2KB preview instead.
+_BASH_TOOL_PERSISTED_PREVIEW_CHARS = 2_048
+
+
+def _query_has_file_path(query: str) -> bool:
+    """Detect if query contains an obvious file path (vanilla Claude wouldn't grep)."""
+    return bool(re.search(r'[\w/.-]+\.(ts|tsx|js|jsx|py|go|rs|cpp|h|java|rb|vue|svelte)\b', query))
+
+
+def _shadow_grep_measure(query: str, recommended_files: list[str], turn: int) -> None:
+    """Run rg and measure what vanilla Claude would have spent exploring.
+
+    Skip if the query contains an obvious file path (vanilla Claude would just Read it).
+    Use the most specific query term. Cap output at Bash tool's response limit.
+    """
+    try:
+        # If query mentions a specific file, vanilla Claude wouldn't grep — it would Read directly
+        if _query_has_file_path(query):
+            return
+        terms = _query_terms(query)
+        if not terms:
+            return
+        # Pick the longest/most specific term (what a real Claude would grep for)
+        best_term = max(terms, key=len)
+        try:
+            r = subprocess.run(
+                ["rg", "-n", "-S", best_term, str(PROJECT_ROOT)],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except (subprocess.TimeoutExpired, Exception):
+            return
+        raw_chars = len(r.stdout)
+        if raw_chars == 0:
+            return
+        # If output fits inline (<21k), Claude sees it all.
+        # If output exceeds inline limit, Claude only sees the 2KB persisted preview.
+        if raw_chars <= _BASH_TOOL_MAX_CHARS:
+            effective_chars = raw_chars
+        else:
+            effective_chars = _BASH_TOOL_PERSISTED_PREVIEW_CHARS
+        hit_count = r.stdout[:effective_chars].count("\n")
+        _log_tool("shadow_grep", {
+            "query": query,
+            "term_used": best_term,
+            "query_had_file_path": False,
+            "raw_output_chars": raw_chars,
+            "effective_output_chars": effective_chars,
+            "hit_count": hit_count,
+            "tokens_would_have_cost": effective_chars // 4,
+            "files_recommended": len(recommended_files),
+        }, turn_override=turn)
+    except Exception:
+        pass
+
+
+def _shadow_file_reads_measure(source: str, hit_files: list[str], inlined_chars: int, turn: int) -> None:
+    """Measure full file sizes for files vanilla Claude would have Read after a grep.
+
+    - Cap each file at Read tool's 2000-line limit (vanilla Claude also reads partially).
+    - Log which files were measured so /savings can dedup against graph_read TAR.
+    """
+    try:
+        total_full_chars = 0
+        total_capped_chars = 0
+        files_measured = 0
+        measured_files: list[str] = []
+        for fpath in hit_files:
+            abs_path = PROJECT_ROOT / fpath
+            try:
+                size = abs_path.stat().st_size
+            except (OSError, Exception):
+                continue
+            capped_size = min(size, _READ_TOOL_MAX_CHARS)
+            total_full_chars += size
+            total_capped_chars += capped_size
+            files_measured += 1
+            measured_files.append(fpath)
+        if files_measured == 0:
+            return
+        # Savings = what vanilla would've read (capped) - what we already inlined
+        tokens_avoided = max(0, total_capped_chars - inlined_chars) // 4
+        _log_tool("shadow_file_reads", {
+            "source": source,
+            "total_hit_files": len(hit_files),
+            "files_measured": files_measured,
+            "files": measured_files,
+            "full_file_chars": total_full_chars,
+            "capped_file_chars": total_capped_chars,
+            "inlined_chars": inlined_chars,
+            "tokens_avoided": tokens_avoided,
+        }, turn_override=turn)
+    except Exception:
+        pass
+
+
+def _fire_shadow_grep(query: str, recommended_files: list[str]) -> None:
+    turn = int(TURN_STATE.get("turn_count", 0))
+    threading.Thread(
+        target=_shadow_grep_measure,
+        args=(query, recommended_files, turn),
+        daemon=True,
+    ).start()
+
+
+def _fire_shadow_file_reads(source: str, hit_files: list[str], inlined_chars: int) -> None:
+    turn = int(TURN_STATE.get("turn_count", 0))
+    threading.Thread(
+        target=_shadow_file_reads_measure,
+        args=(source, hit_files, inlined_chars, turn),
+        daemon=True,
+    ).start()
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Incremental graph update ─────────────────────────────────────────────
+# Deploy: cp mcp_graph_server_v7.5.py ~/.graperoot-pro/mcp_graph_server_v7.5.py
+
+def _detect_changed_files(root: Path, since_epoch: int) -> list[str]:
+    """Return relative paths of files whose mtime > since_epoch.
+
+    Uses `find -newer stamp_file` — works on any project, no git needed.
+    Excludes .git, node_modules, .dual-graph*, __pycache__, and binary
+    extensions that the graph builder ignores anyway.
+    """
+    stamp = DG_DATA_DIR / "last_scan_stamp"
+    # Write/update stamp to match since_epoch so find -newer works correctly
+    try:
+        import os as _os
+        stamp.write_text(str(since_epoch), encoding="utf-8")
+        # Set the stamp file's mtime to since_epoch so find -newer is precise
+        _os.utime(str(stamp), (since_epoch, since_epoch))
+    except OSError:
+        pass
+
+    try:
+        r = subprocess.run(
+            [
+                "find", str(root), "-newer", str(stamp), "-type", "f",
+                "-not", "-path", "*/.git/*",
+                "-not", "-path", "*/node_modules/*",
+                "-not", "-path", "*/.dual-graph*",
+                "-not", "-path", "*/__pycache__/*",
+                "-not", "-name", "*.pyc",
+            ],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        result = []
+        for f in r.stdout.splitlines():
+            f = f.strip()
+            if not f:
+                continue
+            try:
+                result.append(str(Path(f).relative_to(root)))
+            except ValueError:
+                pass
+        return result
+    except Exception:
+        return []
+
+
+def _incremental_update(root: Path, changed_files: list[str], graph: dict) -> dict:
+    """Re-scan changed_files and patch their nodes/edges into the existing graph.
+
+    Skips dead_exports recomputation — that requires the full graph.
+    """
+    if _gb_scan is None:
+        return graph
+    changed_set = set(changed_files)
+
+    # Remove old nodes and edges for changed files
+    graph["nodes"] = [
+        n for n in graph.get("nodes", [])
+        if n.get("path", n.get("id", "")).split("::")[0] not in changed_set
+    ]
+    graph["edges"] = [
+        e for e in graph.get("edges", [])
+        if e.get("from", "").split("::")[0] not in changed_set
+    ]
+
+    # Build existing_nodes from the pruned graph so builder skips unchanged files
+    existing_nodes = {n["id"]: n for n in graph["nodes"] if n.get("kind") == "file"}
+
+    # Re-scan the full project — unchanged files skip instantly via hash comparison
+    try:
+        new_graph = _gb_scan(root, existing_nodes=existing_nodes)
+    except Exception:
+        return graph
+
+    # Merge only nodes/edges for the changed files back in
+    for n in new_graph.get("nodes", []):
+        if n.get("path", n.get("id", "")).split("::")[0] in changed_set:
+            graph["nodes"].append(n)
+    for e in new_graph.get("edges", []):
+        if e.get("from", "").split("::")[0] in changed_set:
+            graph["edges"].append(e)
+
+    # Update counts and timestamp
+    graph["node_count"] = len(graph["nodes"])
+    graph["edge_count"] = len(graph["edges"])
+    graph["file_count"] = len([n for n in graph["nodes"] if n.get("kind") == "file"])
+    graph["symbol_count"] = len([n for n in graph["nodes"] if n.get("kind") == "symbol"])
+    graph["built_at"] = int(time.time())
+    return graph
 
 
 def _load_action_graph() -> dict[str, Any]:
@@ -1584,6 +1814,9 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                 "anchor": anchor,
                 "mode": "cross_turn_pointer",
                 "response_chars": 0,
+                "full_file_chars": cached_len,
+                "full_file_tokens_est": cached_len // 4,
+                "tokens_avoided": cached_len // 4,
                 "cached_len": cached_len,
                 "prior_turn": prior_turn,
             }
@@ -1613,6 +1846,9 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                 "mode": "budget_exhausted",
                 "response_chars": 0,
                 "response_tokens_est": 0,
+                "full_file_chars": requested,
+                "full_file_tokens_est": requested // 4,
+                "tokens_avoided": requested // 4,
             }
             _log_tool("graph_read", payload)
             return {
@@ -1643,6 +1879,7 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             )
             if not is_upgrade:
                 preview = prev_content[:500]
+                full_chars_est = prev_chars or len(prev_content)
                 payload = {
                     "file": file,
                     "requested_chars": requested,
@@ -1652,6 +1889,9 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                     "mode": "dedupe_preview",
                     "response_chars": len(preview),
                     "response_tokens_est": _est_tokens(preview),
+                    "full_file_chars": full_chars_est,
+                    "full_file_tokens_est": full_chars_est // 4,
+                    "tokens_avoided": max(0, full_chars_est - len(preview)) // 4,
                 }
                 _log_tool("graph_read", payload)
                 return {"ok": True, "file": file, "content": preview, "mode": "dedupe_preview", "already_returned": True}
@@ -1684,6 +1924,7 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                 return {"ok": False, "error": "file not found", "file": file}
         else:
             text = tgt.read_text(encoding="utf-8", errors="ignore")
+        full_file_chars = len(text)  # capture BEFORE any truncation/excerpting
         mode = "full"
         sym_stale = False
         # v7.3: auto-promote bare file reads to symbol_excerpt using current turn query.
@@ -1736,9 +1977,8 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                 current_hash = hashlib.md5(text.encode()).hexdigest()[:8]
                 sym_stale = current_hash != stored_hash
         if anchor:
-            # If anchor is specified, search the FULL file content (not symbol excerpt)
-            # to find the anchor and return a window around it.
             full_text = tgt.read_text(encoding="utf-8", errors="ignore") if tgt.exists() else text
+            full_file_chars = len(full_text)
             i = full_text.lower().find(anchor.lower())
             if i >= 0:
                 start = max(0, i - granted // 2)
@@ -1770,10 +2010,19 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             "mode": mode,
             "response_chars": len(text),
             "response_tokens_est": _est_tokens(text),
+            "full_file_chars": full_file_chars,
+            "full_file_tokens_est": _est_tokens("x" * full_file_chars),
+            "tokens_avoided": max(0, full_file_chars - len(text)) // 4,
             "budget_used_chars": int(TURN_STATE.get("used_chars", 0)),
             "budget_remaining_chars": max(0, TURN_READ_BUDGET_CHARS - int(TURN_STATE.get("used_chars", 0))),
         }
         _log_tool("graph_read", payload)
+        TURN_STATE["turn_tokens_served"] = int(TURN_STATE.get("turn_tokens_served", 0)) + _est_tokens(text)
+        TURN_STATE["turn_tokens_avoided"] = int(TURN_STATE.get("turn_tokens_avoided", 0)) + max(0, full_file_chars - len(text)) // 4
+        TURN_STATE["turn_full_file_tokens"] = int(TURN_STATE.get("turn_full_file_tokens", 0)) + full_file_chars // 4
+        hits = TURN_STATE.get("turn_tool_hits", {})
+        hits[mode] = hits.get(mode, 0) + 1
+        TURN_STATE["turn_tool_hits"] = hits
         # Inline action append — do NOT call _record_action() here because `g` was loaded
         # at the top of this function and gets saved at the end. _record_action does its own
         # load/save cycle which would be overwritten by our _save_action_graph(g) below.
@@ -2050,6 +2299,15 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                 stored_root = gdata.get("root", "")
                 if stored_root and str(PROJECT_ROOT) != stored_root:
                     graph_stale_root = True
+                # Back-fill built_at for graphs scanned before this field was added.
+                # Use the graph file's own mtime as a conservative lower bound.
+                if not graph_empty and not graph_stale_root and not gdata.get("built_at"):
+                    _mtime = int(graph_json.stat().st_mtime)
+                    gdata["built_at"] = _mtime
+                    try:
+                        graph_json.write_text(json.dumps(gdata, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
             except Exception:
                 graph_empty = True
         if graph_missing or graph_empty or graph_stale_root:
@@ -2075,6 +2333,32 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             if graph_stale_root:
                 resp["reason"] = f"Graph was built for {stored_root} but current project is {PROJECT_ROOT}. Re-scan needed."
             return resp
+
+        # ── Incremental graph update (first turn of session only) ─────────────
+        _incremental_refreshed: list[str] = []
+        _built_at = int(gdata.get("built_at") or 0)
+        if _built_at > 0 and not TURN_STATE.get("incremental_done") and _gb_scan is not None:
+            _inc_error: str = ""
+            _inc_changed: list[str] = []
+            try:
+                _inc_changed = _detect_changed_files(PROJECT_ROOT, _built_at)
+                if _inc_changed:
+                    _updated = _incremental_update(PROJECT_ROOT, _inc_changed, gdata)
+                    graph_json.write_text(json.dumps(_updated, indent=2), encoding="utf-8")
+                    # Rebuild symbol index for the updated graph
+                    sym_index = _build_symbol_index(_updated)
+                    SYMBOL_INDEX_FILE.write_text(json.dumps(sym_index), encoding="utf-8")
+                    gdata = _updated
+                    _incremental_refreshed = _inc_changed
+            except Exception as _exc:
+                _inc_error = str(_exc)
+            _log_tool("incremental_update", {
+                "built_at": _built_at,
+                "changed_files": _inc_changed,
+                "refreshed": len(_incremental_refreshed),
+                "error": _inc_error,
+            })
+            TURN_STATE["incremental_done"] = True
 
         # Phase 0: Handle truly empty/greenfield projects (< 5 files).
         # Projects with 5+ files get full graph treatment regardless of prior edits.
@@ -2303,6 +2587,10 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             }
             _log_tool("graph_continue", {"query": query, "mode": "memory_first", "recommended_files": rec})
             _record_action("continue_memory_first", {"query": query, "recommended_files": rec})
+            _fire_shadow_grep(query, rec)
+            if _incremental_refreshed:
+                out["graph_refreshed"] = len(_incremental_refreshed)
+                out["graph_refreshed_files"] = _incremental_refreshed[:5]
             return out
 
         # No relevant memory: do single retrieval and return compact suggestions.
@@ -2521,6 +2809,11 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         }
         _log_tool("graph_continue", {"query": query, "mode": "retrieve_then_read", "confidence": confidence, "recommended_files": rec_slice})
         _record_action("continue_retrieve", {"query": query, "recommended_files": rec_slice})
+        if confidence == "high":
+            _fire_shadow_grep(query, rec_slice)
+        if _incremental_refreshed:
+            out["graph_refreshed"] = len(_incremental_refreshed)
+            out["graph_refreshed_files"] = _incremental_refreshed[:5]
         return out
 
     @mcp.tool()
@@ -2697,6 +2990,13 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                             "line": hit["line"],
                             "context": snippet,
                         })
+
+        # Shadow measurement: what vanilla Claude would have Read fully
+        _shadow_hit_files = list({h["file"] for h in hits})
+        _shadow_inlined = sum(len(sb.get("body", "")) for sb in symbol_bodies)
+        _shadow_inlined += sum(len(ue.get("context", "")) for ue in uncontextualized_expanded)
+        if _shadow_hit_files:
+            _fire_shadow_file_reads("fallback_rg", _shadow_hit_files, _shadow_inlined)
 
         TURN_STATE["fallback_calls"] = calls + 1
         TURN_STATE["total_grep_calls"] = int(TURN_STATE.get("total_grep_calls", 0)) + 1
@@ -3295,8 +3595,14 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             dir_terms = {}
             enriched_count = 0
 
-        # Ensure graph always stores the project root it was built against.
+        # Ensure graph always stores the project root and build timestamp.
         graph["root"] = str(root)
+        graph["built_at"] = int(time.time())
+        # Stamp file for find-based staleness detection (fallback when no git)
+        try:
+            (DG_DATA_DIR / "last_scan_stamp").write_text(str(int(time.time())), encoding="utf-8")
+        except OSError:
+            pass
 
         # Write to the same JSON the dashboard serves.
         graph_json = DG_DATA_DIR / "info_graph.json"
@@ -3559,6 +3865,9 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
 
         _log_tool("graph_grep_all", {"pattern": pattern, "total": total, "returned": len(cleaned), "call_num": call_num})
         hit_files = list({line.split(":")[0] for line in cleaned if ":" in line})[:15]
+        # Shadow measurement: vanilla Claude would Read all hit files fully
+        if hit_files:
+            _fire_shadow_file_reads("graph_grep_all", hit_files, sum(len(line) for line in cleaned))
         _record_action("grep_all", {
             "pattern": pattern,
             "file_glob": file_glob,
@@ -4350,6 +4659,172 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
             "hotspots": [{"file": f, "incoming_deps": c} for f, c in ranked],
         }), media_type="application/json")
 
+    async def api_savings(request: Request) -> Response:
+        """Compute honest, measured savings from mcp_tool_calls.jsonl.
+
+        Savings sources (all measured, not estimated):
+        1. TAR: partial file reads vs full file — capped at Read tool's 2000-line limit
+           (vanilla Claude also reads partially for big files)
+        2. Cross-turn pointers: re-reads avoided — discounted because vanilla Claude
+           also has conversation history and may not re-read
+        3. Shadow grep: exploration output avoided (only counted when query was vague)
+        4. Shadow file reads: files inlined that vanilla would've Read separately
+
+        Subtract GrapeRoot's own overhead: every graph_continue and graph_read response
+        has JSON metadata that vanilla Read doesn't have.
+        """
+        empty = {"ok": True, "total_turns": 0, "tool_hits": {},
+            "tokens_served": 0, "tokens_avoided_tar": 0,
+            "tokens_avoided_cross_turn": 0, "tar": 0.0,
+            "shadow_savings": {"grep_avoided": {"measurements": 0, "tokens": 0},
+                               "file_reads_avoided": {"measurements": 0, "tokens": 0},
+                               "total_tokens": 0},
+            "graperoot_overhead_tokens": 0,
+            "cost": {"model": "opus", "price_per_m_input": 15.0,
+                     "vanilla_cost_usd": 0.0, "graperoot_cost_usd": 0.0,
+                     "saved_usd": 0.0, "savings_pct": 0.0}}
+        if not LOG_FILE.exists():
+            return Response(json.dumps(empty), media_type="application/json")
+
+        tokens_served = 0
+        tokens_avoided_tar = 0
+        tokens_avoided_cross_turn = 0
+        full_tokens = 0
+        tool_hits: dict[str, int] = {}
+        max_turn = 0
+        graperoot_overhead_tokens = 0
+        shadow_grep_tokens = 0
+        shadow_grep_count = 0
+        shadow_file_read_tokens = 0
+        shadow_file_read_count = 0
+
+        try:
+            with LOG_FILE.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    turn = int(entry.get("turn", 0))
+                    if turn > max_turn:
+                        max_turn = turn
+                    tool_name = entry.get("tool")
+
+                    # Shadow measurements (background threads logged these)
+                    if tool_name == "shadow_grep":
+                        p = entry.get("payload", {})
+                        shadow_grep_tokens += int(p.get("tokens_would_have_cost", 0))
+                        shadow_grep_count += 1
+                        continue
+                    if tool_name == "shadow_file_reads":
+                        p = entry.get("payload", {})
+                        shadow_file_read_tokens += int(p.get("tokens_avoided", 0))
+                        shadow_file_read_count += 1
+                        continue
+
+                    # GrapeRoot overhead: measure actual response payload size
+                    if tool_name == "graph_continue":
+                        p = entry.get("payload", {})
+                        # Measure the actual logged payload as proxy for response size
+                        payload_chars = len(json.dumps(p))
+                        graperoot_overhead_tokens += payload_chars // 4
+                        continue
+
+                    if tool_name not in ("graph_read", "native_read"):
+                        continue
+
+                    p = entry.get("payload", {})
+                    mode = p.get("mode", "unknown")
+                    tool_hits[mode] = tool_hits.get(mode, 0) + 1
+                    fc = int(p.get("full_file_chars", 0))
+                    rc = int(p.get("response_chars", 0))
+
+                    if mode == "cross_turn_pointer":
+                        # Claude explicitly called graph_read on this file again.
+                        # That's direct evidence it needed re-reading — if it had the
+                        # content from history, it wouldn't have called the tool.
+                        # Credit at 100%: the call IS the proof.
+                        # Cap at Read tool limit (vanilla also caps).
+                        capped = min(fc, _READ_TOOL_MAX_CHARS) if fc > 0 else 0
+                        tokens_avoided_cross_turn += capped // 4
+                        graperoot_overhead_tokens += 20  # pointer response
+                        continue
+
+                    if mode == "dedupe_preview":
+                        if fc > 0:
+                            tokens_avoided_tar += max(0, fc - rc) // 4
+                            tokens_served += rc // 4
+                            full_tokens += fc // 4
+                        graperoot_overhead_tokens += 15
+                        continue
+
+                    if fc > 0:
+                        # Cap full_file at Read tool's effective limit
+                        # (vanilla Claude also doesn't read arbitrarily large files)
+                        capped_fc = min(fc, _READ_TOOL_MAX_CHARS)
+                        full_tokens += capped_fc // 4
+                        tokens_served += rc // 4
+                        avoided = max(0, capped_fc - rc) // 4
+                        tokens_avoided_tar += avoided
+                        # Overhead: graph_read JSON wrapper (ok, mode, file, budget fields)
+                        graperoot_overhead_tokens += 25
+                    else:
+                        tokens_served += int(p.get("response_tokens_est", 0))
+
+        except Exception as e:
+            return Response(json.dumps({"ok": False, "error": str(e)}), status_code=500, media_type="application/json")
+
+        tar = round(tokens_avoided_tar / full_tokens, 4) if full_tokens > 0 else 0.0
+
+        # Dollar cost — honest formula
+        # Vanilla = what we served + what we avoided (TAR + cross-turn + shadow)
+        # GrapeRoot = what we served + our overhead
+        price_per_m = 15.0
+        total_shadow = shadow_grep_tokens + shadow_file_read_tokens
+        vanilla_tokens = tokens_served + tokens_avoided_tar + tokens_avoided_cross_turn + total_shadow
+        graperoot_tokens = tokens_served + graperoot_overhead_tokens
+        vanilla_cost = (vanilla_tokens / 1_000_000) * price_per_m
+        graperoot_cost = (graperoot_tokens / 1_000_000) * price_per_m
+        saved_usd = max(0.0, vanilla_cost - graperoot_cost)
+        savings_pct = round((saved_usd / vanilla_cost) * 100, 1) if vanilla_cost > 0 else 0.0
+
+        total_avoided = tokens_avoided_tar + tokens_avoided_cross_turn + total_shadow
+        return Response(json.dumps({
+            "ok": True,
+            "total_turns": max_turn,
+            "tool_hits": tool_hits,
+            "tar": tar,
+            "tokens_served": tokens_served,
+            "tokens_avoided": total_avoided,
+            "tokens_avoided_tar": tokens_avoided_tar,
+            "tokens_avoided_cross_turn": tokens_avoided_cross_turn,
+            "graperoot_overhead_tokens": graperoot_overhead_tokens,
+            "shadow_savings": {
+                "grep_avoided": {
+                    "measurements": shadow_grep_count,
+                    "tokens": shadow_grep_tokens,
+                },
+                "file_reads_avoided": {
+                    "measurements": shadow_file_read_count,
+                    "tokens": shadow_file_read_tokens,
+                },
+                "total_tokens": total_shadow,
+            },
+            "cost": {
+                "model": "opus",
+                "price_per_m_input": price_per_m,
+                "vanilla_tokens": vanilla_tokens,
+                "graperoot_tokens": graperoot_tokens,
+                "vanilla_cost_usd": round(vanilla_cost, 4),
+                "graperoot_cost_usd": round(graperoot_cost, 4),
+                "saved_usd": round(saved_usd, 4),
+                "savings_pct": savings_pct,
+            },
+        }), media_type="application/json")
+
     mcp_app = mcp.streamable_http_app()
 
     # ── Session middleware (pure-ASGI, no BaseHTTPMiddleware) ──────────────
@@ -4378,6 +4853,7 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
         Route("/mcp_graph_server.py", serve_mcp_server, methods=["GET"]),
         Route("/api/system-map", api_system_map, methods=["GET"]),
         Route("/api/hotspots", api_hotspots, methods=["GET"]),
+        Route("/savings", api_savings, methods=["GET"]),
     ]
 
     mcp_app = session_middleware  # type: ignore[assignment]

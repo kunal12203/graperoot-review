@@ -1,3 +1,19 @@
+1.0.45  (2026-06-15)
+- Added: real token savings telemetry — stop_hook now reads /savings from the MCP
+  server and sends full breakdown (tokens_avoided_tar, tokens_avoided_cross_turn,
+  shadow_tokens_avoided, graperoot_overhead_tokens) to Railway. Old stop_hooks
+  (v1.0.44) auto-get real data too via new "tokens_avoided" field in /savings.
+- Added: GET /api/usage/savings-chart endpoint — daily savings trend data for the
+  Pro dashboard chart widget (tokens_saved, requests_count per day, last N days).
+- Added: savings breakdown in /api/usage/stats response — by_day and recent rows
+  now include per-component savings (TAR, cross-turn dedup, shadow replaced).
+- Added: incremental graph update on session start — detects files changed since
+  last scan via mtime, re-scans only those files, patches graph in-place.
+- Fixed: shadow grep Bash tool cap — empirically measured at 21k chars inline
+  (above that Claude sees 2KB preview). Was over-counting savings on large greps.
+- Improved: /savings endpoint now includes "tokens_avoided" total field so both
+  old and new stop_hooks correctly report savings without any client update.
+
 1.0.44  (2026-06-13)
 - Fixed: all shims (dgc-pro, dg-pro, graperoot-pro + Windows .cmd/.ps1) now call
   launch.py directly instead of launch_pro.sh which no longer ships in the tarball.
