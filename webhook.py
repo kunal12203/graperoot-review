@@ -322,11 +322,10 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN shadow_tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN graperoot_overhead_tokens INTEGER DEFAULT 0",
     ]
-    # Fix inflated naive_cost_usd on historical rows where tokens_avoided=0
-    # Old formula incorrectly priced cache_read_tokens at full input rate
+    # Fix naive_cost_usd on rows where tokens_avoided=0: no graph savings = no claimed savings
     fix_naive_pg = (
         "UPDATE usage_events SET naive_cost_usd = total_cost_usd, savings_pct = 0 "
-        "WHERE tokens_avoided = 0 AND naive_cost_usd > total_cost_usd"
+        "WHERE tokens_avoided = 0 AND naive_cost_usd != total_cost_usd"
     )
     fix_naive_sq = fix_naive_pg
 
