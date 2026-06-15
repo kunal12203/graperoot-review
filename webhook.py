@@ -1015,10 +1015,11 @@ def api_usage_ingest():
     )
 
     # Write to token_savings for the Pro dashboard savings chart
+    # Only count real graph savings (TAR + cross-turn + shadow), not cache reads
     total_saved = tokens_avoided + tokens_avoided_compounding
-    if total_saved > 0 or cr > 0:
+    if total_saved > 0:
         ts_date = ts[:10]  # YYYY-MM-DD
-        saved_count = total_saved if total_saved > 0 else cr
+        saved_count = total_saved
         _pro_query_write(
             f"INSERT INTO token_savings (license_key, date, tokens_saved, requests_count, device_host) "
             f"VALUES ({_pro_ph(5)}) "
