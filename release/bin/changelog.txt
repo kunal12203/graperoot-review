@@ -1,3 +1,8 @@
+1.0.47  (2026-06-15)
+- Fixed: savings calculation no longer claims prompt cache savings as GrapeRoot savings.
+  Only graph-specific avoidance (TAR, cross-turn, shadow) is counted. Historical rows
+  with tokens_avoided=0 are corrected on deploy (naive_cost = actual_cost).
+
 1.0.46  (2026-06-15)
 - Fixed: stop_hook now reads port from <project>/.dual-graph-pro/port so savings
   are fetched from the correct MCP server even when multiple sessions run concurrently

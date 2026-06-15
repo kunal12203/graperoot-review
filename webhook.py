@@ -322,12 +322,22 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN shadow_tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN graperoot_overhead_tokens INTEGER DEFAULT 0",
     ]
+    # Fix inflated naive_cost_usd on historical rows where tokens_avoided=0
+    # Old formula incorrectly priced cache_read_tokens at full input rate
+    fix_naive_pg = (
+        "UPDATE usage_events SET naive_cost_usd = total_cost_usd, savings_pct = 0 "
+        "WHERE tokens_avoided = 0 AND naive_cost_usd > total_cost_usd"
+    )
+    fix_naive_sq = fix_naive_pg
+
     if _pro_is_pg():
         con = _pro_pg_conn()
         cur = con.cursor()
         for sql in pro_cols_pg:
             try: cur.execute(sql)
             except Exception: pass
+        try: cur.execute(fix_naive_pg)
+        except Exception: pass
         con.commit(); cur.close(); con.close()
     else:
         import sqlite3 as _sq
@@ -335,6 +345,8 @@ def _migrate_db():
         for sql in pro_cols_sq:
             try: con.execute(sql)
             except Exception: pass
+        try: con.execute(fix_naive_sq)
+        except Exception: pass
         con.commit(); con.close()
 
 
@@ -966,7 +978,8 @@ def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int,
         compounding_cost = tokens_avoided_compounding * pr[2] / 1e6
         nc = tc + one_time_cost + compounding_cost
     else:
-        nc = ((inp + cw + cr) * pr[0] + out * pr[3]) / 1e6
+        # No graph savings — naive cost equals actual cost (cache savings are Anthropic's, not ours)
+        nc = tc
     sp = (nc - tc) / nc if nc > 0 else 0.0
     return round(tc, 6), round(nc, 6), round(sp, 4)
 

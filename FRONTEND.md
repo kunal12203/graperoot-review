@@ -188,8 +188,9 @@ Query params:
 Notes:
 - `chart` only contains days with at least one session (no zero-fill). Fill gaps client-side.
 - `tokens_saved` per day = `tokens_avoided` sum for that day (TAR + cross-turn + shadow).
-- `estimated_saved_usd` uses the Opus rate ($15/M) as a conservative ceiling. Multiply
-  `total_tokens_saved × user_model_price / 1_000_000` for a model-specific estimate.
+- `estimated_saved_usd` uses the Opus rate ($15/M) as an upper-bound estimate — real
+  savings for Sonnet users are ~5× lower. For a model-accurate number, multiply
+  `total_tokens_saved × user_model_price / 1_000_000` using the pricing table above.
 
 ---
 
@@ -295,9 +296,10 @@ subsequent sessions read from cache. Long sessions → higher hit rate.
 
 ## Notes
 
-- Old sessions (pre-v1.0.45) have `tokens_avoided = 0` and the breakdown fields = 0.
-  Display them normally — the zero just means "no graph-savings data for this session".
-  The `total_cost_usd` and `naive_cost_usd` are still accurate (cache savings still counted).
+- Old sessions (pre-v1.0.46) have `tokens_avoided = 0` and breakdown fields = 0.
+  After v1.0.47 deploy, these rows have `naive_cost_usd = total_cost_usd` (no savings
+  claimed). Only sessions with real graph savings (`tokens_avoided > 0`) show savings.
+  Cache savings ($0.30 vs $3/M) are Anthropic's feature, NOT ours — we don't claim them.
 
 - `savings_pct` stored as 0.0–1.0. Always multiply by 100 before displaying as a percentage.
 
