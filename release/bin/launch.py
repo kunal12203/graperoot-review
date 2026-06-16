@@ -1060,6 +1060,11 @@ def main() -> None:
                 proc.kill()
             except Exception:
                 pass
+        # Remove port file so stop_hook doesn't report stale savings when dgc-pro isn't running
+        try:
+            (data_dir / "port").unlink(missing_ok=True)
+        except Exception:
+            pass
 
     import atexit
     atexit.register(_cleanup)

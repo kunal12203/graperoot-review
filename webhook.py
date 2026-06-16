@@ -1007,6 +1007,37 @@ def api_usage_ingest():
     device_host = (data.get("device_host") or "unknown")[:128]
     ph = _pro_ph(22)
     ts = data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    session_id = data.get("session_id") or ""
+
+    # Dedup: same session_id fires every turn — only keep latest (highest tokens)
+    if session_id and _pro_is_pg():
+        existing = _pro_query(
+            f"SELECT id, cache_read_tokens FROM usage_events "
+            f"WHERE license_key = %s AND session_id = %s ORDER BY id DESC LIMIT 1",
+            (key, session_id), one=True
+        )
+        if existing:
+            # Update if new data has more tokens (session progressed)
+            if cr > int(existing.get("cache_read_tokens") or 0):
+                _pro_query_write(
+                    f"UPDATE usage_events SET timestamp = %s, model = %s, "
+                    f"input_tokens = %s, output_tokens = %s, cache_read_tokens = %s, cache_write_tokens = %s, "
+                    f"total_cost_usd = %s, naive_cost_usd = %s, savings_pct = %s, "
+                    f"tokens_served = %s, tokens_avoided = %s, tool_hits = %s, "
+                    f"project_hash = %s, device_host = %s, "
+                    f"tokens_avoided_tar = %s, tokens_avoided_cross_turn = %s, "
+                    f"shadow_tokens_avoided = %s, graperoot_overhead_tokens = %s "
+                    f"WHERE id = %s",
+                    (ts, model, inp, out, cr, cw, tc, nc, sp,
+                     int(data.get("tokens_served", inp + cw + cr + out)),
+                     tokens_avoided + tokens_avoided_compounding,
+                     data.get("tool_hits"), data.get("project_hash"), device_host,
+                     tokens_avoided_tar, tokens_avoided_cross_turn,
+                     shadow_tokens_avoided, graperoot_overhead_tokens,
+                     existing["id"])
+                )
+            return jsonify({"ok": True, "dedup": "updated"})
+
     _pro_query_write(
         f"INSERT INTO usage_events (license_key, session_id, timestamp, model, "
         f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
@@ -1015,7 +1046,7 @@ def api_usage_ingest():
         f"task_type, confidence, project_hash, device_host, "
         f"tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens) "
         f"VALUES ({ph})",
-        (key, data.get("session_id"), ts, model,
+        (key, session_id, ts, model,
          inp, out, cr, cw,
          tc, nc, sp,
          int(data.get("tokens_served", inp + cw + cr + out)),
