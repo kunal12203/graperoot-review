@@ -41,7 +41,8 @@ except Exception as e:
 SKIP_DIRS = {
     ".git", ".beads", ".beads-hooks", "node_modules", "vendor",
     "dist", "build", ".next", ".idea", ".vscode", "__pycache__",
-    "venv", ".venv", ".dual-graph",
+    "venv", ".venv", ".dual-graph", ".dual-graph-pro", ".graperoot-pro",
+    ".claude", ".cursor", ".gemini", ".graperoot",
     # Common vendored/third-party C/C++ directories
     "third_party", "thirdparty", "3rdparty", "external", "deps",
     "contrib", "submodules",

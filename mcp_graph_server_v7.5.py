@@ -807,6 +807,8 @@ def _detect_changed_files(root: Path, since_epoch: int) -> list[str]:
                 "-not", "-path", "*/.git/*",
                 "-not", "-path", "*/node_modules/*",
                 "-not", "-path", "*/.dual-graph*",
+                "-not", "-path", "*/.claude/*",
+                "-not", "-path", "*/.cursor/*",
                 "-not", "-path", "*/__pycache__/*",
                 "-not", "-name", "*.pyc",
             ],
