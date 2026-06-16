@@ -302,6 +302,9 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS tokens_avoided_cross_turn INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS shadow_tokens_avoided INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS graperoot_overhead_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS unique_files_read INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_reads INTEGER DEFAULT 0",
+        "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_turns INTEGER DEFAULT 0",
         """CREATE TABLE IF NOT EXISTS token_savings (
             id             SERIAL PRIMARY KEY,
             license_key    TEXT NOT NULL,
@@ -430,7 +433,10 @@ def _pro_query(sql: str, params=(), one=False):
         con = _pro_pg_conn()
         cur = con.cursor()
         cur.execute(sql, params)
-        rows = [dict(r) for r in (cur.fetchall() if not one else [cur.fetchone()])]
+        raw = cur.fetchall() if not one else [cur.fetchone()]
+        rows = [dict(r) for r in raw if r is not None]
+        if one and not rows:
+            rows = [{}]
         cur.close(); con.close()
     else:
         import sqlite3 as _sq
@@ -1002,33 +1008,25 @@ def _rebuild_token_savings() -> None:
 
 def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int,
                tokens_avoided: int = 0, tokens_avoided_compounding: int = 0):
-    """Return (total_cost_usd, naive_cost_usd, savings_pct) for the given token counts.
+    """Return (total_cost_usd, naive_cost_usd, savings_pct).
 
-    tokens_avoided: one-time tokens never sent to context (priced at input_price)
-    tokens_avoided_compounding: cache re-bill savings on subsequent turns (priced at cache_read_price)
-
-    The formula: vanilla_cost = actual_cost + (avoided × input) + (compounding × cache_read)
-    This measures what the user WOULD have paid without GrapeRoot's excerpting.
+    tokens_avoided: TAR + cross_turn + shadow (all real file reads that never happened)
+    tokens_avoided_compounding: unused legacy field, kept for compat
+    naive_cost = actual_cost + (tokens_avoided × input_price)
     """
     m = (model or "").lower()
     if "haiku" in m:
-        pr = (1.0,  1.25,  0.1,  5.0)   # Haiku 4.5
+        pr = (1.0,  1.25,  0.1,  5.0)
     elif "fable" in m:
-        pr = (10.0, 12.5,  1.0,  50.0)  # Fable 5
+        pr = (10.0, 12.5,  1.0,  50.0)
     elif "opus" in m and ("4-8" in m or "4-7" in m):
-        pr = (5.0,  6.25,  0.5,  25.0)  # Opus 4.8 / 4.7
+        pr = (5.0,  6.25,  0.5,  25.0)
     elif "opus" in m:
-        pr = (15.0, 18.75, 1.5,  75.0)  # Opus 4 / 4.1
+        pr = (15.0, 18.75, 1.5,  75.0)
     else:
         pr = (3.0,  3.75,  0.3,  15.0)  # Sonnet 4.x / default
     tc = (inp * pr[0] + cw * pr[1] + cr * pr[2] + out * pr[3]) / 1e6
-    if tokens_avoided > 0 or tokens_avoided_compounding > 0:
-        one_time_cost = tokens_avoided * pr[0] / 1e6
-        compounding_cost = tokens_avoided_compounding * pr[2] / 1e6
-        nc = tc + one_time_cost + compounding_cost
-    else:
-        # No graph savings — naive cost equals actual cost (cache savings are Anthropic's, not ours)
-        nc = tc
+    nc = tc + tokens_avoided * pr[0] / 1e6 if tokens_avoided > 0 else tc
     sp = (nc - tc) / nc if nc > 0 else 0.0
     return round(tc, 6), round(nc, 6), round(sp, 4)
 
@@ -1051,8 +1049,11 @@ def api_usage_ingest():
     tokens_avoided_cross_turn = int(data.get("tokens_avoided_cross_turn", 0))
     shadow_tokens_avoided = int(data.get("shadow_tokens_avoided", 0))
     graperoot_overhead_tokens = int(data.get("graperoot_overhead_tokens", 0))
+    unique_files_read = int(data.get("unique_files_read", 0))
+    total_reads = int(data.get("total_reads", 0))
+    total_turns = int(data.get("total_turns", 0))
 
-    tc, nc, sp = _calc_cost(model, inp, out, cr, cw, tokens_avoided, tokens_avoided_compounding)
+    tc, nc, sp = _calc_cost(model, inp, out, cr, cw, tokens_avoided)
 
     device_host = (data.get("device_host") or "unknown")[:128]
     ph = _pro_ph(22)
@@ -1067,49 +1068,96 @@ def api_usage_ingest():
             (key, session_id), one=True
         )
         if existing:
-            # Update if new data has more tokens (session progressed)
-            if cr > int(existing.get("cache_read_tokens") or 0):
-                _pro_query_write(
-                    f"UPDATE usage_events SET timestamp = %s, model = %s, "
-                    f"input_tokens = %s, output_tokens = %s, cache_read_tokens = %s, cache_write_tokens = %s, "
-                    f"total_cost_usd = %s, naive_cost_usd = %s, savings_pct = %s, "
-                    f"tokens_served = %s, tokens_avoided = %s, tool_hits = %s, "
-                    f"project_hash = %s, device_host = %s, "
-                    f"tokens_avoided_tar = %s, tokens_avoided_cross_turn = %s, "
-                    f"shadow_tokens_avoided = %s, graperoot_overhead_tokens = %s "
-                    f"WHERE id = %s",
-                    (ts, model, inp, out, cr, cw, tc, nc, sp,
-                     int(data.get("tokens_served", inp + cw + cr + out)),
-                     tokens_avoided + tokens_avoided_compounding,
-                     data.get("tool_hits"), data.get("project_hash"), device_host,
-                     tokens_avoided_tar, tokens_avoided_cross_turn,
-                     shadow_tokens_avoided, graperoot_overhead_tokens,
-                     existing["id"])
-                )
-                _upsert_token_savings(key, ts, device_host, tokens_avoided + tokens_avoided_compounding)
+            # Always update — stop hook fires every turn with latest cumulative data
+            _pro_query_write(
+                f"UPDATE usage_events SET timestamp = %s, model = %s, "
+                f"input_tokens = %s, output_tokens = %s, cache_read_tokens = %s, cache_write_tokens = %s, "
+                f"total_cost_usd = %s, naive_cost_usd = %s, savings_pct = %s, "
+                f"tokens_served = %s, tokens_avoided = %s, tool_hits = %s, "
+                f"project_hash = %s, device_host = %s, "
+                f"tokens_avoided_tar = %s, tokens_avoided_cross_turn = %s, "
+                f"shadow_tokens_avoided = %s, graperoot_overhead_tokens = %s, "
+                f"unique_files_read = %s, total_reads = %s, total_turns = %s "
+                f"WHERE id = %s",
+                (ts, model, inp, out, cr, cw, tc, nc, sp,
+                 int(data.get("tokens_served", inp + cw + cr + out)),
+                 tokens_avoided,
+                 data.get("tool_hits"), data.get("project_hash"), device_host,
+                 tokens_avoided_tar, tokens_avoided_cross_turn,
+                 shadow_tokens_avoided, graperoot_overhead_tokens,
+                 unique_files_read, total_reads, total_turns,
+                 existing["id"])
+            )
+            _upsert_token_savings(key, ts, device_host, tokens_avoided)
             return jsonify({"ok": True, "dedup": "updated"})
 
+    ph = _pro_ph(25)
     _pro_query_write(
         f"INSERT INTO usage_events (license_key, session_id, timestamp, model, "
         f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
         f"total_cost_usd, naive_cost_usd, savings_pct, "
         f"tokens_served, tokens_avoided, tool_hits, "
         f"task_type, confidence, project_hash, device_host, "
-        f"tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens) "
+        f"tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens, "
+        f"unique_files_read, total_reads, total_turns) "
         f"VALUES ({ph})",
         (key, session_id, ts, model,
          inp, out, cr, cw,
          tc, nc, sp,
          int(data.get("tokens_served", inp + cw + cr + out)),
-         tokens_avoided + tokens_avoided_compounding,
+         tokens_avoided,
          data.get("tool_hits"),
          data.get("task_type"), data.get("confidence"), data.get("project_hash"),
          device_host,
-         tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens)
+         tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens,
+         unique_files_read, total_reads, total_turns)
     )
-    _upsert_token_savings(key, ts, device_host, tokens_avoided + tokens_avoided_compounding)
+    _upsert_token_savings(key, ts, device_host, tokens_avoided_tar + tokens_avoided_cross_turn)
 
     return jsonify({"ok": True})
+
+
+@app.route("/api/usage/backfill-costs", methods=["POST"])
+def api_usage_backfill_costs():
+    """Recalculate total_cost_usd, naive_cost_usd, savings_pct, tokens_avoided
+    for all existing rows using the corrected formula (TAR+cross_turn only, no shadow)."""
+    secret = request.get_json(silent=True, force=True) or {}
+    if secret.get("secret") != "grp-backfill-2026":
+        return jsonify({"error": "forbidden"}), 403
+    if not _pro_is_pg():
+        return jsonify({"error": "postgres only"}), 400
+
+    rows = _pro_query(
+        "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "tokens_avoided, tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided FROM usage_events",
+        ()
+    )
+    updated = 0
+    for r in rows:
+        # Full tokens_avoided = TAR + cross_turn + shadow (all real file reads avoided)
+        # If breakdown fields are all 0 (pre-v1.0.46 rows), keep the existing tokens_avoided value
+        tar         = int(r.get("tokens_avoided_tar") or 0)
+        cross_turn  = int(r.get("tokens_avoided_cross_turn") or 0)
+        shadow      = int(r.get("shadow_tokens_avoided") or 0)
+        breakdown_sum = tar + cross_turn + shadow
+        full_avoided = breakdown_sum if breakdown_sum > 0 else int(r.get("tokens_avoided") or 0)
+        tc, nc, sp = _calc_cost(
+            r.get("model") or "",
+            int(r.get("input_tokens") or 0),
+            int(r.get("output_tokens") or 0),
+            int(r.get("cache_read_tokens") or 0),
+            int(r.get("cache_write_tokens") or 0),
+            full_avoided,
+        )
+        _pro_query_write(
+            "UPDATE usage_events SET total_cost_usd=%s, naive_cost_usd=%s, savings_pct=%s, tokens_avoided=%s WHERE id=%s",
+            (tc, nc, sp, full_avoided, r["id"])
+        )
+        updated += 1
+
+    # Rebuild token_savings table from corrected data
+    _rebuild_token_savings()
+    return jsonify({"ok": True, "rows_updated": updated})
 
 
 @app.route("/api/usage/stats")
