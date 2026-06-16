@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.49: exclude .claude/, .cursor/, .graperoot-pro/ from graph indexing —
+         worktree paths were being recommended instead of actual source files.
+
 v1.0.48: CLI flags — -v/--version, --update, --status, --doctor, -h/--help.
          --doctor validates all dependencies; --status shows install/license info.
 
