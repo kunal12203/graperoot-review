@@ -261,6 +261,7 @@ def init_db():
         con.commit(); con.close()
 
     _migrate_db()
+    _rebuild_token_savings()
 
 
 def _migrate_db():
@@ -950,6 +951,55 @@ def api_graph_status(owner, repo):
 
 # ── Usage telemetry ────────────────────────────────────────────────────────────
 
+def _upsert_token_savings(license_key: str, ts: str, device_host: str, tokens_avoided: int) -> None:
+    """UPSERT one session's tokens_avoided into the token_savings daily summary."""
+    if not _pro_is_pg():
+        return
+    # Extract date from ts — handles both ISO strings and datetime objects
+    try:
+        date_str = ts[:10]  # "YYYY-MM-DD"
+    except Exception:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _pro_query_write(
+        "INSERT INTO token_savings (license_key, date, device_host, tokens_saved, requests_count) "
+        "VALUES (%s, %s, %s, %s, 1) "
+        "ON CONFLICT (license_key, date, device_host) DO UPDATE SET "
+        "tokens_saved = token_savings.tokens_saved + EXCLUDED.tokens_saved, "
+        "requests_count = token_savings.requests_count + 1",
+        (license_key, date_str, device_host, max(0, tokens_avoided))
+    )
+
+
+def _rebuild_token_savings() -> None:
+    """Rebuild token_savings from usage_events to fix stale/missing data."""
+    if not _pro_is_pg():
+        return
+    try:
+        con = _pro_pg_conn()
+        cur = con.cursor()
+        cur.execute("TRUNCATE token_savings")
+        cur.execute("""
+            INSERT INTO token_savings (license_key, date, device_host, tokens_saved, requests_count)
+            SELECT
+                license_key,
+                DATE(timestamp) AS date,
+                COALESCE(device_host, 'unknown') AS device_host,
+                SUM(GREATEST(tokens_avoided, 0)) AS tokens_saved,
+                COUNT(*) AS requests_count
+            FROM usage_events
+            GROUP BY license_key, DATE(timestamp), COALESCE(device_host, 'unknown')
+            ON CONFLICT (license_key, date, device_host) DO UPDATE SET
+                tokens_saved    = EXCLUDED.tokens_saved,
+                requests_count  = EXCLUDED.requests_count
+        """)
+        con.commit()
+        cur.close()
+        con.close()
+        print("[db] token_savings rebuilt from usage_events", flush=True)
+    except Exception as e:
+        print(f"[db] token_savings rebuild failed: {e}", flush=True)
+
+
 def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int,
                tokens_avoided: int = 0, tokens_avoided_compounding: int = 0):
     """Return (total_cost_usd, naive_cost_usd, savings_pct) for the given token counts.
@@ -1036,6 +1086,7 @@ def api_usage_ingest():
                      shadow_tokens_avoided, graperoot_overhead_tokens,
                      existing["id"])
                 )
+                _upsert_token_savings(key, ts, device_host, tokens_avoided + tokens_avoided_compounding)
             return jsonify({"ok": True, "dedup": "updated"})
 
     _pro_query_write(
@@ -1056,7 +1107,7 @@ def api_usage_ingest():
          device_host,
          tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, graperoot_overhead_tokens)
     )
-
+    _upsert_token_savings(key, ts, device_host, tokens_avoided + tokens_avoided_compounding)
 
     return jsonify({"ok": True})
 
