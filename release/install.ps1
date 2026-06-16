@@ -83,7 +83,16 @@ try {
         } catch { return $false }
     }
 
+    # Detect piped execution: when run via `irm ... | iex` the script has no
+    # file path ($MyInvocation.MyCommand.Path is empty). In that case Read-Host
+    # gets EOF immediately and would close the shell — so we auto-accept prompts.
+    $Script:IsPiped = [string]::IsNullOrEmpty($MyInvocation.MyCommand.Path)
+
     function Confirm-Install([string]$Prompt) {
+        if ($Script:IsPiped) {
+            Write-Host "$Prompt [Y/n] Y  (auto — non-interactive)" -ForegroundColor DarkGray
+            return $true
+        }
         $a = Read-Host "$Prompt [Y/n]"
         return ($a -notmatch '^[Nn]')
     }
@@ -105,13 +114,25 @@ try {
         if (Get-Command winget -ErrorAction SilentlyContinue) {
             if (Confirm-Install "[check] Install Python 3.11 via winget?") {
                 winget install -e --id Python.Python.3.11 --accept-source-agreements --accept-package-agreements
-                Write-Host "  Re-open PowerShell and run the installer again." -ForegroundColor Yellow
-                exit 0
+                # Refresh PATH so python is available in this session
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                # Re-probe
+                foreach ($c in $pyCandidates) {
+                    $cmd = Get-Command $c -ErrorAction SilentlyContinue
+                    if ($cmd) {
+                        $ok = & $cmd.Source -c "import sys; print('1' if sys.version_info >= (3,10) else '0')" 2>$null
+                        if ($ok -eq "1") { $pythonCmd = $cmd.Source; break }
+                    }
+                }
+                if (-not $pythonCmd) {
+                    Write-Host "  Python installed but not found in PATH yet. Open a new PowerShell and re-run." -ForegroundColor Yellow
+                    exit 1
+                }
             }
         } else {
             Write-Host "  Install Python 3.11 from https://python.org, then re-run." -ForegroundColor Yellow
         }
-        exit 1
+        if (-not $pythonCmd) { exit 1 }
     }
     Write-Host "[check] Python:       $(& $pythonCmd --version)"
 
@@ -312,12 +333,16 @@ try {
     $acl.SetAccessRule($rule)
     Set-Acl -Path $licenseFile -AclObject $acl
 
-    # PATH - user scope
-    $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+    # PATH - persist to user scope AND refresh in current session so dgc-pro works immediately
     $binDir   = "$INSTALL_DIR\bin"
+    $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
     if ($userPath -notlike "*$binDir*") {
         [Environment]::SetEnvironmentVariable("PATH", "$binDir;$userPath", "User")
         Write-Host "[install] Added $binDir to user PATH"
+    }
+    # Refresh PATH in current process so dgc-pro is usable without reopening a window
+    if ($env:Path -notlike "*$binDir*") {
+        $env:Path = "$binDir;$env:Path"
     }
 
     $ver = if (Test-Path "$INSTALL_DIR\bin\version.txt") { (Get-Content "$INSTALL_DIR\bin\version.txt" -Raw).Trim() } else { "1.0.12" }
@@ -326,7 +351,7 @@ try {
     Write-Host "|  Install complete.  GrapeRoot Pro v$ver" -ForegroundColor Green
     Write-Host "+==============================================================+" -ForegroundColor Green
     Write-Host ""
-    Write-Host "  Open a new PowerShell window (PATH refresh), then:"
+    Write-Host "  Run now (PATH already active in this window):"
     Write-Host "    dgc-pro C:\path\to\your\project       # Claude Code (default)" -ForegroundColor Cyan
     Write-Host "    dg-pro  C:\path\to\your\project       # OpenAI Codex" -ForegroundColor Cyan
     Write-Host "    graperoot-pro --gemini C:\path\...    # Gemini CLI" -ForegroundColor Cyan
