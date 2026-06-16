@@ -4363,6 +4363,11 @@ def main() -> int:
     else:
         raise RuntimeError(f"no free port in {preferred}-{preferred + 19}")
     DG_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Clear tool call log so /savings only reports THIS session's data
+    try:
+        LOG_FILE.write_text("", encoding="utf-8")
+    except OSError:
+        pass
     if port != preferred:
         logging.getLogger(__name__).warning("Port %d in use, using %d", preferred, port)
         os.environ["PORT"] = str(port)
