@@ -4704,6 +4704,7 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
         shadow_grep_count = 0
         shadow_file_read_tokens = 0
         shadow_file_read_count = 0
+        seen_files: set[str] = set()
 
         try:
             with LOG_FILE.open("r", encoding="utf-8") as f:
@@ -4748,16 +4749,14 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
                     tool_hits[mode] = tool_hits.get(mode, 0) + 1
                     fc = int(p.get("full_file_chars", 0))
                     rc = int(p.get("response_chars", 0))
+                    # Extract base file path (strip ::symbol suffix)
+                    raw_file = p.get("file", "") or ""
+                    base_file = raw_file.split("::")[0] if "::" in raw_file else raw_file
 
                     if mode == "cross_turn_pointer":
-                        # Claude explicitly called graph_read on this file again.
-                        # That's direct evidence it needed re-reading — if it had the
-                        # content from history, it wouldn't have called the tool.
-                        # Credit at 100%: the call IS the proof.
-                        # Cap at Read tool limit (vanilla also caps).
                         capped = min(fc, _READ_TOOL_MAX_CHARS) if fc > 0 else 0
                         tokens_avoided_cross_turn += capped // 4
-                        graperoot_overhead_tokens += 20  # pointer response
+                        graperoot_overhead_tokens += 20
                         continue
 
                     if mode == "dedupe_preview":
@@ -4769,15 +4768,19 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
                         continue
 
                     if fc > 0:
-                        # Cap full_file at Read tool's effective limit
-                        # (vanilla Claude also doesn't read arbitrarily large files)
                         capped_fc = min(fc, _READ_TOOL_MAX_CHARS)
-                        full_tokens += capped_fc // 4
                         tokens_served += rc // 4
-                        avoided = max(0, capped_fc - rc) // 4
-                        tokens_avoided_tar += avoided
-                        # Overhead: graph_read JSON wrapper (ok, mode, file, budget fields)
                         graperoot_overhead_tokens += 25
+                        if base_file and base_file in seen_files:
+                            # Same file read again (different symbol) — vanilla Claude
+                            # would have Read this file only once. Don't double-count.
+                            pass
+                        else:
+                            if base_file:
+                                seen_files.add(base_file)
+                            full_tokens += capped_fc // 4
+                            avoided = max(0, capped_fc - rc) // 4
+                            tokens_avoided_tar += avoided
                     else:
                         tokens_served += int(p.get("response_tokens_est", 0))
 
@@ -4799,6 +4802,7 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
         savings_pct = round((saved_usd / vanilla_cost) * 100, 1) if vanilla_cost > 0 else 0.0
 
         total_avoided = tokens_avoided_tar + tokens_avoided_cross_turn + total_shadow
+        total_reads = sum(v for k, v in tool_hits.items() if k != "cross_turn_pointer")
         return Response(json.dumps({
             "ok": True,
             "total_turns": max_turn,
@@ -4809,6 +4813,8 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
             "tokens_avoided_tar": tokens_avoided_tar,
             "tokens_avoided_cross_turn": tokens_avoided_cross_turn,
             "graperoot_overhead_tokens": graperoot_overhead_tokens,
+            "unique_files_read": len(seen_files),
+            "total_reads": total_reads,
             "shadow_savings": {
                 "grep_avoided": {
                     "measurements": shadow_grep_count,

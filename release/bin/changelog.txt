@@ -1,3 +1,11 @@
+1.0.50  (2026-06-16)
+- Improved: TAR savings dedup by base file — multiple symbol reads from the same
+  file now count the file once (was double-counting full_file_chars per symbol).
+- Added: rich telemetry fields — unique_files_read, total_reads, total_turns,
+  tokens_served now sent to Railway on every session end.
+- Fixed: stop_hook regenerated from launch.py — was being overwritten on each
+  dgc-pro start, losing new telemetry fields.
+
 1.0.49  (2026-06-16)
 - Fixed: graph builder now skips .claude/, .cursor/, .gemini/, .graperoot/ directories.
   Worktree paths (.claude/worktrees/agent-xxx/) were being indexed and recommended
