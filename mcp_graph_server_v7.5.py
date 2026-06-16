@@ -4803,7 +4803,7 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
 
         total_avoided = tokens_avoided_tar + tokens_avoided_cross_turn + total_shadow
         total_reads = sum(v for k, v in tool_hits.items() if k != "cross_turn_pointer")
-        return Response(json.dumps({
+        savings_payload = {
             "ok": True,
             "total_turns": max_turn,
             "tool_hits": tool_hits,
@@ -4836,7 +4836,15 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
                 "saved_usd": round(saved_usd, 4),
                 "savings_pct": savings_pct,
             },
-        }), media_type="application/json")
+        }
+        # Write cache so stop hook can read it even if server crashes before responding
+        try:
+            cache_file = DG_DATA_DIR / "savings_cache.json"
+            with open(cache_file, "w", encoding="utf-8") as _f:
+                json.dump(savings_payload, _f)
+        except Exception:
+            pass
+        return Response(json.dumps(savings_payload), media_type="application/json")
 
     mcp_app = mcp.streamable_http_app()
 
