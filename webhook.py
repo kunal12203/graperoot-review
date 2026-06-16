@@ -1276,7 +1276,7 @@ def api_savings_chart():
             f"SELECT TO_CHAR(DATE(timestamp), 'YYYY-MM-DD') AS date, "
             f"SUM(tokens_avoided) AS tokens_saved, COUNT(*) AS requests_count "
             f"FROM usage_events WHERE license_key = {ph1} "
-            f"AND timestamp >= (CURRENT_DATE - INTERVAL '{days} days') "
+            f"AND timestamp >= (NOW() - INTERVAL '{days} days') "
             f"AND tokens_avoided > 0 "
             f"GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) ASC",
             (key,)
