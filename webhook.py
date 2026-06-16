@@ -305,6 +305,45 @@ def _migrate_db():
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS unique_files_read INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_reads INTEGER DEFAULT 0",
         "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS total_turns INTEGER DEFAULT 0",
+        """CREATE TABLE IF NOT EXISTS session_savings (
+            id                      SERIAL PRIMARY KEY,
+            license_key             TEXT NOT NULL,
+            session_id              TEXT NOT NULL,
+            timestamp               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            model                   TEXT,
+            device_host             TEXT DEFAULT 'unknown',
+            project_hash            TEXT,
+            -- Raw token counts
+            input_tokens            INTEGER DEFAULT 0,
+            output_tokens           INTEGER DEFAULT 0,
+            cache_read_tokens       INTEGER DEFAULT 0,
+            cache_write_tokens      INTEGER DEFAULT 0,
+            -- Savings breakdown (raw token counts)
+            tokens_avoided_tar      INTEGER DEFAULT 0,
+            tokens_avoided_cross_turn INTEGER DEFAULT 0,
+            shadow_tokens_avoided   INTEGER DEFAULT 0,
+            graperoot_overhead_tokens INTEGER DEFAULT 0,
+            tokens_served           INTEGER DEFAULT 0,
+            unique_files_read       INTEGER DEFAULT 0,
+            total_reads             INTEGER DEFAULT 0,
+            total_turns             INTEGER DEFAULT 0,
+            tool_hits               TEXT,
+            -- Computed costs (calculated server-side)
+            actual_cost_usd         REAL DEFAULT 0,
+            naive_cost_usd          REAL DEFAULT 0,
+            saved_usd               REAL DEFAULT 0,
+            savings_pct             REAL DEFAULT 0,
+            -- Breakdown percentages (share of total avoided)
+            tar_share_pct           REAL DEFAULT 0,
+            cross_turn_share_pct    REAL DEFAULT 0,
+            shadow_share_pct        REAL DEFAULT 0,
+            -- Input price used for naive cost
+            input_price_per_m       REAL DEFAULT 0,
+            CONSTRAINT uq_ss_key_session UNIQUE (license_key, session_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_ss_license ON session_savings(license_key)",
+        "CREATE INDEX IF NOT EXISTS idx_ss_ts ON session_savings(timestamp DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_ss_license_ts ON session_savings(license_key, timestamp DESC)",
         """CREATE TABLE IF NOT EXISTS token_savings (
             id             SERIAL PRIMARY KEY,
             license_key    TEXT NOT NULL,
@@ -1031,6 +1070,82 @@ def _calc_cost(model: str, inp: int, out: int, cr: int, cw: int,
     return round(tc, 6), round(nc, 6), round(sp, 4)
 
 
+def _upsert_session_savings(key, session_id, ts, model, device_host, project_hash,
+                             inp, out, cr, cw,
+                             tar, cross_turn, shadow, overhead,
+                             tokens_served, unique_files, total_reads, total_turns,
+                             tool_hits_str):
+    """Compute and upsert one clean row into session_savings.
+
+    Formula:
+        actual_cost  = (inp×price + cw×price + cr×price + out×price) / 1M
+        naive_cost   = actual_cost + (tar + cross_turn + shadow) × input_price / 1M
+        saved_usd    = naive_cost - actual_cost
+        savings_pct  = saved_usd / naive_cost
+    Breakdown shares show which vector contributed most.
+    """
+    if not _pro_is_pg():
+        return
+    try:
+        m = (model or "").lower()
+        if "haiku" in m:
+            pr = (1.0, 1.25, 0.1, 5.0)
+        elif "fable" in m:
+            pr = (10.0, 12.5, 1.0, 50.0)
+        elif "opus" in m and ("4-8" in m or "4-7" in m):
+            pr = (5.0, 6.25, 0.5, 25.0)
+        elif "opus" in m:
+            pr = (15.0, 18.75, 1.5, 75.0)
+        else:
+            pr = (3.0, 3.75, 0.3, 15.0)
+
+        input_price = pr[0]
+        actual = (inp * pr[0] + cw * pr[1] + cr * pr[2] + out * pr[3]) / 1e6
+        total_avoided = tar + cross_turn + shadow
+        naive = actual + total_avoided * input_price / 1e6
+        saved = max(0.0, naive - actual)
+        savings_pct = round(saved / naive, 4) if naive > 0 else 0.0
+
+        tar_share = round(tar / total_avoided, 4) if total_avoided > 0 else 0.0
+        ct_share  = round(cross_turn / total_avoided, 4) if total_avoided > 0 else 0.0
+        sh_share  = round(shadow / total_avoided, 4) if total_avoided > 0 else 0.0
+
+        ph = _pro_ph(27)
+        _pro_query_write(
+            f"INSERT INTO session_savings "
+            f"(license_key, session_id, timestamp, model, device_host, project_hash, "
+            f"input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+            f"tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, "
+            f"graperoot_overhead_tokens, tokens_served, unique_files_read, total_reads, total_turns, "
+            f"tool_hits, actual_cost_usd, naive_cost_usd, saved_usd, savings_pct, "
+            f"tar_share_pct, cross_turn_share_pct, shadow_share_pct, input_price_per_m) "
+            f"VALUES ({ph}) "
+            f"ON CONFLICT (license_key, session_id) DO UPDATE SET "
+            f"timestamp=EXCLUDED.timestamp, model=EXCLUDED.model, "
+            f"input_tokens=EXCLUDED.input_tokens, output_tokens=EXCLUDED.output_tokens, "
+            f"cache_read_tokens=EXCLUDED.cache_read_tokens, cache_write_tokens=EXCLUDED.cache_write_tokens, "
+            f"tokens_avoided_tar=EXCLUDED.tokens_avoided_tar, "
+            f"tokens_avoided_cross_turn=EXCLUDED.tokens_avoided_cross_turn, "
+            f"shadow_tokens_avoided=EXCLUDED.shadow_tokens_avoided, "
+            f"graperoot_overhead_tokens=EXCLUDED.graperoot_overhead_tokens, "
+            f"tokens_served=EXCLUDED.tokens_served, unique_files_read=EXCLUDED.unique_files_read, "
+            f"total_reads=EXCLUDED.total_reads, total_turns=EXCLUDED.total_turns, "
+            f"tool_hits=EXCLUDED.tool_hits, actual_cost_usd=EXCLUDED.actual_cost_usd, "
+            f"naive_cost_usd=EXCLUDED.naive_cost_usd, saved_usd=EXCLUDED.saved_usd, "
+            f"savings_pct=EXCLUDED.savings_pct, tar_share_pct=EXCLUDED.tar_share_pct, "
+            f"cross_turn_share_pct=EXCLUDED.cross_turn_share_pct, shadow_share_pct=EXCLUDED.shadow_share_pct, "
+            f"input_price_per_m=EXCLUDED.input_price_per_m",
+            (key, session_id, ts, model, device_host, project_hash,
+             inp, out, cr, cw,
+             tar, cross_turn, shadow, overhead,
+             tokens_served, unique_files, total_reads, total_turns,
+             tool_hits_str, round(actual, 6), round(naive, 6), round(saved, 6),
+             savings_pct, tar_share, ct_share, sh_share, input_price)
+        )
+    except Exception as e:
+        print(f"[session_savings] upsert failed: {e}", flush=True)
+
+
 @app.route("/api/usage", methods=["POST"])
 def api_usage_ingest():
     data = request.get_json(silent=True) or {}
@@ -1089,6 +1204,15 @@ def api_usage_ingest():
                  existing["id"])
             )
             _upsert_token_savings(key, ts, device_host, tokens_avoided)
+            _upsert_session_savings(
+                key, session_id, ts, model, device_host, data.get("project_hash"),
+                inp, out, cr, cw,
+                tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided,
+                graperoot_overhead_tokens,
+                int(data.get("tokens_served", inp + cw + cr + out)),
+                unique_files_read, total_reads, total_turns,
+                data.get("tool_hits")
+            )
             return jsonify({"ok": True, "dedup": "updated"})
 
     ph = _pro_ph(25)
@@ -1113,6 +1237,16 @@ def api_usage_ingest():
          unique_files_read, total_reads, total_turns)
     )
     _upsert_token_savings(key, ts, device_host, tokens_avoided_tar + tokens_avoided_cross_turn)
+    if session_id:
+        _upsert_session_savings(
+            key, session_id, ts, model, device_host, data.get("project_hash"),
+            inp, out, cr, cw,
+            tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided,
+            graperoot_overhead_tokens,
+            int(data.get("tokens_served", inp + cw + cr + out)),
+            unique_files_read, total_reads, total_turns,
+            data.get("tool_hits")
+        )
 
     return jsonify({"ok": True})
 
@@ -1158,6 +1292,48 @@ def api_usage_backfill_costs():
     # Rebuild token_savings table from corrected data
     _rebuild_token_savings()
     return jsonify({"ok": True, "rows_updated": updated})
+
+
+@app.route("/api/usage/backfill-session-savings", methods=["POST"])
+def api_backfill_session_savings():
+    """Populate session_savings from all existing usage_events rows."""
+    secret = request.get_json(silent=True, force=True) or {}
+    if secret.get("secret") != "grp-backfill-2026":
+        return jsonify({"error": "forbidden"}), 403
+    if not _pro_is_pg():
+        return jsonify({"error": "postgres only"}), 400
+
+    rows = _pro_query(
+        "SELECT license_key, session_id, timestamp, model, device_host, project_hash, "
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "tokens_avoided_tar, tokens_avoided_cross_turn, shadow_tokens_avoided, "
+        "graperoot_overhead_tokens, tokens_served, unique_files_read, total_reads, total_turns, "
+        "tool_hits FROM usage_events WHERE session_id IS NOT NULL AND session_id != ''",
+        ()
+    )
+    written = 0
+    for r in rows:
+        try:
+            _upsert_session_savings(
+                r["license_key"], r["session_id"],
+                r["timestamp"], r.get("model"), r.get("device_host", "unknown"),
+                r.get("project_hash"),
+                int(r.get("input_tokens") or 0), int(r.get("output_tokens") or 0),
+                int(r.get("cache_read_tokens") or 0), int(r.get("cache_write_tokens") or 0),
+                int(r.get("tokens_avoided_tar") or 0),
+                int(r.get("tokens_avoided_cross_turn") or 0),
+                int(r.get("shadow_tokens_avoided") or 0),
+                int(r.get("graperoot_overhead_tokens") or 0),
+                int(r.get("tokens_served") or 0),
+                int(r.get("unique_files_read") or 0),
+                int(r.get("total_reads") or 0),
+                int(r.get("total_turns") or 0),
+                r.get("tool_hits")
+            )
+            written += 1
+        except Exception:
+            pass
+    return jsonify({"ok": True, "rows_written": written})
 
 
 @app.route("/api/usage/stats")
