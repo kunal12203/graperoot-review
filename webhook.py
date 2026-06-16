@@ -1226,6 +1226,7 @@ def api_usage_stats():
         f"cache_read_tokens, cache_write_tokens, total_cost_usd, naive_cost_usd, savings_pct, "
         f"tokens_served, tokens_avoided, tokens_avoided_tar, tokens_avoided_cross_turn, "
         f"shadow_tokens_avoided, graperoot_overhead_tokens, tool_hits, "
+        f"unique_files_read, total_reads, total_turns, "
         f"task_type, confidence, project_hash, session_id, device_host "
         f"FROM usage_events WHERE license_key = {ph1} AND {window} "
         f"ORDER BY timestamp DESC LIMIT 50",
