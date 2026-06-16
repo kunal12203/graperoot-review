@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.48: CLI flags — -v/--version, --update, --status, --doctor, -h/--help.
+         --doctor validates all dependencies; --status shows install/license info.
+
 v1.0.46: stop_hook reads port from <project>/.dual-graph-pro/port — fixes 0
          savings when switching projects or running concurrent sessions; dedup
          Stop hooks so they don't accumulate across repeated dgc-pro invocations
@@ -995,10 +998,13 @@ def main() -> None:
     prog = {"claude": "dgc-pro", "codex": "dg-pro"}.get(tool, "graperoot-pro")
 
     ap = argparse.ArgumentParser(prog=prog,
-        description=f"GrapeRoot Pro — dual-graph context engine (v1.0). Tool: {tool}.")
+        description=f"GrapeRoot Pro — dual-graph context engine. Tool: {tool}.")
     ap.add_argument("project", nargs="?", default=".")
-    ap.add_argument("--version", action="store_true")
+    ap.add_argument("-v", "--version", action="store_true", help="Show version and exit")
+    ap.add_argument("--update", action="store_true", help="Check for updates and exit")
     ap.add_argument("--skip-update", action="store_true", help="Skip auto-update check")
+    ap.add_argument("--status", action="store_true", help="Show license and install info")
+    ap.add_argument("--doctor", action="store_true", help="Check dependencies and health")
     # Tool selection (stripped before passthrough)
     ap.add_argument("--claude", dest="_tool", action="store_const", const="claude")
     ap.add_argument("--codex", "--dg-pro", dest="_tool", action="store_const", const="codex")
@@ -1038,6 +1044,56 @@ def main() -> None:
     if args.version:
         ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "1.0.41"
         print(f"{label} v{ver}  (platform: {tool})")
+        return
+
+    if args.update:
+        print(f"[{label}] Checking for updates…", flush=True)
+        auto_update()
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "unknown"
+        print(f"[{label}] Current version: v{ver}", flush=True)
+        return
+
+    if args.status:
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "unknown"
+        license_file = PRO_HOME / "license.key"
+        lk = license_file.read_text().strip()[:8] + "…" if license_file.exists() else "not found"
+        print(f"{label} v{ver}")
+        print(f"  Install:  {PRO_HOME}")
+        print(f"  License:  {lk}")
+        print(f"  Platform: {tool}")
+        print(f"  Python:   {sys.executable}")
+        return
+
+    if args.doctor:
+        ver = (PRO_HOME / "bin" / "version.txt").read_text().strip() if (PRO_HOME/"bin"/"version.txt").exists() else "unknown"
+        print(f"[{label}] Doctor — v{ver}", flush=True)
+        checks = []
+        # Check server script
+        server_py = PRO_HOME / "mcp_graph_server_v7.5.py"
+        checks.append(("MCP server script", server_py.exists()))
+        # Check graph builder
+        builder = PRO_HOME / "graph_builder.py"
+        checks.append(("Graph builder", builder.exists()))
+        # Check license
+        license_file = PRO_HOME / "license.key"
+        checks.append(("License key", license_file.exists()))
+        # Check gate/sync hooks
+        checks.append(("Graph gate script", (PRO_HOME / "graph_gate.py").exists()))
+        checks.append(("Graph sync script", (PRO_HOME / "graph_sync.py").exists()))
+        # Check CLI tool availability
+        tool_name = {"claude": "claude", "codex": "codex", "gemini": "gemini", "opencode": "opencode", "cursor": "cursor"}.get(tool, "claude")
+        checks.append((f"CLI ({tool_name})", shutil.which(tool_name) is not None))
+        # Print results
+        all_ok = True
+        for name, ok in checks:
+            status = "OK" if ok else "MISSING"
+            if not ok:
+                all_ok = False
+            print(f"  {'✓' if ok else '✗'} {name}: {status}")
+        if all_ok:
+            print(f"\n  All checks passed.")
+        else:
+            print(f"\n  Some checks failed — try reinstalling: curl -fsSL https://graperoot.dev/install.sh | bash")
         return
 
     project = Path(args.project).resolve()

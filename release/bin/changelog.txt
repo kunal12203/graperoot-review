@@ -1,3 +1,11 @@
+1.0.48  (2026-06-16)
+- Added: CLI flags — dgc-pro -v/--version, --update, --status, --doctor, -h/--help.
+  --status shows install path, license, platform. --doctor checks all dependencies.
+- Fixed: clear mcp_tool_calls.jsonl on server start — prevents /savings from reporting
+  stale data from previous sessions.
+- Fixed: session dedup in webhook — stop_hook firing every turn no longer creates
+  duplicate rows (existing session_id updates instead of inserting).
+
 1.0.47  (2026-06-15)
 - Fixed: savings calculation no longer claims prompt cache savings as GrapeRoot savings.
   Only graph-specific avoidance (TAR, cross-turn, shadow) is counted. Historical rows
