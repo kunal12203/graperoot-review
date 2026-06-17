@@ -1,3 +1,8 @@
+1.0.51  (2026-06-17)
+- Fixed: Windows path backslash escaping in hook commands — bash was interpreting
+  backslashes as escape sequences. Now uses .as_posix() for forward slashes on
+  all platforms (no-op on Mac/Linux, fix on Windows).
+
 1.0.50  (2026-06-16)
 - Improved: TAR savings dedup by base file — multiple symbol reads from the same
   file now count the file once (was double-counting full_file_chars per symbol).

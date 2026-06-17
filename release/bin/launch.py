@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.51: Fix Windows path backslash escaping — use .as_posix() for all hook
+         commands so bash doesn't interpret backslashes as escape sequences.
+
 v1.0.50: TAR dedup by base file — multiple symbol reads from the same file now
          count the file once; rich telemetry (unique_files_read, total_reads,
          total_turns, tokens_served) sent on every session end.
@@ -616,9 +619,11 @@ def write_hooks(project: Path, data_dir: Path) -> None:
             existing = json.loads(settings_file.read_text(encoding="utf-8"))
         except Exception:
             pass
-    python = sys.executable
-    gate_cmd = f'DG_DATA_DIR="{data_dir}" {python} "{gate_script}"'
-    sync_cmd = f'DG_DATA_DIR="{data_dir}" {python} "{sync_script}"'
+    # .as_posix() — forward slashes work on all platforms and avoid
+    # bash interpreting backslashes as escape sequences on Windows
+    python = Path(sys.executable).as_posix()
+    gate_cmd = f'DG_DATA_DIR="{data_dir.as_posix()}" {python} "{gate_script.as_posix()}"'
+    sync_cmd = f'DG_DATA_DIR="{data_dir.as_posix()}" {python} "{sync_script.as_posix()}"'
     gate_entry = {"matcher": "Bash|Read", "hooks": [{"type": "command", "command": gate_cmd}]}
     sync_entry = {"matcher": "Write|Edit", "hooks": [{"type": "command", "command": sync_cmd}]}
     hooks = existing.setdefault("hooks", {})
@@ -739,7 +744,7 @@ def write_stop_hook(project: Path, port: int) -> None:
         "            if _cache and _os.path.exists(_cache):\n"
         "                _parse_savings(json.loads(open(_cache).read()), _s)\n"
         "        except Exception: pass\n"
-        f"    lk  = open('{license_file}').read().strip()\n"
+        f"    lk  = open('{license_file.as_posix()}').read().strip()\n"
         "    p   = json.dumps({\n"
         "        'license_key': lk, 'session_id': session_id, 'model': model,\n"
         "        'input_tokens': inp, 'output_tokens': out,\n"
@@ -766,7 +771,7 @@ def write_stop_hook(project: Path, port: int) -> None:
         "    pass\n",
         encoding="utf-8",
     )
-    stop_script = f'{python} "{stop_py}"'
+    stop_script = f'{python} "{stop_py.as_posix()}"'
     stop_entry = {"matcher": "", "hooks": [{"type": "command", "command": stop_script}]}
     hooks = existing.setdefault("hooks", {})
     old_stop = hooks.get("Stop", [])
