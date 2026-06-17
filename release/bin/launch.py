@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
-v1.0.51: Fix Windows path backslash escaping — use .as_posix() for all hook
-         commands so bash doesn't interpret backslashes as escape sequences.
+v1.0.52: Fix stop hook python path — write_stop_hook was still using bare
+         sys.executable (backslashes). All hook functions now use .as_posix().
+         Also: Windows installer skips Windows Store Python stubs, better venv
+         error handling.
+
+v1.0.51: Fix gate/sync hook paths — use .as_posix() for all hook commands.
 
 v1.0.50: TAR dedup by base file — multiple symbol reads from the same file now
          count the file once; rich telemetry (unique_files_read, total_reads,
@@ -676,7 +680,7 @@ def write_stop_hook(project: Path, port: int) -> None:
     if not license_file.exists():
         return
 
-    python = sys.executable
+    python = Path(sys.executable).as_posix()
     project_hash = hashlib.sha256(str(project).encode()).hexdigest()[:16]
     # Write stop hook as a proper script file — avoids shell quoting / newline issues with -c
     stop_py = PRO_HOME / "stop_hook.py"
@@ -803,8 +807,8 @@ def write_gemini_hooks(project: Path, data_dir: Path) -> None:
             existing = json.loads(cfg.read_text(encoding="utf-8"))
         except Exception:
             pass
-    python = sys.executable
-    gate_cmd = f'DG_DATA_DIR="{data_dir}" GEMINI_PROJECT_DIR="{project}" {python} "{gate_script}"'
+    python = Path(sys.executable).as_posix()
+    gate_cmd = f'DG_DATA_DIR="{data_dir.as_posix()}" GEMINI_PROJECT_DIR="{Path(project).as_posix()}" {python} "{gate_script.as_posix()}"'
     gate_entry = {"matcher": "run_shell_command|read_file|glob|grep|ls", "hooks": [{"type": "command", "command": gate_cmd}]}
     hooks = existing.setdefault("hooks", {})
     # Remove stale gate entries

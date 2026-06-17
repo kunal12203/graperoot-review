@@ -1,7 +1,13 @@
+1.0.52  (2026-06-17)
+- Fixed: stop hook python path — write_stop_hook was still using bare
+  sys.executable (backslashes on Windows). All three hook functions now
+  use .as_posix() consistently.
+- Fixed: Windows installer skips Windows Store Python stubs, better venv
+  error handling with fallback pip install.
+
 1.0.51  (2026-06-17)
-- Fixed: Windows path backslash escaping in hook commands — bash was interpreting
-  backslashes as escape sequences. Now uses .as_posix() for forward slashes on
-  all platforms (no-op on Mac/Linux, fix on Windows).
+- Fixed: gate/sync hook paths — use .as_posix() for all hook commands
+  (partial fix — stop hook was missed).
 
 1.0.50  (2026-06-16)
 - Improved: TAR savings dedup by base file — multiple symbol reads from the same

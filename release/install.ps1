@@ -100,11 +100,20 @@ try {
     # -----------------------------------------------------------------------
     # Prerequisites - Python 3.10+, Claude Code
     # -----------------------------------------------------------------------
+    function Test-WindowsStoreStub([string]$exe) {
+        try {
+            $resolved = (Get-Command $exe -ErrorAction Stop).Source
+            if ($resolved -like "*\WindowsApps\*") { return $true }
+        } catch {}
+        return $false
+    }
+
     $pyCandidates = @("python3.13","python3.12","python3.11","python3.10","python3","python")
     $pythonCmd = $null
     foreach ($c in $pyCandidates) {
         $cmd = Get-Command $c -ErrorAction SilentlyContinue
         if ($cmd) {
+            if (Test-WindowsStoreStub $c) { continue }
             $ok = & $cmd.Source -c "import sys; print('1' if sys.version_info >= (3,10) else '0')" 2>$null
             if ($ok -eq "1") { $pythonCmd = $cmd.Source; break }
         }
@@ -319,9 +328,23 @@ try {
 
     Write-Host "[install] Creating isolated Python venv..."
     & $pythonCmd -m venv "$INSTALL_DIR\venv" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to create Python venv. Try: $pythonCmd -m venv `"$INSTALL_DIR\venv`"" }
     $venvPy = "$INSTALL_DIR\venv\Scripts\python.exe"
     & $venvPy -m pip install --quiet --upgrade pip
     & $venvPy -m pip install --quiet -r "$INSTALL_DIR\requirements.txt"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[warn] pip install from requirements.txt failed, retrying core deps..." -ForegroundColor Yellow
+        & $venvPy -m pip install anyio mcp uvicorn starlette
+        if ($LASTEXITCODE -ne 0) { throw "Failed to install Python dependencies. Check pip output above." }
+    }
+    # Verify critical imports
+    $importCheck = & $venvPy -c "import anyio, mcp; print('ok')" 2>&1
+    if ($importCheck -ne "ok") {
+        Write-Host "[warn] Import check failed, force-reinstalling..." -ForegroundColor Yellow
+        & $venvPy -m pip install --force-reinstall anyio mcp uvicorn starlette
+        $importCheck2 = & $venvPy -c "import anyio, mcp; print('ok')" 2>&1
+        if ($importCheck2 -ne "ok") { throw "Critical Python packages (anyio, mcp) failed to install. Python 3.14 may not be supported yet — try Python 3.12." }
+    }
 
     # License persistence (owner-only ACL)
     $licenseFile = "$INSTALL_DIR\license.key"
