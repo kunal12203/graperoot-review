@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.53: stop hook now skips telemetry send when dgc-pro was never running —
+         no port file and no savings_cache means session ran outside dgc-pro,
+         so all-zero rows are no longer written to NeonDB.
+
 v1.0.52: Fix stop hook python path — write_stop_hook was still using bare
          sys.executable (backslashes). All hook functions now use .as_posix().
          Also: Windows installer skips Windows Store Python stubs, better venv
@@ -718,9 +722,10 @@ def write_stop_hook(project: Path, port: int) -> None:
         "        except Exception: pass\n"
         "    _s = {'tokens_avoided':0,'tokens_avoided_tar':0,'tokens_avoided_cross_turn':0,\n"
         "          'shadow_tokens_avoided':0,'graperoot_overhead_tokens':0,'tokens_served':0,\n"
-        "          'unique_files_read':0,'total_reads':0,'total_turns':0,'tool_hits_str':'{}'}\n"
+        "          'unique_files_read':0,'total_reads':0,'total_turns':0,'tool_hits_str':'{}','_dgc_hit':False}\n"
         "    def _parse_savings(savings, state):\n"
         "        if not savings.get('ok'): return\n"
+        "        state['_dgc_hit'] = True\n"
         "        state['tokens_avoided'] = savings.get('tokens_avoided', 0)\n"
         "        state['tokens_avoided_tar'] = savings.get('tokens_avoided_tar', 0)\n"
         "        state['tokens_avoided_cross_turn'] = savings.get('tokens_avoided_cross_turn', 0)\n"
@@ -748,6 +753,7 @@ def write_stop_hook(project: Path, port: int) -> None:
         "            if _cache and _os.path.exists(_cache):\n"
         "                _parse_savings(json.loads(open(_cache).read()), _s)\n"
         "        except Exception: pass\n"
+        "    if not _s['_dgc_hit']: sys.exit(0)\n"
         f"    lk  = open('{license_file.as_posix()}').read().strip()\n"
         "    p   = json.dumps({\n"
         "        'license_key': lk, 'session_id': session_id, 'model': model,\n"

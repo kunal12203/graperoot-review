@@ -1973,6 +1973,23 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                     _end = expanded_end
             text = "\n".join(_lines[_start:_end + 1])
             mode = "symbol_excerpt"
+            # Write line range to read_cache.json so graph_gate can rewrite
+            # bare Read(file) calls to Read(file, offset=_start, limit=N).
+            try:
+                _rc_file = DG_DATA_DIR / "read_cache.json"
+                _rc: dict = {}
+                if _rc_file.exists():
+                    try:
+                        _rc = json.loads(_rc_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        _rc = {}
+                _rc[file_for_fs] = {"offset": _start, "limit": _end - _start + 1, "ts": int(datetime.now(timezone.utc).timestamp())}
+                # Prune entries older than 10 minutes
+                _now_ts = int(datetime.now(timezone.utc).timestamp())
+                _rc = {k: v for k, v in _rc.items() if _now_ts - int(v.get("ts", 0)) < 600}
+                _rc_file.write_text(json.dumps(_rc), encoding="utf-8")
+            except Exception:
+                pass
             # Staleness check: compare body hash against current file content.
             stored_hash = sym_meta.get("body_hash", "")
             if stored_hash:
@@ -2816,6 +2833,17 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         if _incremental_refreshed:
             out["graph_refreshed"] = len(_incremental_refreshed)
             out["graph_refreshed_files"] = _incremental_refreshed[:5]
+        # Suggest one follow-up tool — only on first turn, only for clear task types
+        if _first_turn and confidence in ("high", "medium"):
+            _next = None
+            if task_type == "refactor" and rec_slice:
+                _next = f'graph_impact("{rec_slice[0]}") — see what else breaks if you change this'
+            elif task_type == "debug" and rec_slice:
+                _next = f'graph_dynamic_trace("{rec_slice[0]}") — trace execution path through this file'
+            elif task_type == "feature" and rec_slice:
+                _next = f'graph_neighbors("{rec_slice[0]}") — see what imports/exports this file'
+            if _next:
+                out["next"] = _next
         return out
 
     @mcp.tool()

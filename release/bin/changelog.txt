@@ -1,3 +1,8 @@
+1.0.53  (2026-06-17)
+- Fixed: stop hook no longer sends zero-savings telemetry when dgc-pro was
+  never running (e.g. plain `claude` invocation). Send is now gated on
+  whether a live port or savings_cache was actually reached.
+
 1.0.52  (2026-06-17)
 - Fixed: stop hook python path — write_stop_hook was still using bare
   sys.executable (backslashes on Windows). All three hook functions now

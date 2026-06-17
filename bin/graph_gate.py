@@ -39,35 +39,7 @@ except Exception:
 tool = payload.get("tool_name", "")
 tool_input = payload.get("tool_input") or {}
 
-# ── Read: warn but don't block (required for Edit/Write workflow) ────────────
-if tool == "Read":
-    file_path = tool_input.get("file_path", "")
-    # Don't warn on config/meta files
-    _EXEMPT_BASENAMES = {
-        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-        "Cargo.toml", "Cargo.lock", "go.mod", "go.sum",
-        "pyproject.toml", "setup.py", "requirements.txt",
-        "tsconfig.json", ".eslintrc.json", ".env", ".gitignore",
-        "CLAUDE.md", "CONTEXT.md", "MEMORY.md", "README.md",
-        "Dockerfile", "docker-compose.yml",
-    }
-    _EXEMPT_PATTERNS = re.compile(
-        r"(?:README|CHANGELOG|LICENSE|CONTRIBUTING)(?:\.\w+)?$"
-        r"|\.(?:lock|toml|yml|yaml|json|md)$"
-        r"|/\.claude/|/\.dual-graph",
-        re.IGNORECASE,
-    )
-    basename = Path(file_path).name if file_path else ""
-    if basename not in _EXEMPT_BASENAMES and not _EXEMPT_PATTERNS.search(file_path):
-        print(
-            f"HINT: graph_read(file=\"{file_path}\") is more token-efficient than Read.\n"
-            f"graph_read returns only the relevant symbol/section, not the full file.\n"
-            f"Use Read only when you need the full file for editing.",
-            file=sys.stderr,
-        )
-    sys.exit(0)  # Always allow — never block Read
-
-if tool != "Bash":
+if tool not in ("Read", "Bash"):
     sys.exit(0)
 
 # ── Exploration detection for Bash ────────────────────────────────────────────
@@ -259,7 +231,75 @@ _INFRA_PATH = re.compile(
 )
 
 
+_EXEMPT_BASENAMES = {
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "Cargo.toml", "Cargo.lock", "go.mod", "go.sum",
+    "pyproject.toml", "setup.py", "requirements.txt",
+    "tsconfig.json", ".eslintrc.json", ".env", ".gitignore",
+    "CLAUDE.md", "CONTEXT.md", "MEMORY.md", "README.md",
+    "Dockerfile", "docker-compose.yml",
+}
+_EXEMPT_PATTERNS = re.compile(
+    r"(?:README|CHANGELOG|LICENSE|CONTRIBUTING)(?:\.\w+)?$"
+    r"|\.(?:lock|toml|yml|yaml|json|md)$"
+    r"|/\.claude/|/\.dual-graph",
+    re.IGNORECASE,
+)
+
+
+def _handle_read() -> int:
+    """Handle Read tool — rewrite to bounded range if graph_read cached a line range."""
+    file_path = tool_input.get("file_path", "")
+
+    # Only attempt rewrite on bare Read calls (no offset/limit already set)
+    has_offset = "offset" in tool_input or "limit" in tool_input
+    if not has_offset and file_path:
+        data_dir = _find_data_dir()
+        if data_dir is not None:
+            rc_file = data_dir / "read_cache.json"
+            if rc_file.exists():
+                try:
+                    import time as _t
+                    rc = json.loads(rc_file.read_text(encoding="utf-8"))
+                    project_root = data_dir.parent
+                    abs_path = str(Path(file_path).resolve())
+                    try:
+                        rel_path = str(Path(file_path).resolve().relative_to(project_root.resolve()))
+                    except ValueError:
+                        rel_path = file_path
+                    entry = rc.get(rel_path) or rc.get(abs_path)
+                    if entry and _t.time() - float(entry.get("ts", 0)) < 600:
+                        out = {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "updatedInput": {
+                                    "file_path": file_path,
+                                    "offset": int(entry["offset"]),
+                                    "limit": int(entry["limit"]),
+                                },
+                            }
+                        }
+                        print(json.dumps(out))
+                        return 0
+                except Exception:
+                    pass
+
+    # No cached range — emit hint for non-exempt files
+    basename = Path(file_path).name if file_path else ""
+    if basename not in _EXEMPT_BASENAMES and not _EXEMPT_PATTERNS.search(file_path):
+        print(
+            f"HINT: graph_read(file=\"{file_path}\") is more token-efficient than Read.\n"
+            f"graph_read returns only the relevant symbol/section, not the full file.\n"
+            f"Use Read only when you need the full file for editing.",
+            file=sys.stderr,
+        )
+    return 0  # Always allow Read
+
+
 def main() -> int:
+    if tool == "Read":
+        return _handle_read()
+
     cmd = tool_input.get("command", "")
 
     if _REMOTE_EXEC.search(cmd):
