@@ -16,6 +16,18 @@ const COMPARE = [
   { feature: "Code leaves your server", gr: "Never",             cr: "Yes",              ca: "Yes",              gp: "Yes"             },
 ];
 
+const HEADROOM_COMPARE = [
+  { feature: "What it does",            gr: "Selects which context to send",     hr: "Compresses context after selection"     },
+  { feature: "Works at",                gr: "Upstream (selection)",              hr: "Downstream (compression)"              },
+  { feature: "Knows your codebase",     gr: "Yes — graph of every symbol/edge",  hr: "No — stateless per request"            },
+  { feature: "Finds the right 8 files", gr: "Yes — graph traversal query",       hr: "No — compresses whatever it receives"  },
+  { feature: "Cross-file relationships",gr: "Yes — import edges, call graphs",   hr: "No — AST within a single file only"    },
+  { feature: "Lossless",                gr: "Yes — original code untouched",     hr: "No — lossy by design (CCR recovery)"   },
+  { feature: "Token savings mechanism", gr: "Read 8 relevant files not 40",      hr: "Shrink those 40 files by 60–92%"       },
+  { feature: "Open source",             gr: "No",                                hr: "Yes — Apache 2.0, 30k+ stars"          },
+  { feature: "Works together?",         gr: "Yes — complementary",               hr: "Yes — complementary"                   },
+];
+
 function Cell({ val }: { val: string | boolean }) {
   if (val === true)  return <Check size={15} className="text-green-400 mx-auto" />;
   if (val === false) return <X     size={15} className="text-zinc-700 mx-auto" />;
@@ -96,6 +108,53 @@ export default function ComparePage() {
                   <span className="text-white font-semibold">store/chunk_store.go</span>
                 </p>
               </div>
+            </div>
+          </div>
+
+          {/* Headroom comparison */}
+          <div className="mt-16">
+            <p className="text-center text-[11px] font-bold text-grape-500 uppercase tracking-widest mb-3">
+              vs token compression
+            </p>
+            <h2 className="font-sans text-center text-3xl sm:text-4xl font-bold text-zinc-100 mb-4 tracking-tight">
+              GrapeRoot vs Headroom
+            </h2>
+            <p className="text-center text-zinc-400 text-sm mb-8 max-w-lg mx-auto leading-relaxed">
+              Headroom (30k+ stars) compresses context after you select it.
+              GrapeRoot selects the right context before you ever read a file.
+              They solve different problems — and work best together.
+            </p>
+
+            <div className="rounded-xl border border-white/[0.07] overflow-hidden mb-6">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-white/[0.07] bg-[#0e0e11]">
+                    <th className="text-left px-4 py-3 text-[11px] text-zinc-500 uppercase tracking-wider w-[36%]">Dimension</th>
+                    <th className="px-3 py-3 text-[11px] text-grape-400 uppercase tracking-wider text-center">GrapeRoot</th>
+                    <th className="px-3 py-3 text-[11px] text-zinc-500 uppercase tracking-wider text-center">Headroom</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {HEADROOM_COMPARE.map((row, i) => (
+                    <tr key={row.feature} className={`border-b border-white/[0.04] last:border-0 ${i % 2 ? "bg-zinc-900/20" : ""}`}>
+                      <td className="px-4 py-3 text-zinc-400 text-xs">{row.feature}</td>
+                      <td className="px-3 py-3 text-center bg-grape-500/5 text-xs text-zinc-200">{row.gr}</td>
+                      <td className="px-3 py-3 text-center text-xs text-zinc-500">{row.hr}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="rounded-xl border border-grape-500/20 bg-grape-500/5 p-5">
+              <p className="text-sm text-zinc-200 italic mb-2">
+                &ldquo;Headroom shrinks 40 files down. GrapeRoot tells you it&apos;s only 8 files you need.&rdquo;
+              </p>
+              <p className="text-xs text-zinc-500 leading-relaxed">
+                Token compression and context selection are complementary — not competitive.
+                Run GrapeRoot to pick the right files, then Headroom to compress them.
+                Together they give you the lowest possible token spend with the highest signal.
+              </p>
             </div>
           </div>
         </div>
