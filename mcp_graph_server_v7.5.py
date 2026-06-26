@@ -86,9 +86,24 @@ except Exception:  # noqa: BLE001
 
 try:
     from graperoot.dg import retrieve as _dg_retrieve, classify_intent as _dg_classify_intent
-except Exception:  # noqa: BLE001
+    _DG_IMPORT_ERROR = ""
+except Exception as _dg_imp_exc:  # noqa: BLE001
     _dg_retrieve = None  # type: ignore[assignment]
     _dg_classify_intent = None  # type: ignore[assignment]
+    _DG_IMPORT_ERROR = f"{type(_dg_imp_exc).__name__}: {_dg_imp_exc}"
+
+# Fail loudly (to stderr) when local retrieval is unavailable, so the missing
+# dependency surfaces immediately instead of silently degrading to the remote
+# backend and returning opaque 404s. See graph_retrieve()/graph_continue().
+if _dg_retrieve is None:
+    print(
+        "[graperoot] WARNING: local retrieval unavailable — the 'graperoot' package "
+        f"could not be imported ({_DG_IMPORT_ERROR}). graph_retrieve/graph_continue "
+        f"will fail unless DG_BASE_URL points to a running backend. Install it with "
+        f"'pip install graperoot' into this interpreter: {_sys.executable}",
+        file=_sys.stderr,
+        flush=True,
+    )
 
 
 DG_BASE = os.environ.get("DG_BASE_URL", "http://127.0.0.1:8787")
@@ -540,6 +555,33 @@ def _resolve_to_symbols(file_paths: list[str], query: str, max_per_file: int = 1
             result.append(fp)  # no symbol match — keep bare file path
 
     return result
+
+
+def _retrieval_unavailable_error(query: str, exc: Exception | None = None) -> dict[str, Any]:
+    """Build a clear, structured error when neither local nor remote retrieval works.
+
+    Without this, a missing 'graperoot' install silently degrades to the default
+    remote backend (DG_BASE) and returns an opaque 404, hiding the real cause.
+    """
+    hint = (
+        " Local retrieval is disabled because the 'graperoot' package could not be "
+        f"imported ({_DG_IMPORT_ERROR}). Install it with 'pip install graperoot' into "
+        f"this interpreter ({_sys.executable}), or set DG_BASE_URL to a running backend."
+        if _dg_retrieve is None
+        else ""
+    )
+    return {
+        "ok": False,
+        "error": "retrieval_unavailable",
+        "message": (
+            "graph retrieval failed: no local graph result and the remote backend at "
+            f"{DG_BASE} is unreachable.{hint}"
+        ),
+        "detail": f"{type(exc).__name__}: {exc}" if exc is not None else "",
+        "query": query,
+        "graph_files": [],
+        "graph_edges": [],
+    }
 
 
 def _local_chat_fix(query: str, top_files: int, top_edges: int) -> dict[str, Any] | None:
@@ -1670,10 +1712,19 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             return out
         _log_tool("graph_retrieve", {"query": query, "top_files": top_files, "top_edges": top_edges})
         _record_action("retrieve", {"query": query, "top_files": top_files, "top_edges": top_edges})
-        out = _local_chat_fix(query, top_files, top_edges) or _post(
-            "/api/chat-fix",
-            {"query": query, "top_files": top_files, "top_edges": top_edges, "max_grep_hits": 0},
-        )
+        out = _local_chat_fix(query, top_files, top_edges)
+        if out is None:
+            try:
+                out = _post(
+                    "/api/chat-fix",
+                    {"query": query, "top_files": top_files, "top_edges": top_edges, "max_grep_hits": 0},
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Neither local retrieval nor the remote backend is available.
+                # Return an explicit, actionable error instead of a bare 404.
+                err = _retrieval_unavailable_error(query, exc)
+                _log_tool("graph_retrieve", {"query": query, "mode": "retrieval_unavailable"})
+                return err
         # Action graph update + cache hints
         g = _load_action_graph()
         qid = f"query:{_query_key(query)}"
