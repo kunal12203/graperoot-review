@@ -68,6 +68,10 @@ ROUTE_EXTS: set[str] = {
     ".java",
     # Ruby
     ".rb",
+    # GraphQL
+    ".graphql", ".gql",
+    # Scala (Play Framework)
+    ".scala",
 }
 
 
@@ -1428,6 +1432,743 @@ def _extract_laravel(content: str, file_path: str, lines: list[str]) -> list[dic
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# NEW FRAMEWORK REGEXES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Starlette ─────────────────────────────────────────────────────────────────
+
+_STARLETTE_ROUTE_RE = re.compile(
+    r"""Route\s*\(\s*["']([^"']+)["']\s*,\s*(?:endpoint\s*=\s*)?(\w[\w.]*)(?:[^)]*?methods\s*=\s*\[([^\]]*)\])?""",
+    re.MULTILINE,
+)
+_STARLETTE_WS_RE = re.compile(
+    r"""WebSocketRoute\s*\(\s*["']([^"']+)["']""",
+    re.MULTILINE,
+)
+_STARLETTE_MOUNT_RE = re.compile(
+    r"""Mount\s*\(\s*["']([^"']+)["']""",
+    re.MULTILINE,
+)
+
+# ── Litestar / Starlite ───────────────────────────────────────────────────────
+
+_LITESTAR_VERB_RE = re.compile(
+    r"""@(?:\w+\.)?(?P<http_method>get|post|put|patch|delete|head|options|route)\s*\(\s*(?:path\s*=\s*)?["'](?P<path>[^"']+)["']""",
+    re.MULTILINE | re.IGNORECASE,
+)
+_LITESTAR_DEF_RE = re.compile(
+    r"""(?:async\s+)?def\s+(\w+)""",
+)
+_LITESTAR_CONTROLLER_RE = re.compile(
+    r"""class\s+(\w+)\s*\(\s*Controller\s*\)""",
+    re.MULTILINE,
+)
+_LITESTAR_CTRL_PATH_RE = re.compile(
+    r"""path\s*=\s*["']([^"']+)["']""",
+    re.MULTILINE,
+)
+
+# ── aiohttp ───────────────────────────────────────────────────────────────────
+
+_AIOHTTP_ADD_VERB_RE = re.compile(
+    r"""\.add_(?P<method>get|post|put|patch|delete|head|options)\s*\(\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_AIOHTTP_ADD_ROUTE_RE = re.compile(
+    r"""\.add_route\s*\(\s*["'](?P<method>[A-Z]+)["']\s*,\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_AIOHTTP_DECORATOR_RE = re.compile(
+    r"""@\w+\.(?P<method>get|post|put|patch|delete|head|options)\s*\(\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_AIOHTTP_WEB_VERB_RE = re.compile(
+    r"""web\.(?P<method>get|post|put|patch|delete|head|options)\s*\(\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_AIOHTTP_WEB_ROUTE_RE = re.compile(
+    r"""web\.route\s*\(\s*["'](?P<method>[A-Z]+)["']\s*,\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+
+# ── Django Ninja ──────────────────────────────────────────────────────────────
+
+_NINJA_VERB_RE = re.compile(
+    r"""@\w+\.(?P<method>get|post|put|patch|delete)\s*\(\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_NINJA_API_OP_RE = re.compile(
+    r"""@\w+\.api_operation\s*\(\s*\[(?P<methods>[^\]]+)\]\s*,\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+
+# ── Sanic ─────────────────────────────────────────────────────────────────────
+
+_SANIC_VERB_RE = re.compile(
+    r"""@\w+\.(?P<method>get|post|put|patch|delete|head|options)\s*\(\s*["'](?P<path>[^"'<>]+)["']""",
+    re.MULTILINE,
+)
+_SANIC_ROUTE_RE = re.compile(
+    r"""@\w+\.route\s*\(\s*["'](?P<path>[^"']+)["'][^)]*?methods\s*=\s*\[(?P<methods>[^\]]+)\]""",
+    re.MULTILINE,
+)
+_SANIC_ADD_ROUTE_RE = re.compile(
+    r"""\w+\.add_route\s*\(\s*(\w+)\s*,\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_SANIC_PARAM_RE = re.compile(r"<(\w+)(?::\w+)?>")
+
+# ── Tornado ───────────────────────────────────────────────────────────────────
+
+_TORNADO_APP_RE = re.compile(
+    r"""Application\s*\(\s*\[""",
+    re.MULTILINE,
+)
+_TORNADO_TUPLE_RE = re.compile(
+    r"""\(\s*(r?["'][^"']+["'])\s*,\s*(\w+)\s*\)""",
+)
+_TORNADO_HANDLER_METHOD_RE = re.compile(
+    r"""def\s+(get|post|put|delete|patch|head)\s*\(self""",
+    re.MULTILINE,
+)
+_TORNADO_NAMED_GROUP_RE = re.compile(r"\(\?P<(\w+)>[^)]*\)")
+_TORNADO_ANON_GROUP_RE  = re.compile(r"\(\\d\+\)|\(\[.*?\]\+\)")
+
+# ── GraphQL SDL ───────────────────────────────────────────────────────────────
+
+_GQL_TYPE_BLOCK_RE = re.compile(
+    r"""type\s+(Query|Mutation|Subscription)\s*\{([^}]+)\}""",
+    re.MULTILINE | re.DOTALL,
+)
+_GQL_FIELD_RE = re.compile(
+    r"""^\s+(\w+)(?:\([^)]*\))?\s*:""",
+    re.MULTILINE,
+)
+
+# ── Apollo Server / GraphQL Yoga ──────────────────────────────────────────────
+
+_APOLLO_TYPEDEF_RE = re.compile(
+    r"""(?:const|let|var)\s+\w+\s*=\s*(?:gql\s*)?`([^`]+)`""",
+    re.MULTILINE | re.DOTALL,
+)
+_APOLLO_GQL_TAG_RE = re.compile(
+    r"""gql\s*`([^`]+)`""",
+    re.MULTILINE | re.DOTALL,
+)
+
+# ── Strawberry ────────────────────────────────────────────────────────────────
+
+_STRAWBERRY_OP_RE = re.compile(
+    r"""@strawberry\.(?P<op_type>mutation|subscription)\s*(?:\([^)]*\))?\s*\n\s+(?:async\s+)?def\s+(?P<name>\w+)""",
+    re.MULTILINE,
+)
+_STRAWBERRY_FIELD_RE = re.compile(
+    r"""@strawberry\.field\s*\n\s+(?:async\s+)?def\s+(?P<name>\w+)""",
+    re.MULTILINE,
+)
+_STRAWBERRY_TYPE_RE = re.compile(
+    r"""@strawberry\.type\s*\nclass\s+(Query|Mutation|Subscription)""",
+    re.MULTILINE,
+)
+
+# ── Graphene ──────────────────────────────────────────────────────────────────
+
+_GRAPHENE_CLASS_RE = re.compile(
+    r"""class\s+(Query|Mutation|Subscription)\s*\(\s*graphene\.ObjectType\s*\)""",
+    re.MULTILINE,
+)
+_GRAPHENE_FIELD_RE = re.compile(
+    r"""(\w+)\s*=\s*graphene\.(?:List|Field|String|Int|Float|Boolean|ID)\s*\(""",
+    re.MULTILINE,
+)
+_GRAPHENE_RESOLVER_RE = re.compile(
+    r"""def\s+resolve_(\w+)\s*\(self,\s*info""",
+    re.MULTILINE,
+)
+
+# ── Feathers.js ───────────────────────────────────────────────────────────────
+
+_FEATHERS_USE_RE = re.compile(
+    r"""app\.use\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*(?:new\s+)?(\w+)""",
+    re.MULTILINE,
+)
+_FEATHERS_SERVICE_METHOD_RE = re.compile(
+    r"""async\s+(?:find|get|create|update|patch|remove)\s*\(""",
+    re.MULTILINE,
+)
+
+# Feathers method -> (HTTP method, path suffix)
+_FEATHERS_METHOD_MAP = {
+    "find":   [("GET",    "")],
+    "get":    [("GET",    "/:id")],
+    "create": [("POST",   "")],
+    "update": [("PUT",    "/:id")],
+    "patch":  [("PATCH",  "/:id")],
+    "remove": [("DELETE", "/:id")],
+}
+
+# ── AdonisJS ──────────────────────────────────────────────────────────────────
+
+_ADONIS_ROUTE_RE = re.compile(
+    r"""(?:Route|router)\s*\.(?P<method>get|post|put|patch|delete)\s*\(\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_ADONIS_DECO_RE = re.compile(
+    r"""@route\.(?P<method>get|post|put|patch|delete)\s*\(\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+
+# ── Elysia ────────────────────────────────────────────────────────────────────
+
+_ELYSIA_VERB_RE = re.compile(
+    r"""\.(?P<method>get|post|put|patch|delete|options|head|all)\s*\(\s*['"`](?P<path>[^'"`]+)['"`]""",
+    re.MULTILINE,
+)
+
+# ── Symfony (PHP) ─────────────────────────────────────────────────────────────
+
+_SYMFONY_ATTR_RE = re.compile(
+    r"""#\[Route\s*\(\s*['"](?P<path>[^'"]+)['"]\s*(?:,\s*name:\s*\w+)?\s*(?:,\s*methods:\s*\[(?P<methods>[^\]]+)\])?\s*\)\]""",
+    re.MULTILINE,
+)
+_SYMFONY_ANN_RE = re.compile(
+    r"""@Route\s*\(\s*["'](?P<path>[^"']+)["'][^)]*?(?:methods\s*=\s*\{(?P<methods>[^}]+)\})?""",
+    re.MULTILINE,
+)
+_SYMFONY_YAML_RE = re.compile(
+    r"""path:\s*(?P<path>[^\n]+)\n\s+controller:.*?\n\s+methods:\s*\[?(?P<methods>[^\]}\n]+)""",
+    re.MULTILINE | re.DOTALL,
+)
+
+# ── Play Framework (Scala routes file) ────────────────────────────────────────
+
+_PLAY_ROUTE_RE = re.compile(
+    r"""^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(/[^\s]*)\s+([\w.]+(?:\([^)]*\))?)""",
+    re.MULTILINE,
+)
+
+# ── Buffalo (Go) ──────────────────────────────────────────────────────────────
+
+_BUFFALO_VERB_RE = re.compile(
+    r"""app\.(?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*["'](?P<path>[^"']+)["']""",
+    re.MULTILINE,
+)
+_BUFFALO_RESOURCE_RE = re.compile(
+    r"""app\.Resource\s*\(\s*["'](?P<path>[^"']+)["']\s*,\s*(?P<resource>\w+)""",
+    re.MULTILINE,
+)
+
+_BUFFALO_RESOURCE_VERBS = [
+    ("GET",    ""),
+    ("POST",   ""),
+    ("GET",    "/{id}"),
+    ("PUT",    "/{id}"),
+    ("DELETE", "/{id}"),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW FRAMEWORK EXTRACTORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_starlette(content: str, file_path: str) -> list[dict]:
+    """Extract Starlette Route/WebSocketRoute/Mount declarations."""
+    lines   = content.splitlines()
+    routes: list[dict] = []
+
+    for m in _STARLETTE_ROUTE_RE.finditer(content):
+        path    = m.group(1)
+        handler = m.group(2) or ""
+        methods_raw = m.group(3)
+        if methods_raw:
+            methods = [x.strip().strip("'\"") for x in methods_raw.split(",")]
+        else:
+            methods = ["GET"]
+        ln = content[: m.start()].count("\n")
+        for verb in methods:
+            v = verb.upper().strip()
+            if v:
+                routes.append(_make_route(file_path, lines, ln, ln, v, path, handler, "high"))
+
+    for m in _STARLETTE_WS_RE.finditer(content):
+        path = m.group(1)
+        ln   = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, "WS", path, confidence="high"))
+
+    for m in _STARLETTE_MOUNT_RE.finditer(content):
+        path = m.group(1)
+        ln   = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, "MOUNT", path, confidence="high"))
+
+    return routes
+
+
+def _extract_litestar(content: str, file_path: str) -> list[dict]:
+    """Extract Litestar (v2) / Starlite (v1) decorator-based routes."""
+    lines   = content.splitlines()
+    routes: list[dict] = []
+    _METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "head": "HEAD", "options": "OPTIONS", "route": "ANY",
+    }
+
+    for m in _LITESTAR_VERB_RE.finditer(content):
+        http_method = m.group("http_method").lower()
+        path        = m.group("path")
+        verb        = _METHOD_MAP.get(http_method, http_method.upper())
+        ln          = content[: m.start()].count("\n")
+        # Find the def line immediately after the decorator
+        handler = ""
+        for i in range(ln, min(ln + 5, len(lines))):
+            def_m = _LITESTAR_DEF_RE.match(lines[i].strip())
+            if def_m:
+                handler = def_m.group(1)
+                break
+        end = _find_block_end_py(lines, ln)
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, handler, "high"))
+
+    return routes
+
+
+def _extract_aiohttp(content: str, file_path: str) -> list[dict]:
+    """Extract aiohttp route registrations (5 forms)."""
+    lines   = content.splitlines()
+    routes: list[dict] = []
+
+    for pattern, method_group, path_group in [
+        (_AIOHTTP_ADD_VERB_RE,    "method", "path"),
+        (_AIOHTTP_DECORATOR_RE,   "method", "path"),
+        (_AIOHTTP_WEB_VERB_RE,    "method", "path"),
+    ]:
+        for m in pattern.finditer(content):
+            verb = m.group(method_group).upper()
+            path = m.group(path_group)
+            ln   = content[: m.start()].count("\n")
+            routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    for pattern in (_AIOHTTP_ADD_ROUTE_RE, _AIOHTTP_WEB_ROUTE_RE):
+        for m in pattern.finditer(content):
+            verb = m.group("method").upper()
+            path = m.group("path")
+            ln   = content[: m.start()].count("\n")
+            routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    return routes
+
+
+def _extract_django_ninja(content: str, file_path: str) -> list[dict]:
+    """Extract Django Ninja @api.get / @api.api_operation routes."""
+    lines   = content.splitlines()
+    routes: list[dict] = []
+    _METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT",
+        "patch": "PATCH", "delete": "DELETE",
+    }
+
+    for m in _NINJA_VERB_RE.finditer(content):
+        verb    = _METHOD_MAP.get(m.group("method").lower(), m.group("method").upper())
+        path    = m.group("path")
+        ln      = content[: m.start()].count("\n")
+        handler = ""
+        for i in range(ln, min(ln + 5, len(lines))):
+            def_m = re.match(r"\s*(?:async\s+)?def\s+(\w+)", lines[i])
+            if def_m:
+                handler = def_m.group(1)
+                break
+        end = _find_block_end_py(lines, ln)
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, handler, "high"))
+
+    for m in _NINJA_API_OP_RE.finditer(content):
+        methods_raw = m.group("methods")
+        path        = m.group("path")
+        ln          = content[: m.start()].count("\n")
+        methods     = [x.strip().strip("'\"") for x in methods_raw.split(",")]
+        for verb in methods:
+            v = verb.upper().strip()
+            if v:
+                routes.append(_make_route(file_path, lines, ln, ln, v, path, confidence="high"))
+
+    return routes
+
+
+def _extract_sanic(content: str, file_path: str) -> list[dict]:
+    """Extract Sanic route decorators and add_route calls.
+
+    Sanic uses <param> angle-bracket syntax; we normalize to {param} first,
+    then _normalize_path converts those to :param.
+    """
+    lines   = content.splitlines()
+    routes: list[dict] = []
+    _METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "head": "HEAD", "options": "OPTIONS",
+    }
+
+    def _sanic_norm(path: str) -> str:
+        return _SANIC_PARAM_RE.sub(r"{\1}", path)
+
+    for m in _SANIC_VERB_RE.finditer(content):
+        verb = _METHOD_MAP.get(m.group("method").lower(), m.group("method").upper())
+        path = _sanic_norm(m.group("path"))
+        ln   = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    for m in _SANIC_ROUTE_RE.finditer(content):
+        path        = _sanic_norm(m.group("path"))
+        methods_raw = m.group("methods")
+        ln          = content[: m.start()].count("\n")
+        for verb in [x.strip().strip("'\"") for x in methods_raw.split(",")]:
+            v = verb.upper().strip()
+            if v:
+                routes.append(_make_route(file_path, lines, ln, ln, v, path, confidence="high"))
+
+    for m in _SANIC_ADD_ROUTE_RE.finditer(content):
+        path    = _sanic_norm(m.group("path"))
+        handler = m.group(1)
+        ln      = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, handler, "high"))
+
+    return routes
+
+
+def _extract_tornado(content: str, file_path: str) -> list[dict]:
+    """Extract Tornado routes from Application([...]) tuple lists."""
+    lines   = content.splitlines()
+    routes: list[dict] = []
+
+    def _norm_tornado_path(raw: str) -> str:
+        """Convert Tornado regex path to readable form."""
+        # Strip surrounding quotes and leading r prefix
+        path = raw.strip()
+        if path.startswith(("r\"", "r'")):
+            path = path[2:-1]
+        elif path.startswith(('"', "'")):
+            path = path[1:-1]
+        # Named groups: (?P<name>...) -> {name}
+        path = _TORNADO_NAMED_GROUP_RE.sub(r"{\1}", path)
+        # Anonymous groups like (\d+) -> {id}
+        path = re.sub(r"\([^)]+\)", "{id}", path)
+        # Strip anchors
+        path = path.lstrip("^").rstrip("$")
+        return path or "/"
+
+    # Find each Application([...]) block
+    for app_m in _TORNADO_APP_RE.finditer(content):
+        ln_app = content[: app_m.start()].count("\n")
+        # Find the closing ] of the routes list
+        bracket_start = content.find("[", app_m.end() - 1)
+        if bracket_start == -1:
+            continue
+        depth = 0
+        bracket_end = bracket_start
+        for i, ch in enumerate(content[bracket_start:], bracket_start):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    bracket_end = i
+                    break
+        routes_block = content[bracket_start: bracket_end + 1]
+
+        for t in _TORNADO_TUPLE_RE.finditer(routes_block):
+            raw_path    = t.group(1)
+            handler_cls = t.group(2)
+            path        = _norm_tornado_path(raw_path)
+            ln          = content[: app_m.start() + (t.start())].count("\n")
+
+            # Look for method definitions in the handler class
+            cls_re  = re.compile(
+                rf"""class\s+{re.escape(handler_cls)}\s*\(.*?\):(.+?)(?=\nclass\s|\Z)""",
+                re.DOTALL,
+            )
+            cls_m = cls_re.search(content)
+            if cls_m:
+                methods = _TORNADO_HANDLER_METHOD_RE.findall(cls_m.group(1))
+                for verb in methods:
+                    routes.append(_make_route(file_path, lines, ln, ln, verb.upper(), path, handler_cls, "high"))
+            if not cls_m or not _TORNADO_HANDLER_METHOD_RE.search(content[cls_m.start(): cls_m.end()] if cls_m else ""):
+                # Emit at least an ANY route if we can't inspect the class
+                if not (cls_m and _TORNADO_HANDLER_METHOD_RE.search(cls_m.group(0))):
+                    routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, handler_cls, "medium"))
+
+    return routes
+
+
+def _extract_graphql_sdl(content: str, file_path: str) -> list[dict]:
+    """Extract Query/Mutation/Subscription fields from a GraphQL SDL schema."""
+    lines   = content.splitlines()
+    routes: list[dict] = []
+    _OP_MAP = {"Query": "QUERY", "Mutation": "MUTATION", "Subscription": "SUBSCRIPTION"}
+
+    for type_m in _GQL_TYPE_BLOCK_RE.finditer(content):
+        op_type  = type_m.group(1)
+        body     = type_m.group(2)
+        verb     = _OP_MAP.get(op_type, op_type.upper())
+        type_ln  = content[: type_m.start()].count("\n")
+
+        # Find fields in the block
+        for field_m in _GQL_FIELD_RE.finditer(body):
+            field_name = field_m.group(1)
+            path       = f"/graphql/{field_name}"
+            # Compute approximate line number relative to file
+            field_ln   = type_ln + body[: field_m.start()].count("\n") + 1
+            field_ln   = min(field_ln, len(lines) - 1)
+            routes.append(_make_route(file_path, lines, field_ln, field_ln, verb, path, field_name, "high"))
+
+    return routes
+
+
+def _extract_apollo_graphql(content: str, file_path: str) -> list[dict]:
+    """Extract GraphQL operations from Apollo Server / GraphQL Yoga typeDefs."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    # Collect all SDL bodies from gql`` or const typeDefs = `...`
+    sdl_bodies: list[tuple[str, int]] = []  # (body, start_line)
+    for m in _APOLLO_TYPEDEF_RE.finditer(content):
+        ln = content[: m.start()].count("\n")
+        sdl_bodies.append((m.group(1), ln))
+    for m in _APOLLO_GQL_TAG_RE.finditer(content):
+        ln = content[: m.start()].count("\n")
+        # Avoid duplicates already captured by TYPEDEF_RE
+        already = any(abs(ln - existing_ln) <= 2 for _, existing_ln in sdl_bodies)
+        if not already:
+            sdl_bodies.append((m.group(1), ln))
+
+    for sdl_body, base_ln in sdl_bodies:
+        # Reuse the SDL extractor logic
+        _OP_MAP = {"Query": "QUERY", "Mutation": "MUTATION", "Subscription": "SUBSCRIPTION"}
+        for type_m in _GQL_TYPE_BLOCK_RE.finditer(sdl_body):
+            op_type = type_m.group(1)
+            body    = type_m.group(2)
+            verb    = _OP_MAP.get(op_type, op_type.upper())
+            for field_m in _GQL_FIELD_RE.finditer(body):
+                field_name = field_m.group(1)
+                path       = f"/graphql/{field_name}"
+                field_ln   = base_ln + sdl_body[: type_m.start() + field_m.start()].count("\n")
+                field_ln   = min(field_ln, len(lines) - 1)
+                routes.append(_make_route(file_path, lines, field_ln, field_ln, verb, path, field_name, "high"))
+
+    return routes
+
+
+def _extract_strawberry(content: str, file_path: str) -> list[dict]:
+    """Extract Strawberry GraphQL mutation/subscription/field operations."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+    _OP_MAP = {"mutation": "MUTATION", "subscription": "SUBSCRIPTION"}
+
+    for m in _STRAWBERRY_OP_RE.finditer(content):
+        op_type    = m.group("op_type")
+        field_name = m.group("name")
+        verb       = _OP_MAP.get(op_type, op_type.upper())
+        path       = f"/graphql/{field_name}"
+        ln         = content[: m.start()].count("\n")
+        end        = _find_block_end_py(lines, ln)
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, field_name, "high"))
+
+    for m in _STRAWBERRY_FIELD_RE.finditer(content):
+        field_name = m.group("name")
+        path       = f"/graphql/{field_name}"
+        ln         = content[: m.start()].count("\n")
+        end        = _find_block_end_py(lines, ln)
+        routes.append(_make_route(file_path, lines, ln, end, "QUERY", path, field_name, "high"))
+
+    return routes
+
+
+def _extract_graphene(content: str, file_path: str) -> list[dict]:
+    """Extract Graphene Query/Mutation/Subscription fields and resolvers."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    # Find each class inheriting from graphene.ObjectType with a known op name
+    for class_m in _GRAPHENE_CLASS_RE.finditer(content):
+        op_type  = class_m.group(1)
+        verb     = op_type.upper()  # QUERY, MUTATION, SUBSCRIPTION
+        class_ln = content[: class_m.start()].count("\n")
+        class_end = _find_block_end_py(lines, class_ln)
+        class_body = "\n".join(lines[class_ln: class_end + 1])
+
+        # Fields: foo = graphene.Field(...)
+        for field_m in _GRAPHENE_FIELD_RE.finditer(class_body):
+            field_name = field_m.group(1)
+            path       = f"/graphql/{field_name}"
+            field_ln   = class_ln + class_body[: field_m.start()].count("\n")
+            field_ln   = min(field_ln, len(lines) - 1)
+            routes.append(_make_route(file_path, lines, field_ln, field_ln, verb, path, field_name, "high"))
+
+        # Resolvers: def resolve_foo(self, info)
+        for res_m in _GRAPHENE_RESOLVER_RE.finditer(class_body):
+            field_name = res_m.group(1)
+            path       = f"/graphql/{field_name}"
+            res_ln     = class_ln + class_body[: res_m.start()].count("\n")
+            res_ln     = min(res_ln, len(lines) - 1)
+            # Only add if not already present from field detection
+            already = any(r["route_path"] == path for r in routes)
+            if not already:
+                routes.append(_make_route(file_path, lines, res_ln, res_ln, verb, path, field_name, "medium"))
+
+    return routes
+
+
+def _extract_feathers(content: str, file_path: str) -> list[dict]:
+    """Extract Feathers.js service registrations and expand to HTTP routes."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    for m in _FEATHERS_USE_RE.finditer(content):
+        service_path = m.group(1)
+        service_cls  = m.group(2)
+        ln           = content[: m.start()].count("\n")
+
+        # Try to find which Feathers methods the service implements
+        # by looking for the class definition
+        cls_re = re.compile(
+            rf"""class\s+{re.escape(service_cls)}\b.*?(?=\nclass\s|\Z)""",
+            re.DOTALL,
+        )
+        cls_m = cls_re.search(content)
+        service_methods: list[str] = []
+        if cls_m:
+            service_methods = re.findall(
+                r"""async\s+(find|get|create|update|patch|remove)\s*\(""",
+                cls_m.group(0),
+            )
+
+        if not service_methods:
+            # Default: assume full CRUD
+            service_methods = list(_FEATHERS_METHOD_MAP.keys())
+
+        seen_paths: set[str] = set()
+        for svc_method in service_methods:
+            for http_verb, suffix in _FEATHERS_METHOD_MAP.get(svc_method, []):
+                full_path = service_path.rstrip("/") + suffix
+                key = f"{http_verb} {full_path}"
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    routes.append(_make_route(
+                        file_path, lines, ln, ln, http_verb, full_path, service_cls, "high",
+                    ))
+
+    return routes
+
+
+def _extract_adonisjs(content: str, file_path: str) -> list[dict]:
+    """Extract AdonisJS Route.get/post and router.get/post calls."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+    _METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT",
+        "patch": "PATCH", "delete": "DELETE",
+    }
+
+    for pattern in (_ADONIS_ROUTE_RE, _ADONIS_DECO_RE):
+        for m in pattern.finditer(content):
+            verb = _METHOD_MAP.get(m.group("method").lower(), m.group("method").upper())
+            path = m.group("path")
+            ln   = content[: m.start()].count("\n")
+            routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    return routes
+
+
+def _extract_elysia(content: str, file_path: str) -> list[dict]:
+    """Extract Elysia (Bun) HTTP method chains."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+    _METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "options": "OPTIONS", "head": "HEAD", "all": "ANY",
+    }
+
+    for m in _ELYSIA_VERB_RE.finditer(content):
+        verb = _METHOD_MAP.get(m.group("method").lower(), m.group("method").upper())
+        path = m.group("path")
+        ln   = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    return routes
+
+
+def _extract_symfony(content: str, file_path: str) -> list[dict]:
+    """Extract Symfony routes from PHP8 attributes, annotations, and YAML."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    def _parse_methods(raw: Optional[str]) -> list[str]:
+        if not raw:
+            return ["GET"]
+        return [m.strip().strip("'\"") for m in re.split(r"[,\s]+", raw.strip()) if m.strip().strip("'\"")] or ["GET"]
+
+    for m in _SYMFONY_ATTR_RE.finditer(content):
+        path    = m.group("path")
+        methods = _parse_methods(m.group("methods"))
+        ln      = content[: m.start()].count("\n")
+        for verb in methods:
+            routes.append(_make_route(file_path, lines, ln, ln, verb.upper(), path, confidence="high"))
+
+    for m in _SYMFONY_ANN_RE.finditer(content):
+        path    = m.group("path")
+        methods = _parse_methods(m.group("methods"))
+        ln      = content[: m.start()].count("\n")
+        for verb in methods:
+            routes.append(_make_route(file_path, lines, ln, ln, verb.upper(), path, confidence="high"))
+
+    for m in _SYMFONY_YAML_RE.finditer(content):
+        path    = m.group("path").strip()
+        methods = _parse_methods(m.group("methods"))
+        ln      = content[: m.start()].count("\n")
+        for verb in methods:
+            routes.append(_make_route(file_path, lines, ln, ln, verb.upper(), path, confidence="medium"))
+
+    return routes
+
+
+def _extract_play(content: str, file_path: str) -> list[dict]:
+    """Extract Play Framework (Scala) routes from a routes file.
+
+    The routes file format is: METHOD  /path  controller.action(args)
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    for m in _PLAY_ROUTE_RE.finditer(content):
+        verb    = m.group(1).upper()
+        path    = m.group(2)
+        handler = m.group(3).strip()
+        ln      = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, handler, "high"))
+
+    return routes
+
+
+def _extract_buffalo(content: str, file_path: str) -> list[dict]:
+    """Extract Buffalo (Go) route registrations and resource expansions."""
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    for m in _BUFFALO_VERB_RE.finditer(content):
+        verb = m.group("method").upper()
+        path = m.group("path")
+        ln   = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    for m in _BUFFALO_RESOURCE_RE.finditer(content):
+        base_path = m.group("path").rstrip("/")
+        resource  = m.group("resource")
+        ln        = content[: m.start()].count("\n")
+        for verb, suffix in _BUFFALO_RESOURCE_VERBS:
+            routes.append(_make_route(
+                file_path, lines, ln, ln, verb,
+                base_path + suffix, resource, "high",
+            ))
+
+    return routes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FILE-BASED ROUTE DETECTION (Next.js / Remix / SvelteKit / Nuxt)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1587,7 +2328,12 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
     plugin with NestJS-style decorators in a monorepo), so all applicable
     extractors are run and the results merged.
     """
-    if ext not in ROUTE_EXTS:
+    import os as _os
+    _is_play_routes_file = (
+        _os.path.basename(file_path) == "routes"
+        or file_path.endswith("/conf/routes")
+    )
+    if ext not in ROUTE_EXTS and not _is_play_routes_file:
         return []
 
     lines   = content.splitlines()
@@ -1618,6 +2364,18 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         # SvelteKit +server files
         if "+server." in file_path:
             routes.extend(_extract_sveltekit(content, file_path, lines))
+        # Apollo Server / GraphQL Yoga (typeDefs with gql`...`)
+        if "ApolloServer" in content or "createYoga" in content or "gql`" in content:
+            routes.extend(_extract_apollo_graphql(content, file_path))
+        # Feathers.js
+        if "require('@feathersjs" in content or "from '@feathersjs" in content:
+            routes.extend(_extract_feathers(content, file_path))
+        # AdonisJS
+        if "'@adonisjs" in content or 'from "@adonisjs' in content or "start/routes" in file_path:
+            routes.extend(_extract_adonisjs(content, file_path))
+        # Elysia (Bun)
+        if "from 'elysia'" in content or 'from "elysia"' in content or "new Elysia" in content:
+            routes.extend(_extract_elysia(content, file_path))
 
     # ── Python ───────────────────────────────────────────────────────────────
     elif ext == ".py":
@@ -1632,6 +2390,30 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         if ("urlpatterns" in content or "path(" in content
                 or "re_path(" in content or "url(" in content):
             routes.extend(_extract_django(content, file_path, lines))
+        # Starlette
+        if "from starlette" in content or "import starlette" in content:
+            routes.extend(_extract_starlette(content, file_path))
+        # Litestar (v2) / Starlite (v1)
+        if "from litestar" in content or "from starlite" in content:
+            routes.extend(_extract_litestar(content, file_path))
+        # aiohttp
+        if "from aiohttp" in content or "import aiohttp" in content or "web.Application" in content:
+            routes.extend(_extract_aiohttp(content, file_path))
+        # Django Ninja
+        if "NinjaAPI" in content or "from ninja import" in content:
+            routes.extend(_extract_django_ninja(content, file_path))
+        # Sanic
+        if "from sanic" in content or "Sanic(" in content:
+            routes.extend(_extract_sanic(content, file_path))
+        # Tornado
+        if "tornado.web" in content or "RequestHandler" in content:
+            routes.extend(_extract_tornado(content, file_path))
+        # Strawberry GraphQL
+        if "import strawberry" in content:
+            routes.extend(_extract_strawberry(content, file_path))
+        # Graphene
+        if "import graphene" in content or "from graphene import" in content:
+            routes.extend(_extract_graphene(content, file_path))
 
     # ── Go ────────────────────────────────────────────────────────────────────
     elif ext == ".go":
@@ -1656,6 +2438,9 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         # Beego
         if "beego.Router" in content or "beego.NewNamespace" in content:
             routes.extend(_extract_beego(content, file_path, lines))
+        # Buffalo
+        if "gobuffalo/buffalo" in content or "buffalo.New()" in content:
+            routes.extend(_extract_buffalo(content, file_path))
 
     # ── Rust ─────────────────────────────────────────────────────────────────
     elif ext == ".rs":
@@ -1677,6 +2462,8 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
     elif ext == ".php":
         if "Route::" in content:
             routes.extend(_extract_laravel(content, file_path, lines))
+        if "#[Route(" in content or "@Route(" in content or "Symfony" in content:
+            routes.extend(_extract_symfony(content, file_path))
 
     # ── Kotlin ────────────────────────────────────────────────────────────────
     elif ext == ".kt":
@@ -1702,4 +2489,261 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         if any(ind in content for ind in _SINATRA_INDICATORS):
             routes.extend(_extract_sinatra(content, file_path, lines))
 
+    # ── GraphQL SDL ───────────────────────────────────────────────────────────
+    elif ext in (".graphql", ".gql"):
+        routes.extend(_extract_graphql_sdl(content, file_path))
+
+    # ── Scala / Play Framework routes file ───────────────────────────────────
+    _is_play_routes = (
+        ext == ".scala"
+        or file_path.endswith("/conf/routes")
+        or file_path.endswith("/routes")
+        or os.path.basename(file_path) == "routes"
+    )
+    if _is_play_routes:
+        routes.extend(_extract_play(content, file_path))
+
     return _dedup_routes(routes)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TESTS FOR NEW EXTRACTORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _test_new_extractors() -> None:
+    # ── Starlette ────────────────────────────────────────────────────────────
+    code = '''
+from starlette.routing import Route, WebSocketRoute
+routes = [Route("/users", list_users, methods=["GET"]), Route("/users/{user_id:int}", get_user, methods=["GET", "PUT"])]
+'''
+    r = _extract_starlette(code, "app.py")
+    assert any("GET /users" == x["name"] for x in r), f"Starlette GET /users: {[x['name'] for x in r]}"
+    assert any("PUT" in x["name"] for x in r), f"Starlette PUT missing: {[x['name'] for x in r]}"
+    print("[PASS] Starlette")
+
+    # ── Litestar ─────────────────────────────────────────────────────────────
+    code2 = '''
+from litestar import get, post
+@get("/items")
+async def list_items() -> list: ...
+@post("/items")
+async def create_item() -> None: ...
+'''
+    r2 = _extract_litestar(code2, "app.py")
+    assert len(r2) == 2, f"Litestar: expected 2 got {len(r2)}: {r2}"
+    print("[PASS] Litestar")
+
+    # ── aiohttp ───────────────────────────────────────────────────────────────
+    code_aio = '''
+from aiohttp import web
+routes = web.RouteTableDef()
+@routes.get("/users")
+async def list_users(request): ...
+app = web.Application()
+app.add_routes([web.get("/health", health_handler)])
+'''
+    r_aio = _extract_aiohttp(code_aio, "app.py")
+    assert len(r_aio) >= 1, f"aiohttp: {r_aio}"
+    print("[PASS] aiohttp")
+
+    # ── Django Ninja ──────────────────────────────────────────────────────────
+    code_ninja = '''
+from ninja import NinjaAPI
+api = NinjaAPI()
+@api.get("/users")
+def list_users(request): ...
+@api.post("/users")
+def create_user(request): ...
+'''
+    r_ninja = _extract_django_ninja(code_ninja, "api.py")
+    assert len(r_ninja) == 2, f"Django Ninja: {r_ninja}"
+    print("[PASS] Django Ninja")
+
+    # ── Sanic ─────────────────────────────────────────────────────────────────
+    code_sanic = '''
+from sanic import Sanic
+app = Sanic("MyApp")
+@app.get("/users")
+async def list_users(request): ...
+@app.post("/users")
+async def create_user(request): ...
+'''
+    r_sanic = _extract_sanic(code_sanic, "app.py")
+    assert len(r_sanic) == 2, f"Sanic: {r_sanic}"
+    print("[PASS] Sanic")
+
+    # ── Tornado ───────────────────────────────────────────────────────────────
+    code3 = (
+        "import tornado.web\n"
+        "app = tornado.web.Application([\n"
+        '    (r"/users", UserListHandler),\n'
+        '    (r"/users/(\\d+)", UserHandler),\n'
+        "])\n"
+        "class UserListHandler(tornado.web.RequestHandler):\n"
+        "    def get(self): pass\n"
+        "    def post(self): pass\n"
+        "class UserHandler(tornado.web.RequestHandler):\n"
+        "    def get(self): pass\n"
+    )
+    r3 = _extract_tornado(code3, "app.py")
+    assert len(r3) >= 2, f"Tornado: {r3}"
+    print("[PASS] Tornado")
+
+    # ── GraphQL SDL ───────────────────────────────────────────────────────────
+    code4 = '''
+type Query {
+  users: [User]
+  user(id: ID!): User
+}
+type Mutation {
+  createUser(name: String!): User
+}
+'''
+    r4 = _extract_graphql_sdl(code4, "schema.graphql")
+    assert any("users" in x["name"] for x in r4), f"GraphQL SDL queries: {r4}"
+    assert any("createUser" in x["name"] for x in r4), f"GraphQL SDL mutations: {r4}"
+    print("[PASS] GraphQL SDL")
+
+    # ── Apollo Server / GraphQL Yoga ──────────────────────────────────────────
+    code_apollo = '''
+const { ApolloServer, gql } = require('apollo-server');
+const typeDefs = gql`
+  type Query {
+    books: [Book]
+    book(id: ID!): Book
+  }
+  type Mutation {
+    addBook(title: String): Book
+  }
+`;
+'''
+    r_apollo = _extract_apollo_graphql(code_apollo, "server.js")
+    assert any("books" in x["name"] for x in r_apollo), f"Apollo: {r_apollo}"
+    assert any("addBook" in x["name"] for x in r_apollo), f"Apollo mutation: {r_apollo}"
+    print("[PASS] Apollo GraphQL")
+
+    # ── Strawberry ────────────────────────────────────────────────────────────
+    code_strawb = '''
+import strawberry
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    def users(self) -> list[str]:
+        return []
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    async def create_user(self, name: str) -> str:
+        return name
+'''
+    r_strawb = _extract_strawberry(code_strawb, "schema.py")
+    assert any("create_user" in x["name"] for x in r_strawb), f"Strawberry mutation: {r_strawb}"
+    assert any("users" in x["name"] for x in r_strawb), f"Strawberry field: {r_strawb}"
+    print("[PASS] Strawberry")
+
+    # ── Graphene ──────────────────────────────────────────────────────────────
+    code_graphene = '''
+import graphene
+
+class Query(graphene.ObjectType):
+    users = graphene.List(lambda: UserType)
+    user = graphene.Field(UserType, id=graphene.Int())
+
+    def resolve_users(self, info):
+        return []
+
+class Mutation(graphene.ObjectType):
+    create_user = graphene.Field(UserType)
+'''
+    r_graphene = _extract_graphene(code_graphene, "schema.py")
+    assert any("users" in x["name"] for x in r_graphene), f"Graphene fields: {r_graphene}"
+    print("[PASS] Graphene")
+
+    # ── Feathers.js ───────────────────────────────────────────────────────────
+    code_feathers = '''
+const feathers = require('@feathersjs/feathers');
+const app = feathers();
+app.use('/messages', new MessageService());
+class MessageService {
+  async find(params) { return []; }
+  async create(data) { return data; }
+}
+'''
+    r_feathers = _extract_feathers(code_feathers, "app.js")
+    assert len(r_feathers) >= 1, f"Feathers: {r_feathers}"
+    print("[PASS] Feathers.js")
+
+    # ── AdonisJS ──────────────────────────────────────────────────────────────
+    code_adonis = '''
+import Route from '@ioc:Adonis/Core/Route'
+Route.get('/users', 'UsersController.index')
+Route.post('/users', 'UsersController.store')
+Route.delete('/users/:id', 'UsersController.destroy')
+'''
+    r_adonis = _extract_adonisjs(code_adonis, "start/routes.ts")
+    assert len(r_adonis) == 3, f"AdonisJS: expected 3 got {len(r_adonis)}: {r_adonis}"
+    print("[PASS] AdonisJS")
+
+    # ── Elysia ────────────────────────────────────────────────────────────────
+    code5 = '''
+import { Elysia } from 'elysia'
+const app = new Elysia()
+  .get('/users', () => users)
+  .post('/users', ({ body }) => create(body))
+  .get('/users/:id', ({ params: { id } }) => findOne(id))
+'''
+    r5 = _extract_elysia(code5, "src/index.ts")
+    assert len(r5) >= 3, f"Elysia: {r5}"
+    print("[PASS] Elysia")
+
+    # ── Symfony ───────────────────────────────────────────────────────────────
+    code_symfony = '''
+<?php
+namespace App\\Controller;
+use Symfony\\Component\\HttpFoundation\\Response;
+
+class UserController {
+    #[Route('/users', name: 'user_list', methods: ['GET'])]
+    public function index(): Response {}
+
+    #[Route('/users/{id}', methods: ['GET', 'PUT'])]
+    public function show(int $id): Response {}
+}
+'''
+    r_symfony = _extract_symfony(code_symfony, "src/Controller/UserController.php")
+    assert any("/users" in x["route_path"] for x in r_symfony), f"Symfony: {r_symfony}"
+    print("[PASS] Symfony")
+
+    # ── Play Framework ────────────────────────────────────────────────────────
+    code6 = '''GET     /users                  controllers.UserController.index()
+POST    /users                  controllers.UserController.create()
+GET     /users/:id              controllers.UserController.show(id: Long)
+'''
+    r6 = _extract_play(code6, "conf/routes")
+    assert len(r6) == 3, f"Play: expected 3 got {len(r6)}: {r6}"
+    print("[PASS] Play Framework")
+
+    # ── Buffalo ───────────────────────────────────────────────────────────────
+    code_buffalo = '''
+package main
+import "github.com/gobuffalo/buffalo"
+func main() {
+    app := buffalo.New(buffalo.Options{})
+    app.GET("/users", UsersHandler)
+    app.POST("/users", CreateUserHandler)
+    app.Resource("/articles", ArticlesResource{})
+}
+'''
+    r_buffalo = _extract_buffalo(code_buffalo, "actions/app.go")
+    assert len(r_buffalo) >= 2, f"Buffalo verbs: {r_buffalo}"
+    resource_routes = [x for x in r_buffalo if "articles" in x["route_path"]]
+    assert len(resource_routes) >= 3, f"Buffalo resource: {resource_routes}"
+    print("[PASS] Buffalo")
+
+    print("\n=== All new route extractor tests PASSED ===")
+
+
+if __name__ == "__main__":
+    _test_new_extractors()

@@ -1332,6 +1332,189 @@ def register_all_new_tools(
             "by_file": by_file,
         }
 
+    # ── IaC Extended tools ────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def graph_cdk_stacks() -> dict[str, Any]:
+        """List all AWS CDK stacks (v1 and v2) found in the project."""
+        try:
+            from graph_builder_iac_extended import get_cdk_stacks as _get_cdk_stacks  # type: ignore
+            return _get_cdk_stacks(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "graph_builder_iac_extended.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def graph_cfn_resources(resource_type: str = "") -> dict[str, Any]:
+        """List CloudFormation resources, optionally filtered by type (e.g. 'AWS::S3::Bucket')."""
+        try:
+            from graph_builder_iac_extended import get_cfn_resources as _get_cfn_resources  # type: ignore
+            result = _get_cfn_resources(str(get_project_root()))
+            if resource_type:
+                result["resources"] = [r for r in result.get("resources", [])
+                                        if resource_type.lower() in r.get("resource_type", "").lower()]
+                result["total"] = len(result["resources"])
+            return result
+        except ImportError:
+            return {"ok": False, "error": "graph_builder_iac_extended.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def graph_pulumi_resources() -> dict[str, Any]:
+        """List Pulumi resources declared in the project."""
+        try:
+            from graph_builder_iac_extended import get_pulumi_resources as _get_pulumi_resources  # type: ignore
+            return _get_pulumi_resources(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "graph_builder_iac_extended.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def graph_iac_extended_summary() -> dict[str, Any]:
+        """Full IaC summary: CDK stacks, CFN resources, Pulumi resources, Bicep modules."""
+        try:
+            from graph_builder_iac_extended import get_iac_extended_summary as _get_iac_summary  # type: ignore
+            return _get_iac_summary(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "graph_builder_iac_extended.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── CI Extended tools ─────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def graph_ci_extended_summary() -> dict[str, Any]:
+        """CI/CD summary: Travis, Drone, Bitbucket, ArgoCD, Tekton, Flux, TeamCity."""
+        try:
+            from graph_builder_ci_extended import get_ci_extended_summary as _get_ci_ext_summary  # type: ignore
+            return _get_ci_ext_summary(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "graph_builder_ci_extended.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── Lang Extended tools ───────────────────────────────────────────────────
+
+    @mcp.tool()
+    def graph_lang_extended_summary() -> dict[str, Any]:
+        """Language summary: Elixir/Phoenix, Swift/Vapor, Dart/Flutter, Groovy/Gradle."""
+        try:
+            from graph_builder_lang_extended import get_lang_extended_summary as _get_lang_summary  # type: ignore
+            return _get_lang_summary(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "graph_builder_lang_extended.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── Observability Extended tools ──────────────────────────────────────────
+
+    @mcp.tool()
+    def graph_apm_coverage() -> dict[str, Any]:
+        """APM/tracing coverage: New Relic, Dynatrace, Honeycomb, Jaeger, Zipkin."""
+        try:
+            from observability import get_apm_coverage as _get_apm_coverage  # type: ignore
+            return _get_apm_coverage(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "observability.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def graph_newrelic_coverage() -> dict[str, Any]:
+        """New Relic instrumentation coverage across the project."""
+        try:
+            from observability import get_newrelic_coverage as _get_nr_coverage  # type: ignore
+            return _get_nr_coverage(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "observability.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── Structural checks: env vars, ports, races ─────────────────────────────
+
+    @mcp.tool()
+    def graph_unused_env_vars() -> dict[str, Any]:
+        """Find environment variables declared in .env files but never used in source."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_unused_env_vars as _find_unused_env_vars  # type: ignore
+            findings = _find_unused_env_vars(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "total": len(findings), "findings": findings}
+
+    @mcp.tool()
+    def graph_missing_env_vars() -> dict[str, Any]:
+        """Find environment variables used in code but absent from all .env files."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_missing_env_vars as _find_missing_env_vars  # type: ignore
+            findings = _find_missing_env_vars(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "total": len(findings), "findings": findings}
+
+    @mcp.tool()
+    def graph_port_conflicts() -> dict[str, Any]:
+        """Detect the same port bound in two or more different files (excludes 80/443)."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_port_conflicts as _find_port_conflicts  # type: ignore
+            findings = _find_port_conflicts(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "total": len(findings), "findings": findings}
+
+    @mcp.tool()
+    def graph_race_conditions() -> dict[str, Any]:
+        """Heuristic race condition detection for Go, Python threads, and JS Promise.all."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_race_conditions as _find_race_conditions  # type: ignore
+            findings = _find_race_conditions(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_lang: dict[str, int] = {}
+        for f in findings:
+            lang = f.get("language", "unknown")
+            by_lang[lang] = by_lang.get(lang, 0) + 1
+        return {"ok": True, "total": len(findings), "by_language": by_lang, "findings": findings}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers (module-level, not tools)

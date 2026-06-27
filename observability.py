@@ -1553,6 +1553,695 @@ def find_datadog_configs(project_root: str) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 8G  NEW RELIC INSTRUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_newrelic_instrumentation(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract New Relic APM instrumentation from Python, Node.js, Go, and Java source files,
+    as well as New Relic config files (newrelic.ini, newrelic.yml).
+
+    Returns symbol dicts with symbol_type='utility' (imports/config) or 'hook' (trace calls).
+    """
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+    fname = os.path.basename(file_path)
+
+    def _add(lineno: int, name: str, sym_type: str, extra_kw: list[str] | None = None) -> None:
+        sym_id = f"{file_path}::nr_{name}_{lineno}"
+        if sym_id in seen:
+            return
+        seen.add(sym_id)
+        kw = list(dict.fromkeys(["newrelic"] + _name_keywords(name) + (extra_kw or [])))[:10]
+        symbols.append({
+            "id": sym_id,
+            "name": name,
+            "symbol_type": sym_type,
+            "line_start": lineno,
+            "line_end": lineno,
+            "body_hash": _body_hash(lines, lineno, lineno),
+            "confidence": "high",
+            "exported": False,
+            "keywords": kw,
+        })
+
+    # Config file detection
+    if fname.lower() in ("newrelic.ini", "newrelic.yml", "newrelic.yaml"):
+        _add(0, "newrelic:config", "utility")
+        return symbols
+
+    if ext == ".py":
+        _NR_PY_IMPORT = re.compile(r"import newrelic\.agent")
+        _NR_PY_FUNC_TRACE = re.compile(r"@newrelic\.agent\.function_trace\s*\(")
+        _NR_PY_BG_TASK = re.compile(r"@newrelic\.agent\.background_task\s*\(")
+        _NR_PY_CUSTOM_EVENT = re.compile(r"newrelic\.agent\.record_custom_event\s*\(")
+        _NR_PY_NOTICE_ERROR = re.compile(r"newrelic\.agent\.notice_error\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _NR_PY_IMPORT.search(line):
+                _add(lineno, "newrelic:agent", "utility")
+            if _NR_PY_FUNC_TRACE.search(line):
+                # Look ahead for the function name on the next def line
+                func_name = ""
+                for j in range(lineno + 1, min(lineno + 5, len(lines))):
+                    m = re.match(r"\s*def\s+(\w+)", lines[j])
+                    if m:
+                        func_name = m.group(1)
+                        break
+                _add(lineno, f"newrelic:function_trace:{func_name}" if func_name else "newrelic:function_trace", "hook")
+            if _NR_PY_BG_TASK.search(line):
+                _add(lineno, "newrelic:background_task", "hook")
+            if _NR_PY_CUSTOM_EVENT.search(line):
+                _add(lineno, "newrelic:record_custom_event", "hook")
+            if _NR_PY_NOTICE_ERROR.search(line):
+                _add(lineno, "newrelic:notice_error", "hook")
+
+    elif ext in (".js", ".jsx", ".ts", ".tsx"):
+        _NR_JS_REQUIRE = re.compile(r"require\s*\(\s*['\"]newrelic['\"]\s*\)")
+        _NR_JS_WEB_TXN = re.compile(r"newrelic\.startWebTransaction\s*\(")
+        _NR_JS_CUSTOM_EVENT = re.compile(r"newrelic\.recordCustomEvent\s*\(")
+        _NR_JS_NOTICE_ERROR = re.compile(r"newrelic\.noticeError\s*\(")
+        _NR_JS_CUSTOM_ATTR = re.compile(r"newrelic\.addCustomAttribute\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _NR_JS_REQUIRE.search(line):
+                _add(lineno, "newrelic:agent", "utility")
+            if _NR_JS_WEB_TXN.search(line):
+                _add(lineno, "newrelic:startWebTransaction", "hook")
+            if _NR_JS_CUSTOM_EVENT.search(line):
+                _add(lineno, "newrelic:recordCustomEvent", "hook")
+            if _NR_JS_NOTICE_ERROR.search(line):
+                _add(lineno, "newrelic:noticeError", "hook")
+            if _NR_JS_CUSTOM_ATTR.search(line):
+                _add(lineno, "newrelic:addCustomAttribute", "hook")
+
+    elif ext == ".go":
+        _NR_GO_IMPORT = re.compile(r'"github\.com/newrelic/go-agent')
+        _NR_GO_NEW_APP = re.compile(r"newrelic\.NewApplication\s*\(")
+        _NR_GO_START_TXN = re.compile(r"app\.StartTransaction\s*\(")
+        _NR_GO_NOTICE_ERR = re.compile(r"txn\.NoticeError\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _NR_GO_IMPORT.search(line):
+                _add(lineno, "newrelic:agent", "utility")
+            if _NR_GO_NEW_APP.search(line):
+                _add(lineno, "newrelic:NewApplication", "utility")
+            if _NR_GO_START_TXN.search(line):
+                _add(lineno, "newrelic:StartTransaction", "hook")
+            if _NR_GO_NOTICE_ERR.search(line):
+                _add(lineno, "newrelic:NoticeError", "hook")
+
+    elif ext in (".java", ".kt"):
+        _NR_JAVA_IMPORT = re.compile(r"import com\.newrelic\.api\.agent\.")
+        _NR_JAVA_TRACE_DISPATCHER = re.compile(r"@Trace\s*\(\s*dispatcher\s*=\s*true")
+        _NR_JAVA_TRACE = re.compile(r"@Trace\b")
+        _NR_JAVA_NOTICE_ERR = re.compile(r"NewRelic\.noticeError\s*\(")
+        _NR_JAVA_CUSTOM_PARAM = re.compile(r"NewRelic\.addCustomParameter\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _NR_JAVA_IMPORT.search(line):
+                _add(lineno, "newrelic:agent", "utility")
+            if _NR_JAVA_TRACE_DISPATCHER.search(line):
+                _add(lineno, "newrelic:Trace:dispatcher", "hook")
+            elif _NR_JAVA_TRACE.search(line):
+                _add(lineno, "newrelic:Trace", "hook")
+            if _NR_JAVA_NOTICE_ERR.search(line):
+                _add(lineno, "newrelic:noticeError", "hook")
+            if _NR_JAVA_CUSTOM_PARAM.search(line):
+                _add(lineno, "newrelic:addCustomParameter", "hook")
+
+    return symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8H  DYNATRACE INSTRUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_dynatrace_instrumentation(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract Dynatrace OneAgent SDK instrumentation from Python, Node.js, and Java source files,
+    and detect Dynatrace config files (dtconfig.properties, ruxitagentproc.conf).
+
+    Returns symbol dicts with symbol_type='utility' (imports/config) or 'hook' (trace calls).
+    Note: Java @Trace annotation is attributed to Dynatrace only when com.dynatrace imports are present.
+    """
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+    fname = os.path.basename(file_path)
+
+    def _add(lineno: int, name: str, sym_type: str) -> None:
+        sym_id = f"{file_path}::dt_{name}_{lineno}"
+        if sym_id in seen:
+            return
+        seen.add(sym_id)
+        symbols.append({
+            "id": sym_id,
+            "name": name,
+            "symbol_type": sym_type,
+            "line_start": lineno,
+            "line_end": lineno,
+            "body_hash": _body_hash(lines, lineno, lineno),
+            "confidence": "high",
+            "exported": False,
+            "keywords": list(dict.fromkeys(["dynatrace"] + _name_keywords(name)))[:10],
+        })
+
+    # Config file detection
+    if fname.lower() in ("dtconfig.properties", "ruxitagentproc.conf"):
+        _add(0, "dynatrace:config", "utility")
+        return symbols
+
+    if ext == ".py":
+        _DT_PY_IMPORT = re.compile(r"import oneagent|from oneagent import")
+        _DT_PY_GET_SDK = re.compile(r"oneagent\.get_sdk\s*\(")
+        _DT_PY_INCOMING = re.compile(r"with\s+sdk\.trace_incoming_remote_call\s*\(")
+        _DT_PY_OUTGOING = re.compile(r"with\s+sdk\.trace_outgoing_remote_call\s*\(")
+        _DT_PY_DB_INFO = re.compile(r"sdk\.create_database_info\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _DT_PY_IMPORT.search(line):
+                _add(lineno, "dynatrace:oneagent", "utility")
+            if _DT_PY_GET_SDK.search(line):
+                _add(lineno, "dynatrace:get_sdk", "utility")
+            if _DT_PY_INCOMING.search(line):
+                _add(lineno, "dynatrace:trace_incoming_remote_call", "hook")
+            if _DT_PY_OUTGOING.search(line):
+                _add(lineno, "dynatrace:trace_outgoing_remote_call", "hook")
+            if _DT_PY_DB_INFO.search(line):
+                _add(lineno, "dynatrace:create_database_info", "hook")
+
+    elif ext in (".js", ".jsx", ".ts", ".tsx"):
+        _DT_JS_REQUIRE = re.compile(r"require\s*\(\s*['\"]@dynatrace/oneagent-sdk['\"]\s*\)")
+        _DT_JS_CREATE = re.compile(r"Sdk\.createInstance\s*\(")
+        _DT_JS_INCOMING = re.compile(r"api\.createIncomingRemoteCallTracer\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _DT_JS_REQUIRE.search(line):
+                _add(lineno, "dynatrace:oneagent-sdk", "utility")
+            if _DT_JS_CREATE.search(line):
+                _add(lineno, "dynatrace:createInstance", "utility")
+            if _DT_JS_INCOMING.search(line):
+                _add(lineno, "dynatrace:createIncomingRemoteCallTracer", "hook")
+
+    elif ext in (".java", ".kt"):
+        # Disambiguate from NR: only emit Dynatrace symbols when com.dynatrace is present
+        has_dt_import = bool(re.search(r"import com\.dynatrace\.oneagent\.sdk\.", content))
+        if not has_dt_import:
+            return symbols
+
+        _DT_JAVA_IMPORT = re.compile(r"import com\.dynatrace\.oneagent\.sdk\.")
+        _DT_JAVA_TRACE_SAME = re.compile(r"@TraceSameTransaction\b")
+        _DT_JAVA_ADD_ATTR = re.compile(r"@AddRequestAttribute\b")
+
+        for lineno, line in enumerate(lines):
+            if _DT_JAVA_IMPORT.search(line):
+                _add(lineno, "dynatrace:oneagent-sdk", "utility")
+            if _DT_JAVA_TRACE_SAME.search(line):
+                _add(lineno, "dynatrace:TraceSameTransaction", "hook")
+            if _DT_JAVA_ADD_ATTR.search(line):
+                _add(lineno, "dynatrace:AddRequestAttribute", "hook")
+
+    return symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8I  HONEYCOMB INSTRUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_honeycomb_instrumentation(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract Honeycomb Beeline and OTel instrumentation from Python, Node.js, and Go source files.
+
+    Returns symbol dicts with symbol_type='utility' (setup calls) or 'hook' (trace decorators).
+    """
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(lineno: int, name: str, sym_type: str) -> None:
+        sym_id = f"{file_path}::hc_{name}_{lineno}"
+        if sym_id in seen:
+            return
+        seen.add(sym_id)
+        symbols.append({
+            "id": sym_id,
+            "name": name,
+            "symbol_type": sym_type,
+            "line_start": lineno,
+            "line_end": lineno,
+            "body_hash": _body_hash(lines, lineno, lineno),
+            "confidence": "high",
+            "exported": False,
+            "keywords": list(dict.fromkeys(["honeycomb"] + _name_keywords(name)))[:10],
+        })
+
+    if ext == ".py":
+        _HC_PY_IMPORT_BEELINE = re.compile(r"import beeline")
+        _HC_PY_BEELINE_INIT = re.compile(r"beeline\.init\s*\(\s*writekey\s*=")
+        _HC_PY_BEELINE_TRACED = re.compile(r"@beeline\.traced\b")
+        _HC_PY_OTEL_IMPORT = re.compile(r"from honeycomb\.opentelemetry import")
+        _HC_PY_CONFIGURE_OTEL = re.compile(r"configure_opentelemetry\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _HC_PY_IMPORT_BEELINE.search(line):
+                _add(lineno, "honeycomb:beeline", "utility")
+            if _HC_PY_BEELINE_INIT.search(line):
+                _add(lineno, "honeycomb:beeline.init", "utility")
+            if _HC_PY_BEELINE_TRACED.search(line):
+                _add(lineno, "honeycomb:beeline.traced", "hook")
+            if _HC_PY_OTEL_IMPORT.search(line):
+                _add(lineno, "honeycomb:opentelemetry", "utility")
+            if _HC_PY_CONFIGURE_OTEL.search(line):
+                _add(lineno, "honeycomb:configure_opentelemetry", "utility")
+
+    elif ext in (".js", ".jsx", ".ts", ".tsx"):
+        _HC_JS_BEELINE = re.compile(r"require\s*\(\s*['\"]honeycomb-beeline['\"]\s*\)")
+        _HC_JS_LIBHONEY = re.compile(r"require\s*\(\s*['\"]libhoney['\"]\s*\)")
+        _HC_JS_CONFIGURE = re.compile(r"beeline\.configure\s*\(\s*\{")
+        _HC_JS_OTEL = re.compile(r"['\"]@honeycombio/opentelemetry-node['\"]")
+        _HC_JS_WEB_SDK = re.compile(r"HoneycombWebSDK\b")
+
+        for lineno, line in enumerate(lines):
+            if _HC_JS_BEELINE.search(line):
+                _add(lineno, "honeycomb:beeline", "utility")
+            if _HC_JS_LIBHONEY.search(line):
+                _add(lineno, "honeycomb:libhoney", "utility")
+            if _HC_JS_CONFIGURE.search(line):
+                _add(lineno, "honeycomb:beeline.configure", "utility")
+            if _HC_JS_OTEL.search(line):
+                _add(lineno, "honeycomb:opentelemetry-node", "utility")
+            if _HC_JS_WEB_SDK.search(line):
+                _add(lineno, "honeycomb:HoneycombWebSDK", "utility")
+
+    elif ext == ".go":
+        _HC_GO_IMPORT = re.compile(r'"github\.com/honeycombio/beeline-go"')
+        _HC_GO_INIT = re.compile(r"beeline\.Init\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _HC_GO_IMPORT.search(line):
+                _add(lineno, "honeycomb:beeline-go", "utility")
+            if _HC_GO_INIT.search(line):
+                _add(lineno, "honeycomb:beeline.Init", "utility")
+
+    return symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8J  ALERTMANAGER CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_alertmanager_config(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract AlertManager configuration symbols from alertmanager.yml/yaml files.
+
+    Detects receivers (as hooks), inhibit_rules (as utility), and route receiver references.
+    Only runs on files named alertmanager.yml/.yaml or living under an alertmanager/ directory.
+    """
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(lineno: int, name: str, sym_type: str, kw: list[str]) -> None:
+        sym_id = f"{file_path}::am_{name}_{lineno}"
+        if sym_id in seen:
+            return
+        seen.add(sym_id)
+        symbols.append({
+            "id": sym_id,
+            "name": name,
+            "symbol_type": sym_type,
+            "line_start": lineno,
+            "line_end": lineno,
+            "body_hash": _body_hash(lines, lineno, lineno),
+            "confidence": "high",
+            "exported": True,
+            "keywords": list(dict.fromkeys(["alertmanager"] + kw))[:10],
+        })
+
+    # Top-level receivers: block → emit a config utility symbol
+    if re.search(r"^receivers\s*:", content, re.MULTILINE):
+        _add(0, "alertmanager:config", "utility", ["receivers", "config"])
+
+    # inhibit_rules: block
+    if re.search(r"^inhibit_rules\s*:", content, re.MULTILINE):
+        inhibit_line = next(
+            (i for i, ln in enumerate(lines) if re.match(r"^inhibit_rules\s*:", ln)), 0
+        )
+        _add(inhibit_line, "alertmanager:inhibit", "utility", ["inhibit", "rules"])
+
+    # Per-receiver symbols
+    in_receivers = False
+    for lineno, line in enumerate(lines):
+        stripped = line.strip()
+        if re.match(r"^receivers\s*:", line):
+            in_receivers = True
+            continue
+        # End of receivers block (top-level key)
+        if in_receivers and re.match(r"^[A-Za-z]", line) and not stripped.startswith("-"):
+            in_receivers = False
+
+        if in_receivers:
+            m = re.match(r"^\s*-\s*name\s*:\s*[\"']?([^\"'\n]+)[\"']?", line)
+            if m:
+                rname = m.group(1).strip()
+                kw = ["receiver", rname]
+                # Peek ahead for notification type keywords
+                for j in range(lineno + 1, min(lineno + 20, len(lines))):
+                    nxt = lines[j].strip()
+                    if nxt.startswith("- name:"):
+                        break
+                    if "slack_configs:" in nxt:
+                        kw.append("slack")
+                    if "pagerduty_configs:" in nxt:
+                        kw.append("pagerduty")
+                    if "webhook_configs:" in nxt:
+                        kw.append("webhook")
+                _add(lineno, f"receiver:{rname}", "hook", kw)
+
+    return symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8K  LOKI CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_loki_config(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract Loki server config, Promtail config, and Loki datasource references from
+    Grafana dashboard JSON files.
+
+    Loki server: loki.yml/yaml, loki-config.yml, or path contains /loki/
+    Promtail: promtail.yml/yaml
+    Grafana JSON: "type": "loki" datasource references and LogQL expressions.
+    """
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+    fname = os.path.basename(file_path).lower()
+
+    def _add(lineno: int, name: str, sym_type: str, kw: list[str]) -> None:
+        sym_id = f"{file_path}::loki_{name}_{lineno}"
+        if sym_id in seen:
+            return
+        seen.add(sym_id)
+        symbols.append({
+            "id": sym_id,
+            "name": name,
+            "symbol_type": sym_type,
+            "line_start": lineno,
+            "line_end": lineno,
+            "body_hash": _body_hash(lines, lineno, lineno),
+            "confidence": "high",
+            "exported": True,
+            "keywords": list(dict.fromkeys(["loki"] + kw))[:10],
+        })
+
+    # Loki server config
+    is_loki_server = (
+        re.match(r"loki[-.]?(config)?\.ya?ml$", fname)
+        or "/loki/" in file_path.replace("\\", "/")
+    )
+    # Promtail config
+    is_promtail = bool(re.match(r"promtail\.ya?ml$", fname))
+
+    if is_loki_server and ext in (".yaml", ".yml"):
+        # http_listen_port
+        for lineno, line in enumerate(lines):
+            m = re.match(r"\s*http_listen_port\s*:\s*(\d+)", line)
+            if m:
+                _add(lineno, "loki:server", "utility", ["server", "port", m.group(1)])
+                break
+        # ingester:
+        for lineno, line in enumerate(lines):
+            if re.match(r"^ingester\s*:", line):
+                _add(lineno, "loki:ingester", "utility", ["ingester"])
+                break
+
+    elif is_promtail and ext in (".yaml", ".yml"):
+        # clients: url: ...loki
+        in_clients = False
+        for lineno, line in enumerate(lines):
+            if re.match(r"^clients\s*:", line):
+                in_clients = True
+                continue
+            if in_clients and re.match(r"^[A-Za-z]", line) and not line.strip().startswith("-"):
+                in_clients = False
+            if in_clients and re.search(r"url\s*:.*loki", line, re.IGNORECASE):
+                _add(lineno, "promtail:client", "utility", ["promtail", "client"])
+                in_clients = False
+
+    elif ext == ".json":
+        # Grafana dashboard: Loki datasource references
+        for lineno, line in enumerate(lines):
+            if re.search(r'"type"\s*:\s*"loki"', line):
+                _add(lineno, "loki:datasource", "utility", ["datasource", "grafana"])
+            # LogQL: look for label selector syntax in expression values
+            if re.search(r'\{[^}]*\w+="[^"]*"[^}]*\}', line):
+                _add(lineno, "loki:logql", "hook", ["logql", "query"])
+
+    return symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8L  JAEGER INSTRUMENTATION (direct, non-OTel)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_jaeger_instrumentation(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract direct (non-OTel) Jaeger client instrumentation from Python, Go, and Node.js files.
+
+    Returns symbol dicts with symbol_type='utility' (setup) for tracer initialisation.
+    """
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(lineno: int, name: str, sym_type: str, extra_kw: list[str] | None = None) -> None:
+        sym_id = f"{file_path}::jaeger_{name}_{lineno}"
+        if sym_id in seen:
+            return
+        seen.add(sym_id)
+        symbols.append({
+            "id": sym_id,
+            "name": name,
+            "symbol_type": sym_type,
+            "line_start": lineno,
+            "line_end": lineno,
+            "body_hash": _body_hash(lines, lineno, lineno),
+            "confidence": "high",
+            "exported": False,
+            "keywords": list(dict.fromkeys(["jaeger"] + _name_keywords(name) + (extra_kw or [])))[:10],
+        })
+
+    if ext == ".py":
+        _J_PY_IMPORT = re.compile(r"from jaeger_client import Config")
+        _J_PY_CONFIG = re.compile(r"Config\s*\(\s*config\s*=\s*\{")
+        _J_PY_SERVICE = re.compile(r"service_name\s*=\s*['\"]([^'\"]+)['\"]")
+        _J_PY_INIT = re.compile(r"config\.initialize_tracer\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _J_PY_IMPORT.search(line):
+                _add(lineno, "jaeger:Config", "utility")
+            if _J_PY_CONFIG.search(line):
+                # Try to extract service_name on the same or nearby lines
+                svc = ""
+                for j in range(lineno, min(lineno + 10, len(lines))):
+                    m_svc = _J_PY_SERVICE.search(lines[j])
+                    if m_svc:
+                        svc = m_svc.group(1)
+                        break
+                _add(lineno, f"jaeger:{svc}" if svc else "jaeger:Config", "utility", [svc] if svc else [])
+            if _J_PY_INIT.search(line):
+                _add(lineno, "jaeger:initialize_tracer", "utility")
+
+    elif ext == ".go":
+        _J_GO_IMPORT = re.compile(r'"github\.com/uber/jaeger-client-go')
+        _J_GO_CONFIG = re.compile(r"jaegercfg\.Configuration\s*\{")
+        _J_GO_NEW_TRACER = re.compile(r"cfg\.NewTracer\s*\(")
+        _J_GO_SERVICE = re.compile(r'ServiceName\s*:\s*["\']([^"\']+)["\']')
+
+        for lineno, line in enumerate(lines):
+            if _J_GO_IMPORT.search(line):
+                _add(lineno, "jaeger:go-agent", "utility")
+            if _J_GO_CONFIG.search(line):
+                svc = ""
+                for j in range(lineno, min(lineno + 10, len(lines))):
+                    m_svc = _J_GO_SERVICE.search(lines[j])
+                    if m_svc:
+                        svc = m_svc.group(1)
+                        break
+                _add(lineno, f"jaeger:{svc}" if svc else "jaeger:Configuration", "utility", [svc] if svc else [])
+            if _J_GO_NEW_TRACER.search(line):
+                _add(lineno, "jaeger:NewTracer", "utility")
+
+    elif ext in (".js", ".jsx", ".ts", ".tsx"):
+        _J_JS_REQUIRE = re.compile(r"require\s*\(\s*['\"]jaeger-client['\"]\s*\)")
+        _J_JS_INIT = re.compile(r"initTracer\s*\(")
+
+        for lineno, line in enumerate(lines):
+            if _J_JS_REQUIRE.search(line):
+                _add(lineno, "jaeger:client", "utility")
+            if _J_JS_INIT.search(line):
+                _add(lineno, "jaeger:initTracer", "utility")
+
+    return symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8M  ZIPKIN INSTRUMENTATION (direct, non-OTel)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_zipkin_instrumentation(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract direct (non-OTel) Zipkin client instrumentation from Python and Node.js files.
+
+    Returns symbol dicts with symbol_type='utility' (setup) or 'hook' (span decorators).
+    """
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(lineno: int, name: str, sym_type: str, extra_kw: list[str] | None = None) -> None:
+        sym_id = f"{file_path}::zipkin_{name}_{lineno}"
+        if sym_id in seen:
+            return
+        seen.add(sym_id)
+        symbols.append({
+            "id": sym_id,
+            "name": name,
+            "symbol_type": sym_type,
+            "line_start": lineno,
+            "line_end": lineno,
+            "body_hash": _body_hash(lines, lineno, lineno),
+            "confidence": "high",
+            "exported": False,
+            "keywords": list(dict.fromkeys(["zipkin"] + _name_keywords(name) + (extra_kw or [])))[:10],
+        })
+
+    if ext == ".py":
+        _Z_PY_IMPORT = re.compile(r"from py_zipkin\.zipkin import zipkin_span")
+        _Z_PY_DECORATOR = re.compile(r"@zipkin_span\s*\(\s*service_name\s*=\s*[\"']([^\"']+)[\"']")
+
+        for lineno, line in enumerate(lines):
+            if _Z_PY_IMPORT.search(line):
+                _add(lineno, "zipkin:py_zipkin", "utility")
+            m_dec = _Z_PY_DECORATOR.search(line)
+            if m_dec:
+                svc = m_dec.group(1)
+                _add(lineno, f"zipkin:span:{svc}", "hook", [svc])
+
+    elif ext in (".js", ".jsx", ".ts", ".tsx"):
+        _Z_JS_REQUIRE = re.compile(r"require\s*\(\s*['\"]zipkin['\"]\s*\)")
+        _Z_JS_TRACER = re.compile(r"new\s+Tracer\s*\(\s*\{")
+        _Z_JS_BATCH = re.compile(r"BatchRecorder\b")
+        _Z_JS_TRANSPORT = re.compile(r"require\s*\(\s*['\"]zipkin-transport-http['\"]\s*\)")
+
+        has_tracer = False
+        has_batch = False
+        for lineno, line in enumerate(lines):
+            if _Z_JS_REQUIRE.search(line):
+                _add(lineno, "zipkin:client", "utility")
+            if _Z_JS_TRACER.search(line):
+                has_tracer = True
+            if _Z_JS_BATCH.search(line):
+                has_batch = True
+            if has_tracer and has_batch:
+                _add(lineno, "zipkin:Tracer", "utility")
+                has_tracer = False
+                has_batch = False
+            if _Z_JS_TRANSPORT.search(line):
+                _add(lineno, "zipkin:transport-http", "utility")
+
+    return symbols
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MCP HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_newrelic_coverage(project_root: str) -> dict:
+    """Return New Relic instrumentation summary for project."""
+    hooks: list[dict] = []
+    utilities: list[dict] = []
+
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in {"node_modules", ".git", "__pycache__", ".venv", "venv",
+                         "dist", "build", "target", ".tox"}
+        ]
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            _, ext = os.path.splitext(fname.lower())
+            ok, content, _ = _safe_read(fpath)
+            if not ok:
+                continue
+            syms = extract_newrelic_instrumentation(content, fpath, ext)
+            for s in syms:
+                if s["symbol_type"] == "hook":
+                    hooks.append(s)
+                else:
+                    utilities.append(s)
+
+    return {
+        "ok": True,
+        "hook_count": len(hooks),
+        "utility_count": len(utilities),
+        "hooks": hooks,
+        "utilities": utilities,
+    }
+
+
+def get_apm_coverage(project_root: str) -> dict:
+    """
+    Return combined APM coverage: which tools are instrumented.
+
+    Covers: New Relic, Dynatrace, Honeycomb, Jaeger, Zipkin, Datadog, Sentry.
+    """
+    counts: dict[str, int] = {
+        "newrelic": 0, "dynatrace": 0, "honeycomb": 0,
+        "jaeger": 0, "zipkin": 0, "datadog": 0, "sentry": 0,
+    }
+    extractors = {
+        "newrelic": extract_newrelic_instrumentation,
+        "dynatrace": extract_dynatrace_instrumentation,
+        "honeycomb": extract_honeycomb_instrumentation,
+        "jaeger": extract_jaeger_instrumentation,
+        "zipkin": extract_zipkin_instrumentation,
+        "datadog": extract_datadog_instrumentation,
+        "sentry": extract_sentry_instrumentation,
+    }
+
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in {"node_modules", ".git", "__pycache__", ".venv", "venv",
+                         "dist", "build", "target", ".tox"}
+        ]
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            _, ext = os.path.splitext(fname.lower())
+            if ext not in OBSERVABILITY_SOURCE_EXTS:
+                continue
+            ok, content, _ = _safe_read(fpath)
+            if not ok:
+                continue
+            for tool, fn in extractors.items():
+                syms = fn(content, fpath, ext)
+                counts[tool] += len(syms)
+
+    active_tools = [t for t, c in counts.items() if c > 0]
+    return {
+        "ok": True,
+        "tools_detected": active_tools,
+        "symbol_counts": counts,
+        "has_apm": len(active_tools) > 0,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN DISPATCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1588,6 +2277,37 @@ def extract_observability_symbols(content: str, file_path: str) -> list[dict]:
         symbols.extend(extract_log_patterns(content, file_path, ext))
         symbols.extend(extract_sentry_instrumentation(content, file_path, ext))
         symbols.extend(extract_datadog_instrumentation(content, file_path, ext))
+
+        # New Relic
+        if any(s in content for s in ['newrelic.agent', "require('newrelic')", 'newrelic.NewApplication', 'com.newrelic']):
+            symbols.extend(extract_newrelic_instrumentation(content, file_path, ext))
+
+        # Dynatrace
+        if any(s in content for s in ['oneagent', 'dynatrace/oneagent-sdk', 'com.dynatrace']):
+            symbols.extend(extract_dynatrace_instrumentation(content, file_path, ext))
+
+        # Honeycomb
+        if any(s in content for s in ['beeline', 'honeycomb', 'HONEYCOMB_API_KEY', 'libhoney']):
+            symbols.extend(extract_honeycomb_instrumentation(content, file_path, ext))
+
+        # Jaeger
+        if any(s in content for s in ['jaeger_client', 'jaeger-client-go', "require('jaeger-client')"]):
+            symbols.extend(extract_jaeger_instrumentation(content, file_path, ext))
+
+        # Zipkin
+        if any(s in content for s in ['py_zipkin', "require('zipkin')", 'zipkin-transport']):
+            symbols.extend(extract_zipkin_instrumentation(content, file_path, ext))
+
+    # AlertManager (config files)
+    fname = os.path.basename(file_path)
+    if 'alertmanager' in fname.lower() or 'alertmanager' in file_path.lower():
+        symbols.extend(extract_alertmanager_config(content, file_path, ext))
+
+    # Loki (config + promtail)
+    if any(s in fname.lower() for s in ['loki', 'promtail']) or '/loki/' in file_path.replace('\\', '/'):
+        symbols.extend(extract_loki_config(content, file_path, ext))
+    if ext == '.json' and '"type": "loki"' in content:
+        symbols.extend(extract_loki_config(content, file_path, ext))
 
     return symbols
 
@@ -1682,6 +2402,13 @@ def get_observability_summary(project_root: str) -> dict:
     sentry_total_files = 0
     datadog_init_files = 0
     datadog_total_files = 0
+    newrelic_hooks = 0
+    dynatrace_hooks = 0
+    honeycomb_hooks = 0
+    jaeger_hooks = 0
+    zipkin_hooks = 0
+    has_alertmanager = False
+    has_loki = False
 
     for dirpath, dirnames, filenames in os.walk(project_root):
         dirnames[:] = [
@@ -1691,11 +2418,29 @@ def get_observability_summary(project_root: str) -> dict:
         ]
         for fname in filenames:
             _, ext = os.path.splitext(fname.lower())
-            if ext not in OBSERVABILITY_SOURCE_EXTS:
-                continue
             fpath = os.path.join(dirpath, fname)
             ok, content, _ = _safe_read(fpath)
             if not ok:
+                continue
+
+            # AlertManager config files
+            if 'alertmanager' in fname.lower() or 'alertmanager' in fpath.lower():
+                am_syms = extract_alertmanager_config(content, fpath, ext)
+                if am_syms:
+                    has_alertmanager = True
+
+            # Loki config files and Grafana dashboards with Loki datasource
+            if (any(s in fname.lower() for s in ['loki', 'promtail'])
+                    or '/loki/' in fpath.replace('\\', '/')):
+                loki_syms = extract_loki_config(content, fpath, ext)
+                if loki_syms:
+                    has_loki = True
+            if ext == '.json' and '"type": "loki"' in content:
+                loki_syms = extract_loki_config(content, fpath, ext)
+                if loki_syms:
+                    has_loki = True
+
+            if ext not in OBSERVABILITY_SOURCE_EXTS:
                 continue
 
             otel_syms = extract_otel_instrumentation(content, fpath, ext)
@@ -1723,6 +2468,27 @@ def get_observability_summary(project_root: str) -> dict:
                 if any(s["symbol_type"] == "utility" for s in dd_syms):
                     datadog_init_files += 1
 
+            # New APM tools
+            if any(s in content for s in ['newrelic.agent', "require('newrelic')", 'newrelic.NewApplication', 'com.newrelic']):
+                nr_syms = extract_newrelic_instrumentation(content, fpath, ext)
+                newrelic_hooks += sum(1 for s in nr_syms if s["symbol_type"] == "hook")
+
+            if any(s in content for s in ['oneagent', 'dynatrace/oneagent-sdk', 'com.dynatrace']):
+                dt_syms = extract_dynatrace_instrumentation(content, fpath, ext)
+                dynatrace_hooks += sum(1 for s in dt_syms if s["symbol_type"] == "hook")
+
+            if any(s in content for s in ['beeline', 'honeycomb', 'HONEYCOMB_API_KEY', 'libhoney']):
+                hc_syms = extract_honeycomb_instrumentation(content, fpath, ext)
+                honeycomb_hooks += len(hc_syms)
+
+            if any(s in content for s in ['jaeger_client', 'jaeger-client-go', "require('jaeger-client')"]):
+                j_syms = extract_jaeger_instrumentation(content, fpath, ext)
+                jaeger_hooks += len(j_syms)
+
+            if any(s in content for s in ['py_zipkin', "require('zipkin')", 'zipkin-transport']):
+                z_syms = extract_zipkin_instrumentation(content, fpath, ext)
+                zipkin_hooks += len(z_syms)
+
     # Coverage score
     score = 0
     if otel_configs:
@@ -1745,6 +2511,18 @@ def get_observability_summary(project_root: str) -> dict:
         score += 5
     if datadog_init_files > 0:
         score += 5
+    # New APM tools: +5 each
+    if newrelic_hooks > 0:
+        score += 5
+    if dynatrace_hooks > 0:
+        score += 5
+    if honeycomb_hooks > 0:
+        score += 5
+    # Infrastructure tools: +3 each
+    if has_alertmanager:
+        score += 3
+    if has_loki:
+        score += 3
 
     # Recommendations
     recommendations: list[str] = []
@@ -1810,6 +2588,153 @@ def get_observability_summary(project_root: str) -> dict:
             "init_files": datadog_init_files,
             "total_files_with_datadog": datadog_total_files,
         },
+        "newrelic_hooks": newrelic_hooks,
+        "dynatrace_hooks": dynatrace_hooks,
+        "honeycomb_hooks": honeycomb_hooks,
+        "jaeger_hooks": jaeger_hooks,
+        "zipkin_hooks": zipkin_hooks,
+        "has_alertmanager": has_alertmanager,
+        "has_loki": has_loki,
         "coverage_score": min(score, 100),
         "recommendations": recommendations,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST SUITE  (python3 observability.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _test_new_observability() -> None:
+    # New Relic Python
+    nr_py = 'import newrelic.agent\n@newrelic.agent.function_trace()\ndef my_func(): pass'
+    syms = extract_newrelic_instrumentation(nr_py, "app.py", ".py")
+    assert any('newrelic' in s['name'].lower() for s in syms), f"NR Python: {syms}"
+    print("[PASS] New Relic Python")
+
+    # New Relic Node
+    nr_js = "require('newrelic')\nnewrelic.startWebTransaction('/api/users', handler)"
+    syms2 = extract_newrelic_instrumentation(nr_js, "server.js", ".js")
+    assert any('newrelic' in s['name'].lower() for s in syms2), f"NR Node: {syms2}"
+    print("[PASS] New Relic Node")
+
+    # New Relic Go
+    nr_go = '"github.com/newrelic/go-agent/v3/newrelic"\nnewrelic.NewApplication()\napp.StartTransaction("my-txn")\ntxn.NoticeError(err)'
+    syms_go = extract_newrelic_instrumentation(nr_go, "main.go", ".go")
+    assert any('newrelic' in s['name'].lower() for s in syms_go), f"NR Go: {syms_go}"
+    print("[PASS] New Relic Go")
+
+    # New Relic Java
+    nr_java = 'import com.newrelic.api.agent.NewRelic;\n@Trace(dispatcher=true)\npublic void handle() {}\nNewRelic.noticeError(e);'
+    syms_java = extract_newrelic_instrumentation(nr_java, "Handler.java", ".java")
+    assert any('newrelic' in s['name'].lower() for s in syms_java), f"NR Java: {syms_java}"
+    print("[PASS] New Relic Java")
+
+    # New Relic config file
+    syms_cfg = extract_newrelic_instrumentation("[newrelic]\nlicense_key = abc", "newrelic.ini", ".ini")
+    assert any('newrelic' in s['name'].lower() for s in syms_cfg), f"NR Config: {syms_cfg}"
+    print("[PASS] New Relic config file")
+
+    # Dynatrace
+    dt = "import oneagent\nsdk = oneagent.get_sdk()\nwith sdk.trace_incoming_remote_call('my_service', 'users', 'list'): pass"
+    syms3 = extract_dynatrace_instrumentation(dt, "service.py", ".py")
+    assert any('dynatrace' in s['name'].lower() or 'oneagent' in s['name'].lower() for s in syms3), f"Dynatrace: {syms3}"
+    print("[PASS] Dynatrace Python")
+
+    # Dynatrace Node
+    dt_js = "const Sdk = require('@dynatrace/oneagent-sdk');\nconst sdk = Sdk.createInstance();\napi.createIncomingRemoteCallTracer('svc');"
+    syms_dt_js = extract_dynatrace_instrumentation(dt_js, "server.js", ".js")
+    assert any('dynatrace' in s['name'].lower() for s in syms_dt_js), f"Dynatrace Node: {syms_dt_js}"
+    print("[PASS] Dynatrace Node")
+
+    # Dynatrace config file
+    syms_dt_cfg = extract_dynatrace_instrumentation("", "dtconfig.properties", ".properties")
+    assert any('dynatrace' in s['name'].lower() for s in syms_dt_cfg), f"Dynatrace cfg: {syms_dt_cfg}"
+    print("[PASS] Dynatrace config file")
+
+    # Honeycomb
+    hc = "import beeline\nbeeline.init(writekey='abc123', dataset='my-app')\n@beeline.traced\ndef my_handler(): pass"
+    syms4 = extract_honeycomb_instrumentation(hc, "app.py", ".py")
+    assert any('beeline' in s['name'].lower() or 'honeycomb' in s['name'].lower() for s in syms4), f"Honeycomb: {syms4}"
+    print("[PASS] Honeycomb Python")
+
+    # Honeycomb Node
+    hc_js = "const beeline = require('honeycomb-beeline');\nbeeline.configure({writeKey: 'abc'});\nconst hc = require('libhoney');"
+    syms_hc_js = extract_honeycomb_instrumentation(hc_js, "server.js", ".js")
+    assert any('honeycomb' in s['name'].lower() or 'beeline' in s['name'].lower() for s in syms_hc_js), f"Honeycomb Node: {syms_hc_js}"
+    print("[PASS] Honeycomb Node")
+
+    # AlertManager
+    am = "global:\n  resolve_timeout: 5m\nroute:\n  receiver: slack\nreceivers:\n- name: slack\n  slack_configs:\n  - api_url: https://hooks.slack.com/xxx"
+    syms5 = extract_alertmanager_config(am, "alertmanager.yml", ".yml")
+    assert len(syms5) > 0, f"AlertManager: {syms5}"
+    # Expect alertmanager:config utility and receiver:slack hook
+    assert any('alertmanager:config' in s['name'] for s in syms5), f"AlertManager config symbol missing: {syms5}"
+    assert any('receiver:slack' in s['name'] for s in syms5), f"AlertManager receiver:slack missing: {syms5}"
+    print("[PASS] AlertManager")
+
+    # AlertManager with inhibit_rules
+    am_inhibit = "global:\n  resolve_timeout: 5m\nreceivers:\n- name: default\ninhibit_rules:\n- source_match:\n    severity: critical"
+    syms_am_inh = extract_alertmanager_config(am_inhibit, "alertmanager.yml", ".yml")
+    assert any('inhibit' in s['name'] for s in syms_am_inh), f"AlertManager inhibit: {syms_am_inh}"
+    print("[PASS] AlertManager inhibit_rules")
+
+    # Loki server config
+    loki_cfg = "auth_enabled: false\nserver:\n  http_listen_port: 3100\ningester:\n  lifecycler:\n    ring:\n      kvstore:\n        store: inmemory"
+    syms_loki = extract_loki_config(loki_cfg, "/etc/loki/loki.yml", ".yml")
+    assert any('loki:server' in s['name'] or 'loki:ingester' in s['name'] for s in syms_loki), f"Loki server: {syms_loki}"
+    print("[PASS] Loki server config")
+
+    # Promtail config
+    promtail_cfg = "clients:\n  - url: http://loki:3100/loki/api/v1/push\nscrape_configs:\n  - job_name: varlogs"
+    syms_pt = extract_loki_config(promtail_cfg, "/etc/promtail/promtail.yml", ".yml")
+    assert any('promtail' in s['name'] for s in syms_pt), f"Promtail: {syms_pt}"
+    print("[PASS] Promtail config")
+
+    # Loki datasource in Grafana JSON
+    grafana_loki = '{"panels": [], "datasource": {"type": "loki", "uid": "loki-ds"}}'
+    syms_loki_json = extract_loki_config(grafana_loki, "dashboard.json", ".json")
+    assert any('loki' in s['name'].lower() for s in syms_loki_json), f"Loki JSON datasource: {syms_loki_json}"
+    print("[PASS] Loki Grafana datasource")
+
+    # Jaeger Python
+    jaeger = "from jaeger_client import Config\nconfig = Config(config={}, service_name='my-service')\ntracer = config.initialize_tracer()"
+    syms6 = extract_jaeger_instrumentation(jaeger, "tracing.py", ".py")
+    assert len(syms6) > 0, f"Jaeger: {syms6}"
+    assert any('jaeger' in s['name'].lower() for s in syms6), f"Jaeger name check: {syms6}"
+    # Check that service_name is captured
+    assert any('my-service' in s['name'] or 'my-service' in ' '.join(s['keywords']) for s in syms6), \
+        f"Jaeger service_name not captured: {syms6}"
+    print("[PASS] Jaeger Python")
+
+    # Jaeger Go
+    jaeger_go = '"github.com/uber/jaeger-client-go"\ncfg := jaegercfg.Configuration{ServiceName: "my-go-svc"}\ntracer, _, _ := cfg.NewTracer()'
+    syms_j_go = extract_jaeger_instrumentation(jaeger_go, "tracer.go", ".go")
+    assert any('jaeger' in s['name'].lower() for s in syms_j_go), f"Jaeger Go: {syms_j_go}"
+    print("[PASS] Jaeger Go")
+
+    # Jaeger Node
+    jaeger_js = "const initTracer = require('jaeger-client').initTracer;\nconst tracer = initTracer(config, options);"
+    syms_j_js = extract_jaeger_instrumentation(jaeger_js, "tracer.js", ".js")
+    assert any('jaeger' in s['name'].lower() for s in syms_j_js), f"Jaeger Node: {syms_j_js}"
+    print("[PASS] Jaeger Node")
+
+    # Zipkin Python
+    zipkin_py = "from py_zipkin.zipkin import zipkin_span\n@zipkin_span(service_name='myservice', span_name='do_work')\ndef do_work(): pass"
+    syms_z = extract_zipkin_instrumentation(zipkin_py, "app.py", ".py")
+    assert any('zipkin' in s['name'].lower() for s in syms_z), f"Zipkin Python: {syms_z}"
+    # Should have both utility (import) and hook (decorator)
+    assert any(s['symbol_type'] == 'utility' for s in syms_z), f"Zipkin utility missing: {syms_z}"
+    assert any(s['symbol_type'] == 'hook' for s in syms_z), f"Zipkin hook missing: {syms_z}"
+    print("[PASS] Zipkin Python")
+
+    # Zipkin Node
+    zipkin_js = "const {Tracer, BatchRecorder} = require('zipkin');\nconst {HttpLogger} = require('zipkin-transport-http');\nconst tracer = new Tracer({recorder: new BatchRecorder()});"
+    syms_z_js = extract_zipkin_instrumentation(zipkin_js, "tracer.js", ".js")
+    assert any('zipkin' in s['name'].lower() for s in syms_z_js), f"Zipkin Node: {syms_z_js}"
+    print("[PASS] Zipkin Node")
+
+    print("\n=== All new observability tests PASSED ===")
+
+
+if __name__ == "__main__":
+    _test_new_observability()

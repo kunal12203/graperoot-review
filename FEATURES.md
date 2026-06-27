@@ -1,6 +1,6 @@
 # GrapeRoot Pro — Feature List
 
-> **Implementation Status**: Phases 1–14 fully implemented in `graph_builder_v6.2.py` + `mcp_graph_server_v7.5.py`
+> **Implementation Status**: Phases 1–21 fully implemented in `graph_builder_v6.2.py` + `mcp_graph_server_v7.5.py`
 > - Phase 1: Language Expansion (Java, Kotlin, Ruby, SQL, Shell, Scala, C#, Prisma) — `graph_builder_parsers.py`, `graph_builder_prisma.py`
 > - Phase 2: Framework Route Detection (20 frameworks) — `graph_builder_routes.py` + 29 MCP tools in `mcp_tools_integration.py`
 > - Phase 3: Service Graph (Kafka/SQS/Redis/RabbitMQ/NATS/EventBridge + Proto/OpenAPI/GraphQL/AsyncAPI) — `graph_builder_service_graph.py`
@@ -15,6 +15,13 @@
 > - Phase 12: MQ Expansion (Celery, Azure Service Bus, GCP Pub/Sub, Temporal, Sidekiq/Resque)
 > - Phase 13: Structural Checks (N+1 risk, missing pagination, missing indexes) — `structural_bugs.py`
 > - Phase 14: Sentry + Datadog Observability Coverage — `observability.py`
+> - Phase 15: IaC Extended (AWS CDK v1/v2, CloudFormation, Pulumi, Azure Bicep/ARM) — `graph_builder_iac_extended.py`
+> - Phase 16: CI/CD Extended (Travis, Drone 0.x/1.x, Bitbucket Pipelines, ArgoCD, Tekton, Flux, TeamCity) — `graph_builder_ci_extended.py`
+> - Phase 17: ORM Extended (EF Core, Dapper, Ent, Tortoise, SQLModel, Exposed, Knex, Kysely, Objection) — `graph_builder_orm.py`
+> - Phase 18: Routes Extended (Starlette, Litestar, aiohttp, Django Ninja, Sanic, Tornado, GraphQL SDL, Apollo, Strawberry, Graphene, Feathers, AdonisJS, Elysia, Symfony, Play Framework, Buffalo) — `graph_builder_routes.py`
+> - Phase 19: Observability Extended (New Relic, Dynatrace, Honeycomb, AlertManager, Loki, Jaeger, Zipkin) — `observability.py`
+> - Phase 20: Structural Extended (unused env vars, missing env vars, port conflicts, race conditions) — `structural_bugs.py`
+> - Phase 21: Language Extended (Elixir/Phoenix, Swift/Vapor, Dart/Flutter, Groovy/Gradle) — `graph_builder_lang_extended.py`
 
 ## Codebase Intelligence
 - Instant symbol navigation — find any function, class, or variable across your entire project

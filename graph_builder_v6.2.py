@@ -90,6 +90,42 @@ except ImportError:
     _ORM_AVAILABLE = False
     _ORM_EXTS: set = set()
 
+try:
+    from graph_builder_iac_extended import (
+        extract_iac_extended_symbols as _iac_ext_extract,
+        parse_iac_extended_imports as _iac_ext_imports,
+        supports_iac_extended as _iac_ext_supports,
+        IAC_EXT_EXTS as _IAC_EXT_EXTS,
+    )
+    _IAC_EXT_AVAILABLE = True
+except ImportError:
+    _IAC_EXT_AVAILABLE = False
+    _IAC_EXT_EXTS: set = set()
+
+try:
+    from graph_builder_ci_extended import (
+        extract_ci_extended_symbols as _ci_ext_extract,
+        parse_ci_extended_imports as _ci_ext_imports,
+        is_ci_extended_file as _ci_ext_supports,
+        CI_EXT_EXTS as _CI_EXT_EXTS,
+    )
+    _CI_EXT_AVAILABLE = True
+except ImportError:
+    _CI_EXT_AVAILABLE = False
+    _CI_EXT_EXTS: set = set()
+
+try:
+    from graph_builder_lang_extended import (
+        extract_lang_extended_symbols as _lang_ext_extract,
+        parse_lang_extended_imports as _lang_ext_imports,
+        supports_lang_extended as _lang_ext_supports,
+        LANG_EXT_EXTS as _LANG_EXT_EXTS,
+    )
+    _LANG_EXT_AVAILABLE = True
+except ImportError:
+    _LANG_EXT_AVAILABLE = False
+    _LANG_EXT_EXTS: set = set()
+
 # ── Tree-sitter setup ──────────────────────────────────────────────────────────
 try:
     import tree_sitter_typescript as _tsts
@@ -1031,6 +1067,15 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
     # ORM reference edges (TypeORM @ManyToOne, Sequelize belongsTo, Mongoose ref, etc.)
     if _ORM_AVAILABLE and ext in _ORM_EXTS and _orm_supports(text, file_id, ext):
         edges.extend(_orm_parse_imports(text, file_id, ext))
+    # IaC extended edges (CDK, CFN, Pulumi, Bicep)
+    if _IAC_EXT_AVAILABLE and ext in _IAC_EXT_EXTS and _iac_ext_supports(text, file_id, ext):
+        edges.extend(_iac_ext_imports(text, file_id, ext))
+    # CI extended edges (Tekton runAfter, Flux dependsOn)
+    if _CI_EXT_AVAILABLE and ext in _CI_EXT_EXTS and _ci_ext_supports(text, file_id, ext):
+        edges.extend(_ci_ext_imports(text, file_id, ext))
+    # Lang extended edges (Elixir Ecto, Swift imports, Dart imports, Groovy)
+    if _LANG_EXT_AVAILABLE and ext in _LANG_EXT_EXTS and _lang_ext_supports(text, file_id, ext):
+        edges.extend(_lang_ext_imports(text, file_id, ext))
     return edges
 
 
@@ -1337,9 +1382,16 @@ def scan(root: Path, existing_nodes: dict[str, dict] | None = None) -> dict:
                 edges.extend(parse_relations(path, content, root))
                 if ext in SYMBOL_EXTS:
                     _append_symbol_nodes(nodes, edges, _extract_symbols_for_file(content, file_id, ext), file_id, ext)
-                if _ROUTES_AVAILABLE and ext in _ROUTE_EXTS:
+                _is_play = (path.name == "routes" or file_id.endswith("/conf/routes"))
+                if _ROUTES_AVAILABLE and (ext in _ROUTE_EXTS or _is_play):
                     _append_symbol_nodes(nodes, edges, _routes_extract(content, file_id, ext), file_id, ext)
                 _append_symbol_nodes(nodes, edges, _extract_orm_symbols_if_applicable(content, file_id, ext), file_id, ext)
+                if _IAC_EXT_AVAILABLE and ext in _IAC_EXT_EXTS and _iac_ext_supports(content, file_id, ext):
+                    _append_symbol_nodes(nodes, edges, _iac_ext_extract(content, file_id, ext), file_id, ext)
+                if _CI_EXT_AVAILABLE and ext in _CI_EXT_EXTS and _ci_ext_supports(content, file_id, ext):
+                    _append_symbol_nodes(nodes, edges, _ci_ext_extract(content, file_id, ext), file_id, ext)
+                if _LANG_EXT_AVAILABLE and ext in _LANG_EXT_EXTS and _lang_ext_supports(content, file_id, ext):
+                    _append_symbol_nodes(nodes, edges, _lang_ext_extract(content, file_id, ext), file_id, ext)
                 continue
 
         summary = _make_summary(content, file_id, ext)
@@ -1351,9 +1403,16 @@ def scan(root: Path, existing_nodes: dict[str, dict] | None = None) -> dict:
         edges.extend(parse_relations(path, content, root))
         if ext in SYMBOL_EXTS:
             _append_symbol_nodes(nodes, edges, _extract_symbols_for_file(content, file_id, ext), file_id, ext)
-        if _ROUTES_AVAILABLE and ext in _ROUTE_EXTS:
+        _is_play = (path.name == "routes" or file_id.endswith("/conf/routes"))
+        if _ROUTES_AVAILABLE and (ext in _ROUTE_EXTS or _is_play):
             _append_symbol_nodes(nodes, edges, _routes_extract(content, file_id, ext), file_id, ext)
         _append_symbol_nodes(nodes, edges, _extract_orm_symbols_if_applicable(content, file_id, ext), file_id, ext)
+        if _IAC_EXT_AVAILABLE and ext in _IAC_EXT_EXTS and _iac_ext_supports(content, file_id, ext):
+            _append_symbol_nodes(nodes, edges, _iac_ext_extract(content, file_id, ext), file_id, ext)
+        if _CI_EXT_AVAILABLE and ext in _CI_EXT_EXTS and _ci_ext_supports(content, file_id, ext):
+            _append_symbol_nodes(nodes, edges, _ci_ext_extract(content, file_id, ext), file_id, ext)
+        if _LANG_EXT_AVAILABLE and ext in _LANG_EXT_EXTS and _lang_ext_supports(content, file_id, ext):
+            _append_symbol_nodes(nodes, edges, _lang_ext_extract(content, file_id, ext), file_id, ext)
 
     unique_edges = dedupe_edges(edges)
     symbol_count = sum(1 for n in nodes if n.kind == "symbol")

@@ -17,6 +17,10 @@ Checks implemented
 8.  Missing pagination                      (SQLAlchemy, Django ORM, TypeORM, Mongoose, GORM, raw SQL)
 9.  Missing indexes on FK fields            (Prisma, SQLAlchemy, Django, TypeORM, ActiveRecord)
 10. N+1 query risk                          (Python, TypeScript, Ruby)
+11. Unused env vars                         (vars declared in .env but never referenced)
+12. Missing env vars                        (vars referenced in code but absent from all .env files)
+13. Port conflicts                          (same port bound in multiple files/services)
+14. Race condition risk                     (goroutines/threads/Promise.all with shared mutable state)
 
 Aggregator
 ----------
@@ -56,6 +60,118 @@ _TEST_PAT = re.compile(
 )
 
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# ---------------------------------------------------------------------------
+# Constants for new checks (11-14)
+# ---------------------------------------------------------------------------
+
+# Directories to skip when walking project files
+_SKIP_DIRS_COMMON = {
+    ".git", ".svn", ".hg", "node_modules", "vendor",
+    "__pycache__", ".venv", "venv", "env",
+    "dist", "build", "out", "target", ".idea", ".vscode",
+    "site-packages", "eggs", ".eggs", ".tox", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".next", ".nuxt",
+}
+
+# .env file name patterns
+_ENV_FILE_NAMES = {
+    ".env", ".env.local", ".env.production", ".env.development",
+    ".env.test", ".env.example", ".env.staging",
+}
+
+# Source file extensions for env-var scan
+_SRC_EXTS_ENV = {".ts", ".js", ".py", ".go", ".java", ".rb", ".cs", ".kt", ".php",
+                 ".tsx", ".jsx", ".mjs", ".cjs"}
+
+# Variables that are framework/OS-injected — never flag as unused/missing
+_AUTO_VARS: set[str] = {
+    "PATH", "HOME", "USER", "SHELL",
+    "NODE_ENV", "RAILS_ENV", "APP_ENV", "FLASK_ENV", "GIN_MODE",
+    "DEBUG", "PORT", "HOST", "LOG_LEVEL",
+}
+
+# Missing-env exclusions (framework-set at runtime)
+_MISSING_ENV_SKIP: set[str] = {
+    "NODE_ENV", "PORT", "HOST", "DEBUG", "RAILS_ENV",
+    "APP_ENV", "FLASK_ENV", "LOG_LEVEL", "GIN_MODE",
+}
+
+# Parse declared var from .env line  (e.g. "DB_PASSWORD=secret")
+_ENV_DECL_RE = re.compile(r"^([A-Z_][A-Z0-9_]*)\s*=(.*)$")
+
+# Usage patterns per language — compiled once
+_USAGE_PATTERNS: list[re.Pattern] = [
+    # Node/JS
+    re.compile(r"process\.env\.([A-Z_][A-Z0-9_]*)"),
+    re.compile(r"""process\.env\[['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    # Python
+    re.compile(r"""os\.environ\[['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    re.compile(r"""os\.(?:environ\.get|getenv)\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    re.compile(r"""env\.get\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    # Go
+    re.compile(r"""os\.Getenv\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    re.compile(r"""os\.LookupEnv\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    # Java
+    re.compile(r"""System\.getenv\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    # Ruby
+    re.compile(r"""ENV\s*\[['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    re.compile(r"""ENV\.fetch\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"]"""),
+    # C#
+    re.compile(r"""Environment\.GetEnvironmentVariable\s*\(\s*['"]([A-Z_][A-Z0-9_]*)['"]"""),
+]
+
+# Port detection patterns
+# .env / config: PORT=8080  or  REDIS_PORT=6379
+_PORT_ENV_RE   = re.compile(r"^([A-Z_]*PORT[A-Z_]*)\s*=\s*(\d{2,5})", re.MULTILINE)
+# docker-compose ports: section "- 8080:8080"
+_DC_PORT_RE    = re.compile(r"""['"]?(\d{2,5}):(\d{2,5})['"]?""")
+# docker-compose environment PORT: 8080
+_DC_ENV_PORT_RE = re.compile(r"PORT\s*:\s*(\d{2,5})")
+# K8s containerPort / port / nodePort
+_K8S_PORT_RE   = re.compile(r"(?:containerPort|nodePort|port)\s*:\s*(\d{2,5})")
+# Python uvicorn / Flask
+_PY_PORT_RE    = re.compile(
+    r"(?:uvicorn\.run|app\.run)\s*\([^)]*?port\s*=\s*(\d{2,5})"
+    r"|\.listen\s*\(\s*(\d{2,5})",
+    re.DOTALL,
+)
+# Go ListenAndServe / net.Listen
+_GO_PORT_RE    = re.compile(
+    r'ListenAndServe\s*\(\s*["\'][^"\']*:(\d{2,5})["\']'
+    r'|net\.Listen\s*\([^,]+,\s*["\'][^"\']*:(\d{2,5})["\']'
+)
+# Node.js .listen(port) or PORT || 3000
+_JS_PORT_RE    = re.compile(
+    r'\.listen\s*\(\s*(\d{2,5})'
+    r'|PORT\s*\|\|\s*(\d{2,5})'
+)
+# Spring Boot application.properties
+_SPRING_PORT_RE = re.compile(r"server\.port\s*=\s*(\d{2,5})")
+# Ports to ignore (expected to repeat in proxy configs)
+_SKIP_PORTS    = {80, 443, 0}
+
+# Race condition patterns — Go
+_GO_GOROUTINE_RE  = re.compile(r"\bgo\s+(?:func\s*\(|\w+\s*\()")
+_GO_SYNC_RE       = re.compile(r"""["']sync["']|sync\.""")
+_GO_MAP_WRITE_RE  = re.compile(r"\w+\[[\w\"']+\]\s*=")
+_GO_SHARED_MUT_RE = re.compile(
+    r"\bgo\s+func\s*\([^)]*\)\s*\{[^}]*?(\w+)\s*(?:\+\+|--|\+=|-=|=\s*[^=])",
+    re.DOTALL,
+)
+
+# Race condition patterns — Python threading
+_PY_THREAD_RE     = re.compile(r"threading\.Thread\s*\(")
+_PY_LOCK_RE       = re.compile(r"threading\.(?:R?Lock)\s*\(\s*\)")
+
+# Race condition patterns — JS/TS Promise.all
+_JS_PROMISE_ALL_RE = re.compile(r"Promise\.all\s*\(")
+_JS_SHARED_AGG_RE  = re.compile(
+    r"\blet\s+(count|total|results|errors|data)\s*=\s*(?:0|\[\]|\{\})"
+)
+_JS_MUTATION_RE    = re.compile(
+    r"\+\+\s*(?:count|total)|(?:results|errors|data)\.push\s*\("
+)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -1749,6 +1865,486 @@ def find_n_plus_one_risk(graph: dict, project_root: str) -> list[dict]:  # noqa:
 
 
 # ---------------------------------------------------------------------------
+# 11. Unused env vars
+# ---------------------------------------------------------------------------
+
+def _walk_project(project_root: str):
+    """Yield (dirpath, dirnames, filenames) skipping common non-source dirs."""
+    root = Path(project_root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _SKIP_DIRS_COMMON and not d.startswith(".")
+        ]
+        yield dirpath, dirnames, filenames
+
+
+def _collect_env_declarations(project_root: str) -> dict[str, list[tuple[str, int, str]]]:
+    """Return {var_name: [(rel_path, line_no, snippet), ...]} from .env* files."""
+    root = Path(project_root)
+    declared: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            if fname not in _ENV_FILE_NAMES and not fname.startswith(".env."):
+                continue
+            rel = str(fpath.relative_to(root))
+            try:
+                lines = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            for i, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if stripped.startswith("#") or not stripped:
+                    continue
+                m = _ENV_DECL_RE.match(stripped)
+                if m:
+                    var_name = m.group(1)
+                    value = m.group(2).strip()
+                    snippet = stripped[:80]
+                    declared[var_name].append((rel, i, snippet))
+    return declared
+
+
+def _collect_env_usages(project_root: str) -> set[str]:
+    """Return set of env var names referenced in source code."""
+    used: set[str] = set()
+    root = Path(project_root)
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            if fpath.suffix.lower() not in _SRC_EXTS_ENV:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for pat in _USAGE_PATTERNS:
+                for m in pat.finditer(content):
+                    used.add(m.group(1))
+    return used
+
+
+def find_unused_env_vars(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Find variables declared in .env files but never referenced in source code.
+
+    Returns
+    -------
+    list[dict] with type="unused_env_var".
+    """
+    declared = _collect_env_declarations(project_root)
+    used_vars = _collect_env_usages(project_root)
+
+    # Also collect all vars declared across .env.example — these are templates, skip
+    example_vars: set[str] = set()
+    root = Path(project_root)
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            if fname == ".env.example":
+                fpath = Path(dirpath) / fname
+                try:
+                    lines = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except Exception:
+                    continue
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith("#") or not stripped:
+                        continue
+                    m = _ENV_DECL_RE.match(stripped)
+                    if m:
+                        example_vars.add(m.group(1))
+
+    issues: list[dict] = []
+    for var_name, occurrences in declared.items():
+        if var_name in _AUTO_VARS:
+            continue
+        if var_name in example_vars:
+            continue
+        if var_name in used_vars:
+            continue
+        # Skip if value is empty (template placeholder)
+        # occurrences: list of (rel_path, line_no, snippet)
+        for rel_path, line_no, snippet in occurrences:
+            # Check if this specific file is a .env.example
+            if rel_path.endswith(".env.example"):
+                continue
+            # Extract value from snippet "VAR=value"
+            m = _ENV_DECL_RE.match(snippet)
+            if m and m.group(2).strip() == "":
+                continue
+            issues.append({
+                "type": "unused_env_var",
+                "file": rel_path,
+                "line": line_no,
+                "snippet": snippet,
+                "var_name": var_name,
+                "severity": "low",
+                "fix": "Remove this variable from .env or add it to .env.example if it's a template.",
+            })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# 12. Missing env vars
+# ---------------------------------------------------------------------------
+
+def find_missing_env_vars(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Find environment variables referenced in source code but absent from all .env files.
+
+    Returns
+    -------
+    list[dict] with type="missing_env_var".
+    """
+    root = Path(project_root)
+
+    # Build declared_vars across ALL .env* files (including .env.example)
+    declared_vars: set[str] = set()
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            if fname not in _ENV_FILE_NAMES and not fname.startswith(".env."):
+                continue
+            try:
+                lines = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("#") or not stripped:
+                    continue
+                m = _ENV_DECL_RE.match(stripped)
+                if m:
+                    declared_vars.add(m.group(1))
+
+    # Also scan docker-compose and K8s YAML for env: section defined vars
+    docker_k8s_vars: set[str] = set()
+    _DC_ENV_DEFINED_RE = re.compile(r"^\s{0,10}([A-Z_][A-Z0-9_]*)\s*:", re.MULTILINE)
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            if fname.lower() in {"docker-compose.yml", "docker-compose.yaml"} or \
+               (fname.endswith((".yml", ".yaml")) and
+                    any(k in fname.lower() for k in ("k8s", "kube", "deploy", "manifest"))):
+                fpath = Path(dirpath) / fname
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                for m in _DC_ENV_DEFINED_RE.finditer(content):
+                    docker_k8s_vars.add(m.group(1))
+    declared_vars.update(docker_k8s_vars)
+
+    # Build code_vars: var -> [(file, line, snippet)] — limit to 3 occurrences per var
+    code_vars: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            if fpath.suffix.lower() not in _SRC_EXTS_ENV:
+                continue
+            rel = str(fpath.relative_to(root))
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            lines_list = content.splitlines()
+            for pat in _USAGE_PATTERNS:
+                for m in pat.finditer(content):
+                    var_name = m.group(1)
+                    if var_name in _MISSING_ENV_SKIP:
+                        continue
+                    if len(code_vars[var_name]) >= 3:
+                        continue
+                    line_no = content[:m.start()].count("\n") + 1
+                    snippet = lines_list[line_no - 1].strip()[:80] if line_no <= len(lines_list) else m.group(0)
+                    code_vars[var_name].append((rel, line_no, snippet))
+
+    issues: list[dict] = []
+    for var_name, occurrences in code_vars.items():
+        if var_name in declared_vars:
+            continue
+        for rel, line_no, snippet in occurrences:
+            issues.append({
+                "type": "missing_env_var",
+                "file": rel,
+                "line": line_no,
+                "snippet": snippet,
+                "var_name": var_name,
+                "severity": "high",
+                "fix": "Add this variable to .env.example and all relevant .env files.",
+            })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# 13. Port conflicts
+# ---------------------------------------------------------------------------
+
+def _extract_ports_from_file(
+    fpath: Path,
+    content: str,
+    rel: str,
+) -> list[tuple[int, str, int, str]]:
+    """Return list of (port, rel_path, line_no, snippet) from a single file."""
+    results: list[tuple[int, str, int, str]] = []
+    fname = fpath.name.lower()
+    ext   = fpath.suffix.lower()
+    lines = content.splitlines()
+
+    def _add(port_str: str, pos: int, raw_snippet: str) -> None:
+        try:
+            port = int(port_str)
+        except ValueError:
+            return
+        if port in _SKIP_PORTS:
+            return
+        line_no = content[:pos].count("\n") + 1
+        snippet = (lines[line_no - 1].strip()[:80] if line_no <= len(lines) else raw_snippet)
+        results.append((port, rel, line_no, snippet))
+
+    # .env / config files
+    if fname.startswith(".env") or ext in {".env", ".properties", ".cfg", ".ini"}:
+        for m in _PORT_ENV_RE.finditer(content):
+            _add(m.group(2), m.start(), m.group(0))
+
+    # docker-compose
+    if "docker-compose" in fname and ext in {".yml", ".yaml"}:
+        # ports: section
+        in_ports = False
+        for i, line in enumerate(lines):
+            if re.match(r"\s*ports\s*:", line):
+                in_ports = True
+                continue
+            if in_ports:
+                dm = _DC_PORT_RE.search(line)
+                if dm:
+                    pos = sum(len(l) + 1 for l in lines[:i])
+                    _add(dm.group(1), pos, line.strip())
+                elif not line.strip().startswith("-") and line.strip():
+                    in_ports = False
+        # environment section PORT:
+        for m in _DC_ENV_PORT_RE.finditer(content):
+            _add(m.group(1), m.start(), m.group(0))
+
+    # Kubernetes YAML
+    if ext in {".yml", ".yaml"} and "docker-compose" not in fname:
+        for m in _K8S_PORT_RE.finditer(content):
+            _add(m.group(1), m.start(), m.group(0))
+
+    # Python
+    if ext == ".py":
+        for m in _PY_PORT_RE.finditer(content):
+            port_str = m.group(1) or m.group(2)
+            if port_str:
+                _add(port_str, m.start(), m.group(0))
+
+    # Go
+    if ext == ".go":
+        for m in _GO_PORT_RE.finditer(content):
+            port_str = m.group(1) or m.group(2)
+            if port_str:
+                _add(port_str, m.start(), m.group(0))
+
+    # JavaScript / TypeScript
+    if ext in {".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"}:
+        for m in _JS_PORT_RE.finditer(content):
+            port_str = m.group(1) or m.group(2)
+            if port_str:
+                _add(port_str, m.start(), m.group(0))
+
+    # Spring Boot application.properties
+    if fname in {"application.properties", "application.yml", "application.yaml"}:
+        for m in _SPRING_PORT_RE.finditer(content):
+            _add(m.group(1), m.start(), m.group(0))
+
+    return results
+
+
+def find_port_conflicts(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Find cases where two different files/services bind the same port.
+
+    Returns
+    -------
+    list[dict] with type="port_conflict".
+    """
+    root = Path(project_root)
+    # port -> list of (rel_path, line_no, snippet)
+    port_map: dict[int, list[tuple[str, int, str]]] = defaultdict(list)
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext   = fpath.suffix.lower()
+            bname = fname.lower()
+            # Only scan relevant file types
+            if not (
+                bname.startswith(".env") or
+                ext in {".env", ".properties", ".cfg", ".ini",
+                        ".yml", ".yaml", ".py", ".go",
+                        ".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"}
+            ):
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            rel = str(fpath.relative_to(root))
+            for port, _rel, line_no, snippet in _extract_ports_from_file(fpath, content, rel):
+                port_map[port].append((_rel, line_no, snippet))
+
+    issues: list[dict] = []
+    for port, entries in port_map.items():
+        # Deduplicate by file — same file can mention port multiple times
+        seen_files: dict[str, tuple[int, str]] = {}
+        for rel_path, line_no, snippet in entries:
+            if rel_path not in seen_files:
+                seen_files[rel_path] = (line_no, snippet)
+        if len(seen_files) < 2:
+            continue
+        files = list(seen_files.keys())
+        first_file   = files[0]
+        first_line, first_snippet = seen_files[first_file]
+        issues.append({
+            "type": "port_conflict",
+            "file": first_file,
+            "line": first_line,
+            "snippet": first_snippet,
+            "port": port,
+            "conflicting_files": files,
+            "severity": "high",
+            "fix": f"Port {port} is declared in multiple files. Assign unique ports per service.",
+        })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# 14. Race condition risk
+# ---------------------------------------------------------------------------
+
+def find_race_conditions(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Heuristic detection of potential race conditions.
+
+    Covers:
+    - Go: goroutines + shared map/slice mutations without sync import
+    - Python: threading.Thread + shared mutable state without Lock
+    - JavaScript/TypeScript: Promise.all + shared mutable aggregator variable
+
+    Returns
+    -------
+    list[dict] with type="race_condition_risk".
+    """
+    issues: list[dict] = []
+    root = Path(project_root)
+
+    _EXTS = {".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext   = fpath.suffix.lower()
+            if ext not in _EXTS:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            rel   = str(fpath.relative_to(root))
+            lines = content.splitlines()
+
+            # ── Go ──────────────────────────────────────────────────────────
+            if ext == ".go":
+                goroutine_matches = list(_GO_GOROUTINE_RE.finditer(content))
+                if not goroutine_matches:
+                    continue
+                has_sync = bool(_GO_SYNC_RE.search(content))
+                if has_sync:
+                    continue
+                # Check for shared map/slice writes in the same file
+                has_shared_write = bool(_GO_MAP_WRITE_RE.search(content))
+                # Check for variable mutations inside goroutine bodies
+                shared_mut_m = _GO_SHARED_MUT_RE.search(content)
+                if has_shared_write or shared_mut_m:
+                    # Use the first goroutine launch as the issue location
+                    m = goroutine_matches[0]
+                    line_no = content[:m.start()].count("\n") + 1
+                    snippet = lines[line_no - 1].strip()[:80] if line_no <= len(lines) else m.group(0)
+                    issues.append({
+                        "type": "race_condition_risk",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "language": "go",
+                        "pattern": "goroutine writing to shared variable without mutex",
+                        "severity": "high",
+                        "fix": "Use sync.Mutex/atomic (Go), threading.Lock (Python), or avoid shared state in concurrent code.",
+                    })
+
+            # ── Python ──────────────────────────────────────────────────────
+            elif ext == ".py":
+                thread_matches = list(_PY_THREAD_RE.finditer(content))
+                if not thread_matches:
+                    continue
+                has_lock = bool(_PY_LOCK_RE.search(content))
+                if has_lock:
+                    continue
+                # Check for shared mutable variable mutations (simple heuristic)
+                # Look for list/dict appends or counter increments outside function defs
+                has_shared_mut = bool(re.search(
+                    r"(?:\.append\s*\(|\.extend\s*\(|\+\+|\+=\s*1|count\s*\+=)",
+                    content,
+                ))
+                if has_shared_mut:
+                    m = thread_matches[0]
+                    line_no = content[:m.start()].count("\n") + 1
+                    snippet = lines[line_no - 1].strip()[:80] if line_no <= len(lines) else m.group(0)
+                    issues.append({
+                        "type": "race_condition_risk",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "language": "python",
+                        "pattern": "threading.Thread with shared mutable state and no Lock",
+                        "severity": "high",
+                        "fix": "Use sync.Mutex/atomic (Go), threading.Lock (Python), or avoid shared state in concurrent code.",
+                    })
+
+            # ── JavaScript / TypeScript ──────────────────────────────────────
+            elif ext in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+                pa_matches = list(_JS_PROMISE_ALL_RE.finditer(content))
+                if not pa_matches:
+                    continue
+                for pa_m in pa_matches:
+                    # Look at 20 lines before Promise.all for shared aggregator declaration
+                    pa_line = content[:pa_m.start()].count("\n") + 1
+                    start_line = max(0, pa_line - 20)
+                    window_before = "\n".join(lines[start_line:pa_line])
+                    agg_m = _JS_SHARED_AGG_RE.search(window_before)
+                    if not agg_m:
+                        continue
+                    # Look at 40 lines after Promise.all for mutations
+                    end_line = min(len(lines), pa_line + 40)
+                    window_after = "\n".join(lines[pa_line:end_line])
+                    if not _JS_MUTATION_RE.search(window_after):
+                        continue
+                    line_no = pa_line
+                    snippet = lines[line_no - 1].strip()[:80] if line_no <= len(lines) else pa_m.group(0)
+                    issues.append({
+                        "type": "race_condition_risk",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "language": "javascript",
+                        "pattern": "Promise.all with shared mutable aggregator variable",
+                        "severity": "high",
+                        "fix": "Use sync.Mutex/atomic (Go), threading.Lock (Python), or avoid shared state in concurrent code.",
+                    })
+                    break  # one finding per file is enough
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + health summary
 # ---------------------------------------------------------------------------
 
@@ -1777,6 +2373,10 @@ def run_all_checks(graph: dict, project_root: str) -> dict:
         ("missing_pagination",     lambda: find_missing_pagination(graph, project_root)),
         ("missing_indexes",        lambda: find_missing_indexes(graph, project_root)),
         ("n_plus_one_risk",        lambda: find_n_plus_one_risk(graph, project_root)),
+        ("unused_env_vars",        lambda: find_unused_env_vars(graph, project_root)),
+        ("missing_env_vars",       lambda: find_missing_env_vars(graph, project_root)),
+        ("port_conflicts",         lambda: find_port_conflicts(graph, project_root)),
+        ("race_conditions",        lambda: find_race_conditions(graph, project_root)),
     ]
 
     all_issues: list[dict] = []
@@ -1842,7 +2442,7 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     # Penalty model:  critical=-20, high=-10, medium=-4, low=-1  (floor 0)
     penalty = (n_critical * 20) + (n_high * 10) + (n_medium * 4) + (n_low * 1)
 
-    # Additional per-finding penalties for new checks (each capped at -20)
+    # Additional per-finding penalties for new checks (each capped)
     n_plus_one_findings   = len([i for i in report["issues"] if i.get("type") == "n_plus_one_risk"])
     missing_pag_findings  = len([i for i in report["issues"] if i.get("type") == "missing_pagination"])
     missing_idx_findings  = len([i for i in report["issues"] if i.get("type") == "missing_index"])
@@ -1850,6 +2450,17 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     penalty += min(20, n_plus_one_findings  * 5)
     penalty += min(20, missing_pag_findings * 3)
     penalty += min(20, missing_idx_findings * 2)
+
+    # Checks 11-14 penalties
+    unused_env_findings   = len([i for i in report["issues"] if i.get("type") == "unused_env_var"])
+    missing_env_findings  = len([i for i in report["issues"] if i.get("type") == "missing_env_var"])
+    port_conflict_findings = len([i for i in report["issues"] if i.get("type") == "port_conflict"])
+    race_cond_findings    = len([i for i in report["issues"] if i.get("type") == "race_condition_risk"])
+
+    penalty += min(5,  unused_env_findings   * 1)   # low severity, cap -5
+    penalty += min(20, missing_env_findings  * 4)   # high severity, cap -20
+    penalty += min(15, port_conflict_findings * 5)  # high severity, cap -15
+    penalty += min(20, race_cond_findings    * 5)   # high severity, cap -20
 
     score   = max(0, 100 - penalty)
 
@@ -1864,8 +2475,8 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     else:
         grade = "F"
 
-    # Total checks = 10 functional checks
-    total_checks  = 10
+    # Total checks = 14 functional checks
+    total_checks  = 14
     checks_failed = min(
         total_checks,
         (1 if n_critical else 0) + (1 if n_high else 0) +
@@ -1888,6 +2499,78 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
         "checks_passed":  checks_passed,
         "checks_failed":  checks_failed,
     }
+
+
+# ---------------------------------------------------------------------------
+# MCP tool exports (registration happens in mcp_tools_integration.py)
+# ---------------------------------------------------------------------------
+
+def graph_unused_env_vars_tool(project_root: str) -> dict:
+    findings = find_unused_env_vars({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_missing_env_vars_tool(project_root: str) -> dict:
+    findings = find_missing_env_vars({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_port_conflicts_tool(project_root: str) -> dict:
+    findings = find_port_conflicts({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_race_conditions_tool(project_root: str) -> dict:
+    findings = find_race_conditions({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+# ---------------------------------------------------------------------------
+# Test suite for new structural checks
+# ---------------------------------------------------------------------------
+
+def _test_new_structural():
+    import tempfile, pathlib, os
+
+    tmpdir = tempfile.mkdtemp()
+
+    # Setup: .env file with some vars
+    (pathlib.Path(tmpdir) / ".env").write_text(
+        "DB_PASSWORD=secret123\nSTRIPE_KEY=sk_live_xxx\nNODE_ENV=production\nUNUSED_VAR=unused\n"
+    )
+    # Setup: source file using some vars
+    (pathlib.Path(tmpdir) / "app.js").write_text(
+        "const db = process.env.DB_PASSWORD\nconst stripe = process.env.STRIPE_KEY\nconst missing = process.env.SENDGRID_API_KEY\n"
+    )
+
+    # Test unused env vars
+    unused = find_unused_env_vars({}, tmpdir)
+    assert any(f['var_name'] == 'UNUSED_VAR' for f in unused), f"Unused: {unused}"
+    print("[PASS] find_unused_env_vars")
+
+    # Test missing env vars
+    missing = find_missing_env_vars({}, tmpdir)
+    assert any(f['var_name'] == 'SENDGRID_API_KEY' for f in missing), f"Missing: {missing}"
+    print("[PASS] find_missing_env_vars")
+
+    # Test port conflicts
+    (pathlib.Path(tmpdir) / "service-a").mkdir()
+    (pathlib.Path(tmpdir) / "service-a" / ".env").write_text("PORT=8080\n")
+    (pathlib.Path(tmpdir) / "service-b").mkdir()
+    (pathlib.Path(tmpdir) / "service-b" / ".env").write_text("PORT=8080\n")
+    conflicts = find_port_conflicts({}, tmpdir)
+    assert any(f['port'] == 8080 for f in conflicts), f"Port: {conflicts}"
+    print("[PASS] find_port_conflicts")
+
+    # Test race conditions (Go)
+    (pathlib.Path(tmpdir) / "server.go").write_text(
+        'package main\nimport "fmt"\nvar counter int\nfunc main() {\n    for i := 0; i < 10; i++ {\n        go func() { counter++ }()\n    }\n}\n'
+    )
+    races = find_race_conditions({}, tmpdir)
+    assert any(f['language'] == 'go' for f in races), f"Race Go: {races}"
+    print("[PASS] find_race_conditions (Go)")
+
+    print("\n=== All new structural tests PASSED ===")
 
 
 # ---------------------------------------------------------------------------

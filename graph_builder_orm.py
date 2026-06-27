@@ -1,13 +1,22 @@
 """
 ORM model symbol extractor for graph_builder_v6.2.
 
-Supports 6 major ORMs via regex-only detection (no AST / YAML libs):
-  1. TypeORM    (.ts, .js)   — @Entity decorator
-  2. Sequelize  (.js, .ts)   — class extends Model / .init()
-  3. GORM       (.go)        — struct with gorm tags / gorm.io import
-  4. Drizzle    (.ts)        — pgTable / mysqlTable / sqliteTable exports
-  5. Mongoose   (.js, .ts)   — new mongoose.Schema + mongoose.model(...)
-  6. SQLAlchemy (.py)        — class extends Base / db.Model
+Supports 15 major ORMs via regex-only detection (no AST / YAML libs):
+  1.  TypeORM     (.ts, .js)      — @Entity decorator
+  2.  Sequelize   (.js, .ts)      — class extends Model / .init()
+  3.  GORM        (.go)           — struct with gorm tags / gorm.io import
+  4.  Drizzle     (.ts)           — pgTable / mysqlTable / sqliteTable exports
+  5.  Mongoose    (.js, .ts)      — new mongoose.Schema + mongoose.model(...)
+  6.  SQLAlchemy  (.py)           — class extends Base / db.Model
+  7.  EF Core     (.cs)           — DbContext / DbSet<T> / [Table(
+  8.  Dapper      (.cs)           — connection.Query<T> / connection.Execute
+  9.  Ent ORM     (.go)           — ent.Schema / entgo.io/ent
+  10. Tortoise    (.py)           — tortoise.models / from tortoise
+  11. SQLModel    (.py)           — SQLModel base class
+  12. Exposed     (.kt, .kts)     — object extends *IdTable / Table
+  13. Knex.js     (.js, .ts)      — knex.schema / knex(
+  14. Kysely      (.ts)           — Kysely<T> / from 'kysely'
+  15. Objection.js(.js, .ts)      — class extends Model + static tableName
 
 Public API
 ----------
@@ -27,7 +36,7 @@ from typing import Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-ORM_EXTS: set[str] = {".ts", ".js", ".go", ".py"}
+ORM_EXTS: set[str] = {".ts", ".js", ".go", ".py", ".cs", ".kt", ".kts"}
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -650,6 +659,1075 @@ def _extract_sqlalchemy(content: str, file_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 7. EF Core (C#)
+# ---------------------------------------------------------------------------
+
+_EFCORE_DBCONTEXT_RE = re.compile(
+    r"class\s+(\w+)\s*:\s*(?:IdentityDbContext|DbContext)\b"
+)
+_EFCORE_DBSET_RE = re.compile(
+    r"public\s+DbSet<(\w+)>\s+(\w+)\s*\{"
+)
+_EFCORE_TABLE_RE = re.compile(
+    r'\[Table\s*\(\s*["\']([^"\']+)["\']'
+)
+_EFCORE_CLASS_RE = re.compile(r"class\s+(\w+)\b")
+_EFCORE_KEYATTR_RE = re.compile(r"\[Key\]|\[Column\(|\[ForeignKey\(")
+_EFCORE_MIGRATION_RE = re.compile(
+    r"class\s+(\w+)\s*:\s*Migration\b"
+)
+_EFCORE_HASONE_RE = re.compile(
+    r"HasOne\s*\(.*?=>\s*\w+\.(\w+)\)"
+)
+_EFCORE_HASMANY_RE = re.compile(
+    r"HasMany\s*\(.*?=>\s*\w+\.(\w+)\)"
+)
+_EFCORE_FK_ATTR_RE = re.compile(
+    r'\[ForeignKey\s*\(\s*"(\w+)"\s*\)\]'
+)
+
+
+def _extract_efcore(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # DbContext classes
+    for m in _EFCORE_DBCONTEXT_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "use_case",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["efcore", "dbcontext", "DbContext"],
+            )
+        )
+
+    # DbSet<EntityType> properties  →  model symbol for the entity type
+    for m in _EFCORE_DBSET_RE.finditer(content):
+        entity_type = m.group(1)
+        if entity_type in seen:
+            continue
+        seen.add(entity_type)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                entity_type,
+                "model",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["efcore", "entity"],
+            )
+        )
+
+    # Migration classes
+    for m in _EFCORE_MIGRATION_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "utility",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["efcore", "migration"],
+            )
+        )
+
+    # Entity classes: class with [Key] / [Column( / [ForeignKey( nearby
+    # (scan by finding class declarations and checking the surrounding context)
+    for m in _EFCORE_CLASS_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        # look 300 chars around the class declaration for EF attribute markers
+        ctx_start = max(0, m.start() - 100)
+        ctx_end = min(len(content), m.start() + 300)
+        ctx = content[ctx_start:ctx_end]
+        if not _EFCORE_KEYATTR_RE.search(ctx):
+            continue
+        # also check for [Table( annotation
+        table_m = _EFCORE_TABLE_RE.search(ctx)
+        extra = ["efcore", "entity"]
+        if table_m:
+            extra.append(table_m.group(1).lower())
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=extra,
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 8. Dapper (C#)
+# ---------------------------------------------------------------------------
+
+_DAPPER_QUERY_RE = re.compile(
+    r"connection\.Query(?:Async)?<(\w+)>"
+)
+_DAPPER_QUERY_SINGLE_RE = re.compile(
+    r"connection\.QuerySingle(?:Async)?<(\w+)>"
+)
+_DAPPER_QUERY_FIRST_RE = re.compile(
+    r"connection\.QueryFirst(?:Async)?<(\w+)>"
+)
+_DAPPER_EXECUTE_RE = re.compile(
+    r'connection\.Execute(?:Async)?\s*\(\s*["\']([^"\']+)["\']'
+)
+_DAPPER_ADDHANDLER_RE = re.compile(
+    r"SqlMapper\.AddTypeHandler<(\w+)>"
+)
+_DAPPER_TYPEHANDLER_RE = re.compile(
+    r"class\s+(\w+)\s*:\s*SqlMapper\.TypeHandler<(\w+)>"
+)
+
+
+def _extract_dapper(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # Query<T> / QueryAsync<T> → model for the generic type
+    for pattern in (_DAPPER_QUERY_RE, _DAPPER_QUERY_SINGLE_RE, _DAPPER_QUERY_FIRST_RE):
+        for m in pattern.finditer(content):
+            name = m.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            ln = _line_of(content, m.start())
+            symbols.append(
+                _make_symbol(
+                    file_path,
+                    name,
+                    "model",
+                    ln,
+                    ln,
+                    lines,
+                    confidence="high",
+                    exported=True,
+                    extra_kw=["dapper", "model"],
+                )
+            )
+
+    # Execute("SQL ...") → use_case with truncated SQL as name hint
+    for m in _DAPPER_EXECUTE_RE.finditer(content):
+        sql_hint = m.group(1)[:40].replace("\n", " ").strip()
+        name = f"Execute:{sql_hint}"
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "use_case",
+                ln,
+                ln,
+                lines,
+                confidence="medium",
+                exported=False,
+                extra_kw=["dapper", "execute"],
+            )
+        )
+
+    # SqlMapper.AddTypeHandler<T>
+    for m in _DAPPER_ADDHANDLER_RE.finditer(content):
+        name = f"TypeHandler:{m.group(1)}"
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "hook",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=False,
+                extra_kw=["dapper", "typehandler", m.group(1).lower()],
+            )
+        )
+
+    # class Foo : SqlMapper.TypeHandler<T>
+    for m in _DAPPER_TYPEHANDLER_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "hook",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["dapper", "typehandler", m.group(2).lower()],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 9. Ent ORM (Go)
+# ---------------------------------------------------------------------------
+
+_ENT_SCHEMA_RE = re.compile(
+    r"type\s+(\w+)\s+struct\s*\{[^}]*ent\.Schema[^}]*\}",
+    re.DOTALL,
+)
+_ENT_FIELDS_RE = re.compile(
+    r"func\s*\(\s*\w+\s+(\w+)\s*\)\s*Fields\s*\(\s*\)\s*\[\]ent\.Field"
+)
+_ENT_EDGES_RE = re.compile(
+    r"func\s*\(\s*\w+\s+(\w+)\s*\)\s*Edges\s*\(\s*\)\s*\[\]ent\.Edge"
+)
+_ENT_GENERATE_RE = re.compile(r"entc\.Generate\s*\(")
+_ENT_CLIENT_CREATE_RE = re.compile(r"client\.(\w+)\.Create\s*\(\s*\)")
+_ENT_EDGE_TO_RE = re.compile(r'edge\.To\s*\(\s*"([^"]+)"')
+_ENT_EDGE_FROM_RE = re.compile(r'edge\.From\s*\(\s*"([^"]+)"')
+_ENT_EDGE_THROUGH_RE = re.compile(r'edge\.Through\s*\(\s*"([^"]+)"')
+
+
+def _extract_ent(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # Schema structs: type User struct { ent.Schema }
+    for m in _ENT_SCHEMA_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["ent", "schema"],
+            )
+        )
+
+    # Fields() / Edges() methods → ensure the schema class is registered
+    for pattern in (_ENT_FIELDS_RE, _ENT_EDGES_RE):
+        for m in pattern.finditer(content):
+            name = m.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            ln = _line_of(content, m.start())
+            end = _find_block_end(lines, ln)
+            symbols.append(
+                _make_symbol(
+                    file_path,
+                    name,
+                    "model",
+                    ln,
+                    end,
+                    lines,
+                    confidence="medium",
+                    exported=True,
+                    extra_kw=["ent", "schema"],
+                )
+            )
+
+    # entc.Generate → utility
+    for m in _ENT_GENERATE_RE.finditer(content):
+        name = "entc.Generate"
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "utility",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=False,
+                extra_kw=["ent", "generate"],
+            )
+        )
+
+    # client.EntityName.Create() → use_case
+    for m in _ENT_CLIENT_CREATE_RE.finditer(content):
+        entity = m.group(1)
+        uc_name = f"client.{entity}.Create"
+        if uc_name in seen:
+            continue
+        seen.add(uc_name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                uc_name,
+                "use_case",
+                ln,
+                ln,
+                lines,
+                confidence="medium",
+                exported=False,
+                extra_kw=["ent", "client", entity.lower()],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 10. Tortoise ORM (Python)
+# ---------------------------------------------------------------------------
+
+_TORTOISE_MODEL_RE = re.compile(
+    r"^class\s+(\w+)\s*\(\s*(?:tortoise\.)?Model\s*\)\s*:",
+    re.MULTILINE,
+)
+_TORTOISE_META_TABLE_RE = re.compile(
+    r'class\s+Meta\s*:.*?table\s*=\s*["\']([^"\']+)["\']',
+    re.DOTALL,
+)
+_TORTOISE_REGISTER_RE = re.compile(r"@register_tortoise")
+_TORTOISE_INIT_RE = re.compile(r"Tortoise\.init\s*\(")
+_TORTOISE_FK_RE = re.compile(
+    r'fields\.ForeignKeyField\s*\(\s*["\']([^"\']+)["\']'
+)
+
+
+def _extract_tortoise(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _TORTOISE_MODEL_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        # find block end: scan until unindented class/def
+        end = ln
+        for j in range(ln + 1, min(ln + 200, len(lines))):
+            stripped = lines[j]
+            if stripped and not stripped[0].isspace() and (
+                stripped.startswith("class ") or stripped.startswith("def ")
+            ):
+                end = j - 1
+                break
+            end = j
+        body = "\n".join(lines[ln : end + 1])
+
+        # extract table name from inner Meta class
+        tbl_m = _TORTOISE_META_TABLE_RE.search(body)
+        extra = ["tortoise", "model"]
+        if tbl_m:
+            extra.append(tbl_m.group(1).lower())
+
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=extra,
+            )
+        )
+
+    # @register_tortoise decorator
+    for m in _TORTOISE_REGISTER_RE.finditer(content):
+        if "register_tortoise" in seen:
+            continue
+        seen.add("register_tortoise")
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                "register_tortoise",
+                "utility",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=False,
+                extra_kw=["tortoise", "register"],
+            )
+        )
+
+    # Tortoise.init(...)
+    for m in _TORTOISE_INIT_RE.finditer(content):
+        if "Tortoise.init" in seen:
+            continue
+        seen.add("Tortoise.init")
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                "Tortoise.init",
+                "utility",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=False,
+                extra_kw=["tortoise", "init"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 11. SQLModel (Python)
+# ---------------------------------------------------------------------------
+
+_SQLMODEL_TABLE_RE = re.compile(
+    r"^class\s+(\w+)\s*\(\s*SQLModel\s*,\s*table\s*=\s*True\s*\)\s*:",
+    re.MULTILINE,
+)
+_SQLMODEL_DATA_RE = re.compile(
+    r"^class\s+(\w+)\s*\(\s*SQLModel\s*\)\s*:",
+    re.MULTILINE,
+)
+_SQLMODEL_FK_RE = re.compile(
+    r'Field\s*\([^)]*foreign_key\s*=\s*["\']([^"\']+)["\']'
+)
+_SQLMODEL_REL_RE = re.compile(
+    r'Relationship\s*\([^)]*back_populates\s*=\s*["\']([^"\']+)["\']'
+)
+_SQLMODEL_FK_TABLE_RE = re.compile(
+    r'foreign_key\s*=\s*["\']([^"\'\.]+)\.\w+["\']'
+)
+
+
+def _extract_sqlmodel(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # Table models: class Foo(SQLModel, table=True):
+    for m in _SQLMODEL_TABLE_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = ln
+        for j in range(ln + 1, min(ln + 200, len(lines))):
+            stripped = lines[j]
+            if stripped and not stripped[0].isspace() and (
+                stripped.startswith("class ") or stripped.startswith("def ")
+            ):
+                end = j - 1
+                break
+            end = j
+        body = "\n".join(lines[ln : end + 1])
+
+        # Collect FK fields → hook symbols
+        for fk_m in _SQLMODEL_FK_RE.finditer(body):
+            fk_name = f"{name}.fk_{fk_m.group(1).replace('.', '_')}"
+            if fk_name not in seen:
+                seen.add(fk_name)
+                fk_ln = ln + body[: fk_m.start()].count("\n")
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        fk_name,
+                        "hook",
+                        fk_ln,
+                        fk_ln,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["sqlmodel", "foreign_key"],
+                    )
+                )
+
+        # Relationship(...) → hook symbols
+        for rel_m in _SQLMODEL_REL_RE.finditer(body):
+            rel_name = f"{name}.rel_{rel_m.group(1)}"
+            if rel_name not in seen:
+                seen.add(rel_name)
+                rel_ln = ln + body[: rel_m.start()].count("\n")
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        rel_name,
+                        "hook",
+                        rel_ln,
+                        rel_ln,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["sqlmodel", "relationship"],
+                    )
+                )
+
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["sqlmodel", "table"],
+            )
+        )
+
+    # Data-only models: class Foo(SQLModel):
+    for m in _SQLMODEL_DATA_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = ln
+        for j in range(ln + 1, min(ln + 200, len(lines))):
+            stripped = lines[j]
+            if stripped and not stripped[0].isspace() and (
+                stripped.startswith("class ") or stripped.startswith("def ")
+            ):
+                end = j - 1
+                break
+            end = j
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "utility",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["sqlmodel", "data"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 12. Exposed (Kotlin)
+# ---------------------------------------------------------------------------
+
+_EXPOSED_IDTABLE_RE = re.compile(
+    r"^object\s+(\w+)\s*:\s*(?:Int|Long|UUID)?IdTable(?:<[^>]+>)?\s*\(",
+    re.MULTILINE,
+)
+_EXPOSED_TABLE_RE = re.compile(
+    r"^object\s+(\w+)\s*:\s*Table\s*\(",
+    re.MULTILINE,
+)
+_EXPOSED_REFERENCES_RE = re.compile(
+    r"\.references\s*\(\s*(\w+)\.\w+"
+)
+_EXPOSED_TRANSACTION_RE = re.compile(r"\btransaction\s*\{")
+_EXPOSED_SCHEMA_CREATE_RE = re.compile(
+    r"SchemaUtils\.create\s*\(([^)]+)\)"
+)
+
+
+def _extract_exposed(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # *IdTable objects
+    for m in _EXPOSED_IDTABLE_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["exposed", "table"],
+            )
+        )
+
+    # Simple Table objects
+    for m in _EXPOSED_TABLE_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["exposed", "table"],
+            )
+        )
+
+    # .references(OtherTable.col) → hook
+    for m in _EXPOSED_REFERENCES_RE.finditer(content):
+        target = m.group(1)
+        hook_name = f"references_{target}"
+        if hook_name in seen:
+            continue
+        seen.add(hook_name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                hook_name,
+                "hook",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=False,
+                extra_kw=["exposed", "fk", target.lower()],
+            )
+        )
+
+    # transaction { } → use_case
+    for m in _EXPOSED_TRANSACTION_RE.finditer(content):
+        ln = _line_of(content, m.start())
+        uc_name = f"transaction_L{ln + 1}"
+        if uc_name in seen:
+            continue
+        seen.add(uc_name)
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                uc_name,
+                "use_case",
+                ln,
+                end,
+                lines,
+                confidence="medium",
+                exported=False,
+                extra_kw=["exposed", "transaction"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 13. Knex.js (Node.js)
+# ---------------------------------------------------------------------------
+
+_KNEX_CREATE_TABLE_RE = re.compile(
+    r"\.createTable\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
+)
+_KNEX_ALTER_TABLE_RE = re.compile(
+    r"\.alterTable\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
+)
+_KNEX_QUERY_RE = re.compile(
+    r"knex\s*\(\s*[\"'`]([^\"'`]+)[\"'`]\s*\)"
+)
+_KNEX_MIGRATION_UP_RE = re.compile(
+    r"exports\.up\s*=|export\s+.*?async\s+.*?\bup\b"
+)
+_KNEX_REFERENCES_RE = re.compile(
+    r"\.references\s*\(\s*[\"'`]([^\"'`]+)[\"'`]\s*\)"
+)
+
+
+def _extract_knex(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    for pattern in (_KNEX_CREATE_TABLE_RE, _KNEX_ALTER_TABLE_RE):
+        for m in pattern.finditer(content):
+            name = m.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            ln = _line_of(content, m.start())
+            end = _find_block_end(lines, ln)
+            symbols.append(
+                _make_symbol(
+                    file_path,
+                    name,
+                    "model",
+                    ln,
+                    end,
+                    lines,
+                    confidence="high",
+                    exported=False,
+                    extra_kw=["knex", "table"],
+                )
+            )
+
+    # knex('table') query references
+    for m in _KNEX_QUERY_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                ln,
+                lines,
+                confidence="medium",
+                exported=False,
+                extra_kw=["knex", "query"],
+            )
+        )
+
+    # Migration file → utility
+    if _KNEX_MIGRATION_UP_RE.search(content):
+        name = "migration.up"
+        if name not in seen:
+            seen.add(name)
+            m = _KNEX_MIGRATION_UP_RE.search(content)
+            assert m is not None
+            ln = _line_of(content, m.start())
+            symbols.append(
+                _make_symbol(
+                    file_path,
+                    name,
+                    "utility",
+                    ln,
+                    ln,
+                    lines,
+                    confidence="high",
+                    exported=True,
+                    extra_kw=["knex", "migration"],
+                )
+            )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 14. Kysely (TypeScript)
+# ---------------------------------------------------------------------------
+
+_KYSELY_DB_INTERFACE_RE = re.compile(
+    r"interface\s+(\w+)\s*\{[^}]*:\s*\w+Table\b",
+    re.DOTALL,
+)
+_KYSELY_TABLE_INTERFACE_RE = re.compile(
+    r"interface\s+(\w+)Table\s*\{"
+)
+_KYSELY_TABLE_TYPE_RE = re.compile(
+    r"type\s+(\w+)Table\s*="
+)
+_KYSELY_INSTANCE_RE = re.compile(
+    r"new\s+Kysely<(\w+)>\s*\("
+)
+_KYSELY_MIGRATOR_RE = re.compile(r"new\s+Migrator\s*\(")
+_KYSELY_SELECT_FROM_RE = re.compile(
+    r"\.selectFrom\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
+)
+_KYSELY_INSERT_INTO_RE = re.compile(
+    r"\.insertInto\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
+)
+
+
+def _extract_kysely(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # Database interface (contains *Table fields)
+    for m in _KYSELY_DB_INTERFACE_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "use_case",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["kysely", "database"],
+            )
+        )
+
+    # Table interfaces: interface UserTable { ... }
+    for pattern in (_KYSELY_TABLE_INTERFACE_RE, _KYSELY_TABLE_TYPE_RE):
+        for m in pattern.finditer(content):
+            # strip trailing "Table" from group(1) for the symbol name
+            raw = m.group(1)
+            name = f"{raw}Table"
+            if name in seen:
+                continue
+            seen.add(name)
+            ln = _line_of(content, m.start())
+            end = _find_block_end(lines, ln)
+            symbols.append(
+                _make_symbol(
+                    file_path,
+                    name,
+                    "model",
+                    ln,
+                    end,
+                    lines,
+                    confidence="high",
+                    exported=True,
+                    extra_kw=["kysely", "table", raw.lower()],
+                )
+            )
+
+    # new Kysely<DatabaseType>(...) → use_case
+    for m in _KYSELY_INSTANCE_RE.finditer(content):
+        db_type = m.group(1)
+        uc_name = f"Kysely<{db_type}>"
+        if uc_name in seen:
+            continue
+        seen.add(uc_name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                uc_name,
+                "use_case",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=False,
+                extra_kw=["kysely", "instance", db_type.lower()],
+            )
+        )
+
+    # new Migrator(...) → utility
+    for m in _KYSELY_MIGRATOR_RE.finditer(content):
+        if "Migrator" in seen:
+            continue
+        seen.add("Migrator")
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                "Migrator",
+                "utility",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=False,
+                extra_kw=["kysely", "migrator"],
+            )
+        )
+
+    # .selectFrom('table') / .insertInto('table') → model (table name)
+    for pattern in (_KYSELY_SELECT_FROM_RE, _KYSELY_INSERT_INTO_RE):
+        for m in pattern.finditer(content):
+            name = m.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            ln = _line_of(content, m.start())
+            symbols.append(
+                _make_symbol(
+                    file_path,
+                    name,
+                    "model",
+                    ln,
+                    ln,
+                    lines,
+                    confidence="medium",
+                    exported=False,
+                    extra_kw=["kysely", "table"],
+                )
+            )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 15. Objection.js (Node.js / TypeScript)
+# ---------------------------------------------------------------------------
+
+_OBJECTION_CLASS_RE = re.compile(
+    r"class\s+(\w+)\s+extends\s+(?:\w+\.)?Model\b"
+)
+_OBJECTION_TABLENAME_RE = re.compile(
+    r"static\s+tableName\s*=\s*[\"'`]([^\"'`]+)[\"'`]"
+)
+_OBJECTION_JSONSCHEMA_RE = re.compile(
+    r"static\s+jsonSchema\s*=\s*\{"
+)
+_OBJECTION_RELATIONS_RE = re.compile(
+    r"static\s+(?:get\s+)?relationMappings\s*"
+)
+_OBJECTION_MODELCLASS_RE = re.compile(
+    r"modelClass\s*:\s*(\w+)"
+)
+
+
+def _extract_objection(content: str, file_path: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _OBJECTION_CLASS_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        body = "\n".join(lines[ln : end + 1])
+
+        extra = ["objection", "model"]
+
+        # annotate table name
+        tbl_m = _OBJECTION_TABLENAME_RE.search(body)
+        if tbl_m:
+            extra.append(tbl_m.group(1).lower())
+
+        # jsonSchema → hook
+        if _OBJECTION_JSONSCHEMA_RE.search(body):
+            hook_name = f"{name}.jsonSchema"
+            if hook_name not in seen:
+                seen.add(hook_name)
+                js_m = _OBJECTION_JSONSCHEMA_RE.search(body)
+                assert js_m is not None
+                js_ln = ln + body[: js_m.start()].count("\n")
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        hook_name,
+                        "hook",
+                        js_ln,
+                        js_ln,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["objection", "jsonschema"],
+                    )
+                )
+
+        # relationMappings → hook + extract modelClass references
+        rel_m = _OBJECTION_RELATIONS_RE.search(body)
+        if rel_m:
+            hook_name = f"{name}.relationMappings"
+            if hook_name not in seen:
+                seen.add(hook_name)
+                rel_ln = ln + body[: rel_m.start()].count("\n")
+                rel_end = _find_block_end(lines, rel_ln)
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        hook_name,
+                        "hook",
+                        rel_ln,
+                        rel_end,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["objection", "relations"],
+                    )
+                )
+
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=extra,
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -663,27 +1741,105 @@ def supports_orm(content: str, file_path: str, ext: str) -> bool:
     if ext not in ORM_EXTS:
         return False
 
-    # Quick substring checks (fastest possible)
-    _quick = (
-        "typeorm",
-        "sequelize",
-        "gorm.io/gorm",
-        "jinzhu/gorm",
-        "drizzle-orm",
-        "mongoose",
-        "sqlalchemy",
-        "@Entity",
-        "@Column",
-        "extends Model",
-        "extends db.Model",
-        "pgTable",
-        "mysqlTable",
-        "sqliteTable",
-    )
-    c_lower = content[:4096]  # only scan the top of large files
-    for token in _quick:
-        if token in c_lower:
-            return True
+    c_top = content[:4096]  # only scan the top of large files
+
+    # Quick substring checks (fastest possible) — grouped by extension for speed
+    if ext in (".ts", ".js"):
+        _quick_tsjs = (
+            "typeorm",
+            "sequelize",
+            "drizzle-orm",
+            "mongoose",
+            "@Entity",
+            "@Column",
+            "extends Model",
+            "pgTable",
+            "mysqlTable",
+            "sqliteTable",
+            # Knex
+            "knex.schema",
+            "require('knex')",
+            'require("knex")',
+            "from 'knex'",
+            'from "knex"',
+            # Kysely
+            "Kysely<",
+            "from 'kysely'",
+            'from "kysely"',
+            "new Kysely(",
+            # Objection
+            "static tableName",
+            "relationMappings",
+        )
+        for token in _quick_tsjs:
+            if token in c_top:
+                return True
+        return False
+
+    if ext == ".go":
+        _quick_go = (
+            "gorm.io/gorm",
+            "jinzhu/gorm",
+            # Ent ORM
+            "ent.Schema",
+            "entgo.io/ent",
+            "[]ent.Field",
+            "[]ent.Edge",
+        )
+        for token in _quick_go:
+            if token in c_top:
+                return True
+        return False
+
+    if ext == ".py":
+        _quick_py = (
+            "sqlalchemy",
+            # Tortoise ORM
+            "tortoise.models",
+            "from tortoise",
+            # SQLModel
+            "SQLModel",
+            "from sqlmodel",
+        )
+        for token in _quick_py:
+            if token in c_top:
+                return True
+        return False
+
+    if ext == ".cs":
+        _quick_cs = (
+            # EF Core
+            "DbContext",
+            "DbSet<",
+            "[Table(",
+            "[Key]",
+            "modelBuilder.Entity",
+            # Dapper
+            "connection.Query<",
+            "connection.QueryAsync<",
+            "connection.Execute(",
+            "SqlMapper",
+        )
+        for token in _quick_cs:
+            if token in c_top:
+                return True
+        return False
+
+    if ext in (".kt", ".kts"):
+        _quick_kt = (
+            "IntIdTable",
+            "LongIdTable",
+            "UUIDIdTable",
+            "IdTable",
+            "transaction {",
+            "org.jetbrains.exposed",
+            "SchemaUtils",
+        )
+        for token in _quick_kt:
+            if token in c_top:
+                return True
+        return False
+
     return False
 
 
@@ -700,24 +1856,118 @@ def extract_orm_symbols(content: str, file_path: str, ext: str) -> list[dict]:
             symbols.extend(_extract_typeorm(content, file_path))
 
         # Sequelize: needs extends Model or .init( with DataTypes
-        if "sequelize" in content.lower() or "extends Model" in content:
+        # Disambiguation: skip if this is clearly Objection (static tableName) or
+        # Kysely — Sequelize-style .init() with DataTypes is the key indicator
+        if "sequelize" in content.lower() or (
+            "extends Model" in content and "DataTypes" in content
+        ):
             symbols.extend(_extract_sequelize(content, file_path))
 
         # Drizzle
-        if "drizzle-orm" in content or "pgTable" in content or "mysqlTable" in content or "sqliteTable" in content:
+        if (
+            "drizzle-orm" in content
+            or "pgTable" in content
+            or "mysqlTable" in content
+            or "sqliteTable" in content
+        ):
             symbols.extend(_extract_drizzle(content, file_path))
 
         # Mongoose
         if "mongoose" in content:
             symbols.extend(_extract_mongoose(content, file_path))
 
+        # Knex.js — disambiguation from Kysely: Knex uses knex.schema.createTable
+        # (not Kysely<) and from 'knex'
+        if (
+            "knex.schema" in content
+            or "require('knex')" in content
+            or 'require("knex")' in content
+            or "from 'knex'" in content
+            or 'from "knex"' in content
+        ) and "Kysely<" not in content:
+            symbols.extend(_extract_knex(content, file_path))
+
+        # Kysely — .ts only (strongly typed)
+        if ext == ".ts" and (
+            "Kysely<" in content
+            or "from 'kysely'" in content
+            or 'from "kysely"' in content
+            or "new Kysely(" in content
+        ):
+            symbols.extend(_extract_kysely(content, file_path))
+
+        # Objection.js — disambiguation from Sequelize: uses static tableName, not .init()
+        if "extends Model" in content and (
+            "static tableName" in content
+            or "static get relationMappings" in content
+            or "static relationMappings" in content
+        ):
+            symbols.extend(_extract_objection(content, file_path))
+
     elif ext == ".go":
+        # GORM
         if "gorm" in content:
             symbols.extend(_extract_gorm(content, file_path))
 
+        # Ent ORM
+        if (
+            "ent.Schema" in content
+            or "entgo.io/ent" in content
+            or "[]ent.Field" in content
+            or "[]ent.Edge" in content
+        ):
+            symbols.extend(_extract_ent(content, file_path))
+
     elif ext == ".py":
-        if "sqlalchemy" in content.lower():
+        # SQLAlchemy — run first; SQLModel imports sqlmodel not sqlalchemy
+        if "sqlalchemy" in content.lower() and "sqlmodel" not in content.lower():
             symbols.extend(_extract_sqlalchemy(content, file_path))
+
+        # SQLModel — must have SQLModel in class declaration
+        if "SQLModel" in content and (
+            "from sqlmodel" in content
+            or "import sqlmodel" in content
+        ):
+            symbols.extend(_extract_sqlmodel(content, file_path))
+
+        # Tortoise ORM
+        if "tortoise" in content.lower() and (
+            "tortoise.models" in content
+            or "from tortoise" in content
+        ):
+            symbols.extend(_extract_tortoise(content, file_path))
+
+    elif ext == ".cs":
+        # EF Core
+        if (
+            "DbContext" in content
+            or "DbSet<" in content
+            or "[Table(" in content
+            or "[Key]" in content
+            or "modelBuilder.Entity" in content
+        ):
+            symbols.extend(_extract_efcore(content, file_path))
+
+        # Dapper — can coexist with EF Core
+        if (
+            "connection.Query<" in content
+            or "connection.QueryAsync<" in content
+            or "connection.Execute(" in content
+            or "SqlMapper" in content
+        ):
+            symbols.extend(_extract_dapper(content, file_path))
+
+    elif ext in (".kt", ".kts"):
+        # Exposed ORM — disambiguation from JPA: Exposed uses object extends *IdTable/Table
+        if (
+            "IntIdTable" in content
+            or "LongIdTable" in content
+            or "UUIDIdTable" in content
+            or "IdTable" in content
+            or "transaction {" in content
+            or "org.jetbrains.exposed" in content
+        ):
+            symbols.extend(_extract_exposed(content, file_path))
 
     # Deduplicate by id (in case two extractors overlap on a generic file)
     seen_ids: set[str] = set()
@@ -792,6 +2042,28 @@ def parse_orm_imports(content: str, file_id: str, ext: str) -> list[dict]:
                 }
             )
 
+        # Knex.js: .references('other_table')
+        for m in _KNEX_REFERENCES_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "references",
+                    "orm": "knex",
+                }
+            )
+
+        # Objection.js: modelClass: OtherModel inside relationMappings
+        for m in _OBJECTION_MODELCLASS_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "references",
+                    "orm": "objection",
+                }
+            )
+
     elif ext == ".py":
         # SQLAlchemy: relationship('OtherModel')
         for m in _SA_RELATIONSHIP_RE.finditer(content):
@@ -803,6 +2075,91 @@ def parse_orm_imports(content: str, file_id: str, ext: str) -> list[dict]:
                     "orm": "sqlalchemy",
                 }
             )
+
+        # Tortoise ORM: ForeignKeyField('app.ModelName')
+        for m in _TORTOISE_FK_RE.finditer(content):
+            # 'app.ModelName' → extract model part after dot if present
+            ref = m.group(1)
+            target = ref.split(".")[-1] if "." in ref else ref
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": target,
+                    "edge_type": "references",
+                    "orm": "tortoise",
+                }
+            )
+
+        # SQLModel: foreign_key='table.column' → extract table part
+        for m in _SQLMODEL_FK_TABLE_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "references",
+                    "orm": "sqlmodel",
+                }
+            )
+
+    elif ext == ".cs":
+        # EF Core: HasOne/HasMany fluent API
+        for m in _EFCORE_HASONE_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "references",
+                    "orm": "efcore",
+                }
+            )
+        for m in _EFCORE_HASMANY_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "references",
+                    "orm": "efcore",
+                }
+            )
+        # EF Core: [ForeignKey("PropertyName")]
+        for m in _EFCORE_FK_ATTR_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "references",
+                    "orm": "efcore",
+                }
+            )
+
+    elif ext in (".kt", ".kts"):
+        # Exposed: .references(OtherTable.col)
+        for m in _EXPOSED_REFERENCES_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "references",
+                    "orm": "exposed",
+                }
+            )
+
+    elif ext == ".go":
+        # Ent ORM: edge.To / edge.From / edge.Through
+        for pattern, orm_label in (
+            (_ENT_EDGE_TO_RE, "ent"),
+            (_ENT_EDGE_FROM_RE, "ent"),
+            (_ENT_EDGE_THROUGH_RE, "ent"),
+        ):
+            for m in pattern.finditer(content):
+                edges.append(
+                    {
+                        "source": file_id,
+                        "target_name": m.group(1),
+                        "edge_type": "references",
+                        "orm": orm_label,
+                    }
+                )
 
     return edges
 
@@ -910,5 +2267,160 @@ class Article(Base):
         s["name"] == "Article" and s["symbol_type"] == "model" for s in syms
     ), f"No Article: {syms}"
     print("PASS  SQLAlchemy")
+
+    # ── Test 7: EF Core ───────────────────────────────────────────────────────
+    cs_efcore = """
+using Microsoft.EntityFrameworkCore;
+public class AppDbContext : DbContext {
+    public DbSet<User> Users { get; set; }
+    public DbSet<Order> Orders { get; set; }
+}
+public class User { [Key] public int Id { get; set; } }
+"""
+    syms = extract_orm_symbols(cs_efcore, "Data/AppDbContext.cs", ".cs")
+    assert any(
+        s["name"] == "AppDbContext" and "dbcontext" in s.get("keywords", [])
+        for s in syms
+    ), f"EF Core DbContext: {syms}"
+    assert any(s["name"] == "User" for s in syms), f"EF Core entity: {syms}"
+    print("PASS  EF Core")
+
+    # ── Test 8: Dapper ────────────────────────────────────────────────────────
+    cs_dapper = """
+using Dapper;
+public class UserRepository {
+    public IEnumerable<User> GetAll(IDbConnection connection) {
+        return connection.Query<User>("SELECT * FROM users");
+    }
+    public void Create(IDbConnection connection) {
+        connection.Execute("INSERT INTO users (name) VALUES (@Name)", new { Name = "test" });
+    }
+}
+"""
+    syms = extract_orm_symbols(cs_dapper, "Repos/UserRepository.cs", ".cs")
+    assert any(s["name"] == "User" and s["symbol_type"] == "model" for s in syms), f"Dapper model: {syms}"
+    print("PASS  Dapper")
+
+    # ── Test 9: Ent ORM ───────────────────────────────────────────────────────
+    go_ent = """
+package schema
+import "entgo.io/ent"
+type User struct { ent.Schema }
+func (User) Fields() []ent.Field { return []ent.Field{} }
+func (User) Edges() []ent.Edge { return []ent.Edge{} }
+"""
+    syms = extract_orm_symbols(go_ent, "ent/schema/user.go", ".go")
+    assert any(s["name"] == "User" for s in syms), f"Ent schema: {syms}"
+    print("PASS  Ent ORM")
+
+    # ── Test 10: Tortoise ORM ─────────────────────────────────────────────────
+    py_tortoise = """
+from tortoise import fields
+from tortoise.models import Model
+
+class Tournament(Model):
+    id = fields.IntField(pk=True)
+    name = fields.TextField()
+
+    class Meta:
+        table = "tournament"
+
+class Event(Model):
+    tournament = fields.ForeignKeyField('models.Tournament', related_name='events')
+"""
+    syms = extract_orm_symbols(py_tortoise, "models/tournament.py", ".py")
+    assert any(s["name"] == "Tournament" for s in syms), f"Tortoise model: {syms}"
+    assert any(s["name"] == "Event" for s in syms), f"Tortoise Event model: {syms}"
+    print("PASS  Tortoise ORM")
+
+    # ── Test 11: SQLModel ─────────────────────────────────────────────────────
+    py_sqlmodel = """
+from sqlmodel import SQLModel, Field, Relationship
+from typing import Optional
+
+class Hero(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    team_id: Optional[int] = Field(default=None, foreign_key="team.id")
+    team: Optional["Team"] = Relationship(back_populates="heroes")
+
+class HeroCreate(SQLModel):
+    name: str
+"""
+    syms = extract_orm_symbols(py_sqlmodel, "app/models.py", ".py")
+    assert any(
+        s["name"] == "Hero" and s["symbol_type"] == "model" for s in syms
+    ), f"SQLModel table: {syms}"
+    assert any(
+        s["name"] == "HeroCreate" and s["symbol_type"] == "utility" for s in syms
+    ), f"SQLModel data: {syms}"
+    print("PASS  SQLModel")
+
+    # ── Test 12: Exposed (Kotlin) ─────────────────────────────────────────────
+    kt_exposed = """
+object Users : IntIdTable() {
+    val name = varchar("name", 50)
+    val email = varchar("email", 100).uniqueIndex()
+}
+object Orders : Table() {
+    val userId = integer("user_id").references(Users.id)
+}
+"""
+    syms = extract_orm_symbols(kt_exposed, "db/Tables.kt", ".kt")
+    assert any(s["name"] == "Users" for s in syms), f"Exposed table: {syms}"
+    assert any(s["name"] == "Orders" for s in syms), f"Exposed Orders: {syms}"
+    print("PASS  Exposed ORM")
+
+    # ── Test 13: Knex.js ──────────────────────────────────────────────────────
+    js_knex = """
+const knex = require('knex')({ client: 'pg' })
+exports.up = function(knex) {
+    return knex.schema.createTable('users', function(table) {
+        table.increments('id')
+        table.string('name')
+    })
+}
+exports.down = function(knex) {
+    return knex.schema.dropTable('users')
+}
+"""
+    syms = extract_orm_symbols(js_knex, "migrations/001_users.js", ".js")
+    assert any(s["name"] == "users" for s in syms), f"Knex createTable: {syms}"
+    print("PASS  Knex.js")
+
+    # ── Test 14: Kysely ───────────────────────────────────────────────────────
+    ts_kysely = """
+import { Kysely, PostgresDialect } from 'kysely'
+interface Database { users: UserTable; orders: OrderTable }
+interface UserTable { id: number; name: string }
+interface OrderTable { id: number; userId: number }
+const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) })
+db.selectFrom('users').select(['id', 'name'])
+"""
+    syms = extract_orm_symbols(ts_kysely, "src/db.ts", ".ts")
+    assert any(
+        s["name"] == "Database" or "UserTable" in s["name"] for s in syms
+    ), f"Kysely: {syms}"
+    print("PASS  Kysely")
+
+    # ── Test 15: Objection.js ─────────────────────────────────────────────────
+    js_objection = """
+const { Model } = require('objection')
+class User extends Model {
+    static tableName = 'users'
+    static get relationMappings() {
+        return {
+            orders: {
+                relation: Model.HasManyRelation,
+                modelClass: Order,
+                join: { from: 'users.id', to: 'orders.user_id' }
+            }
+        }
+    }
+}
+"""
+    syms = extract_orm_symbols(js_objection, "models/User.js", ".js")
+    assert any(s["name"] == "User" for s in syms), f"Objection model: {syms}"
+    print("PASS  Objection.js")
 
     print("\nALL ORM TESTS PASSED")
