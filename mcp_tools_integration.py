@@ -65,7 +65,7 @@ _TOOL_GRAPH: dict[str, dict] = {
         "connection refused|too many connections|pool exhausted|connection timeout|pgbouncer|hikari|connection exhaustion": [
             "graph_connection_pool_misconfigs", "graph_config_misconfigs", "graph_health_checks",
         ],
-        "messages lost|data loss|events dropped|kafka|consumer crash": [
+        "messages lost|data loss|events dropped|kafka|consumer crash|silently dropped|not fulfilled|orders lost": [
             "graph_config_misconfigs", "graph_idempotency_gaps",
         ],
         "slow|latency|p99|timeout|hanging": [
@@ -74,7 +74,7 @@ _TOOL_GRAPH: dict[str, dict] = {
         "secret|api key|token|credential|password.*log": [
             "graph_log_secret_leakage", "graph_scan_secrets",
         ],
-        "health check|readiness|liveness|pod restart|CrashLoopBackOff": [
+        "health check|readiness|liveness|pod restart|CrashLoopBackOff|stale 200|traffic to pod|not ready": [
             "graph_health_checks", "graph_goroutine_leaks", "graph_resource_leaks",
         ],
         "thundering herd|cache miss|cache cold|stampede|redis restart|cache restart|db overload": [
