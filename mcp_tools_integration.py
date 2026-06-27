@@ -1628,6 +1628,48 @@ def register_all_new_tools(
         return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
 
     @mcp.tool()
+    def graph_connection_pool_misconfigs() -> dict[str, Any]:
+        """Detect database connection pools misconfigured for production (no max, unlimited size)."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_connection_pool_misconfigs as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_rule: dict[str, int] = {}
+        for f in findings:
+            r = f.get("rule_id", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+
+    @mcp.tool()
+    def graph_health_checks() -> dict[str, Any]:
+        """Find missing health endpoints and Kubernetes Deployments without readinessProbe."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_missing_health_checks as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "total": len(findings), "findings": findings}
+
+    @mcp.tool()
     def graph_unsafe_migrations() -> dict[str, Any]:
         """Find ALTER TABLE without online DDL markers, missing lock timeouts, DROP in app code."""
         graph_json = get_dg_data_dir() / "info_graph.json"

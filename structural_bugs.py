@@ -3007,6 +3007,405 @@ def find_unsafe_migrations(graph: dict, project_root: str) -> list[dict]:  # noq
 
 
 # ---------------------------------------------------------------------------
+# Phase 26 — Connection Pool Misconfiguration
+# ---------------------------------------------------------------------------
+
+# POOL-001: Go — sql.Open without SetMaxOpenConns
+_GO_SQL_OPEN_RE        = re.compile(r"\bsql\.Open\s*\(")
+_GO_CONN_LIFETIME_RE   = re.compile(r"\bSetConnMaxLifetime\s*\(")
+_GO_MAX_OPEN_RE        = re.compile(r"\bSetMaxOpenConns\s*\(")
+_GO_SQLX_OPEN_RE       = re.compile(r"\bsqlx\.Open\s*\(")
+_GO_DB_DOT_RE          = re.compile(r"\bdb\.")
+
+# POOL-002: Python SQLAlchemy — create_engine without pool_size
+_PY_CREATE_ENGINE_RE   = re.compile(r"\bcreate_engine\s*\(")
+_PY_POOL_SIZE_RE       = re.compile(r"\bpool_size\s*=")
+_PY_POOL_CLASS_RE      = re.compile(r"\bpool_class\s*=")
+_PY_NULL_POOL_RE       = re.compile(r"\bNullPool\b")
+_PY_STATIC_POOL_RE     = re.compile(r"\bStaticPool\b")
+_PY_POOL_SIZE_ZERO_RE  = re.compile(r"\bpool_size\s*=\s*0\b")
+
+# POOL-003: Node.js pg Pool / mysql2 createPool without max / connectionLimit
+_JS_PG_POOL_RE         = re.compile(r"\bnew\s+Pool\s*\(\s*\{")
+_JS_PG_MAX_RE          = re.compile(r"\bmax\s*:")
+_JS_MYSQL_POOL_RE      = re.compile(r"\bcreatePool\s*\(\s*\{")
+_JS_CONN_LIMIT_RE      = re.compile(r"\bconnectionLimit\s*:")
+
+# POOL-004: Go — hardcoded connection string (not os.Getenv)
+_GO_HARDCODED_DSN_RE   = re.compile(
+    r'sql\.Open\s*\(\s*["\'](?:postgres|mysql|sqlite3|pgx)["\'],\s*["\'](?:host=|[^"\']*://)',
+)
+_GO_GETENV_RE          = re.compile(r"\bos\.Getenv\s*\(")
+
+# POOL-005: Python psycopg2 pool with maxconn=1
+_PY_PSYCOPG2_POOL_RE   = re.compile(
+    r"psycopg2\.pool\.(?:Simple|Threaded)ConnectionPool\s*\("
+)
+
+
+def find_connection_pool_misconfigs(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect database connection pool configurations that will cause exhaustion under load.
+
+    Rule IDs: POOL-001 through POOL-005.
+
+    Returns
+    -------
+    list[dict] with type="connection_pool_misconfig".
+    """
+    issues: list[dict] = []
+    root = Path(project_root)
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext   = fpath.suffix.lower()
+            rel   = str(fpath.relative_to(root))
+
+            # ── Go checks (POOL-001, POOL-004) ────────────────────────────────
+            if ext == ".go":
+                # Skip test files
+                if fname.endswith("_test.go"):
+                    continue
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+
+                # POOL-001: sql.Open or SetConnMaxLifetime present, but no SetMaxOpenConns
+                has_sql_open      = bool(_GO_SQL_OPEN_RE.search(content))
+                has_conn_lifetime = bool(_GO_CONN_LIFETIME_RE.search(content))
+                has_max_open      = bool(_GO_MAX_OPEN_RE.search(content))
+                has_sqlx          = bool(_GO_SQLX_OPEN_RE.search(content))
+                has_db_calls      = bool(_GO_DB_DOT_RE.search(content))
+
+                if (has_sql_open or has_conn_lifetime) and not has_max_open:
+                    # Exclude: sqlx.Open without any db. calls after
+                    if has_sqlx and not has_db_calls:
+                        pass
+                    else:
+                        # Find the line of sql.Open or SetConnMaxLifetime
+                        trigger = _GO_SQL_OPEN_RE.search(content) or _GO_CONN_LIFETIME_RE.search(content)
+                        line_no = content[:trigger.start()].count("\n") + 1 if trigger else 1
+                        lines   = content.splitlines()
+                        snippet = lines[line_no - 1].strip()[:80] if line_no <= len(lines) else ""
+                        issues.append({
+                            "type": "connection_pool_misconfig",
+                            "rule_id": "POOL-001",
+                            "severity": "high",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "database/sql opened without SetMaxOpenConns "
+                                "— pool size defaults to unlimited"
+                            ),
+                            "snippet": snippet,
+                            "fix": "Call db.SetMaxOpenConns(N) after sql.Open to cap the pool size.",
+                        })
+
+                # POOL-004: hardcoded connection string (not os.Getenv)
+                for m in _GO_HARDCODED_DSN_RE.finditer(content):
+                    # Check that the connection string arg is not os.Getenv(...)
+                    # The match itself captures the raw string literal — that's proof enough
+                    line_no = content[:m.start()].count("\n") + 1
+                    lines   = content.splitlines()
+                    snippet = lines[line_no - 1].strip()[:80] if line_no <= len(lines) else m.group(0)
+                    issues.append({
+                        "type": "connection_pool_misconfig",
+                        "rule_id": "POOL-004",
+                        "severity": "medium",
+                        "file": rel,
+                        "line": line_no,
+                        "message": "Hardcoded database connection string (use env var)",
+                        "snippet": snippet,
+                        "fix": "Replace the inline DSN with os.Getenv(\"DATABASE_URL\").",
+                    })
+
+            # ── Python checks (POOL-002, POOL-005) ───────────────────────────
+            elif ext == ".py":
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                lines_list = content.splitlines()
+
+                # POOL-002: create_engine without pool_size (and not NullPool/StaticPool)
+                for m in _PY_CREATE_ENGINE_RE.finditer(content):
+                    line_no = content[:m.start()].count("\n") + 1
+                    # Look at the same line and the next 5 lines for pool_size / pool_class
+                    end_line = min(len(lines_list), line_no + 5)
+                    window   = "\n".join(lines_list[line_no - 1: end_line])
+
+                    if _PY_NULL_POOL_RE.search(window):
+                        continue
+                    if _PY_STATIC_POOL_RE.search(window):
+                        continue
+                    if _PY_POOL_CLASS_RE.search(window):
+                        continue
+
+                    # pool_size=0 → flag (zero means unlimited in some drivers)
+                    if _PY_POOL_SIZE_ZERO_RE.search(window):
+                        snippet = lines_list[line_no - 1].strip()[:80]
+                        issues.append({
+                            "type": "connection_pool_misconfig",
+                            "rule_id": "POOL-002",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "SQLAlchemy create_engine without pool_size "
+                                "— defaults to 5 connections"
+                            ),
+                            "snippet": snippet,
+                            "fix": "Set pool_size= to a positive integer in create_engine().",
+                        })
+                        continue
+
+                    if not _PY_POOL_SIZE_RE.search(window):
+                        snippet = lines_list[line_no - 1].strip()[:80]
+                        issues.append({
+                            "type": "connection_pool_misconfig",
+                            "rule_id": "POOL-002",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "SQLAlchemy create_engine without pool_size "
+                                "— defaults to 5 connections"
+                            ),
+                            "snippet": snippet,
+                            "fix": "Add pool_size=N (e.g. pool_size=10) to create_engine().",
+                        })
+
+                # POOL-005: psycopg2.pool.SimpleConnectionPool/ThreadedConnectionPool with maxconn=1
+                for m in _PY_PSYCOPG2_POOL_RE.finditer(content):
+                    line_no = content[:m.start()].count("\n") + 1
+                    snippet = lines_list[line_no - 1].strip()[:80] if line_no <= len(lines_list) else m.group(0)
+                    # Extract the args: SimpleConnectionPool(minconn, maxconn, ...)
+                    # Look for pattern like (1, 1, or (1,1,
+                    call_end = content.find(")", m.end())
+                    call_text = content[m.end(): call_end + 1] if call_end > m.end() else ""
+                    arg_m = re.match(r"\s*(\d+)\s*,\s*(\d+)", call_text)
+                    if arg_m:
+                        minconn = int(arg_m.group(1))
+                        maxconn = int(arg_m.group(2))
+                        if maxconn <= 1:
+                            issues.append({
+                                "type": "connection_pool_misconfig",
+                                "rule_id": "POOL-005",
+                                "severity": "low",
+                                "file": rel,
+                                "line": line_no,
+                                "message": (
+                                    "Connection pool maxconn=1 won't scale under concurrent requests"
+                                ),
+                                "snippet": snippet,
+                                "fix": "Increase maxconn to match expected concurrent DB connections (e.g. 10-20).",
+                            })
+
+            # ── JS/TS checks (POOL-003) ────────────────────────────────────────
+            elif ext in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                lines_list = content.splitlines()
+
+                # new Pool({ without max: within next 10 lines
+                for m in _JS_PG_POOL_RE.finditer(content):
+                    line_no = content[:m.start()].count("\n") + 1
+                    end_line = min(len(lines_list), line_no + 10)
+                    window   = "\n".join(lines_list[line_no - 1: end_line])
+                    if not _JS_PG_MAX_RE.search(window):
+                        snippet = lines_list[line_no - 1].strip()[:80]
+                        issues.append({
+                            "type": "connection_pool_misconfig",
+                            "rule_id": "POOL-003",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "pg Pool created without max — defaults to 10 connections"
+                            ),
+                            "snippet": snippet,
+                            "fix": "Add max: N to the Pool config object (e.g. max: 20).",
+                        })
+
+                # createPool({ without connectionLimit: within next 10 lines
+                for m in _JS_MYSQL_POOL_RE.finditer(content):
+                    line_no = content[:m.start()].count("\n") + 1
+                    end_line = min(len(lines_list), line_no + 10)
+                    window   = "\n".join(lines_list[line_no - 1: end_line])
+                    if not _JS_CONN_LIMIT_RE.search(window):
+                        snippet = lines_list[line_no - 1].strip()[:80]
+                        issues.append({
+                            "type": "connection_pool_misconfig",
+                            "rule_id": "POOL-003",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "pg Pool created without max — defaults to 10 connections"
+                            ),
+                            "snippet": snippet,
+                            "fix": "Add connectionLimit: N to the createPool config object.",
+                        })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# Phase 27 — Missing Health Checks
+# ---------------------------------------------------------------------------
+
+# HTTP framework detection patterns
+_HTTP_FRAMEWORK_RE = re.compile(
+    r"\b(?:express|fastapi|gin|echo|actix|flask|django|fiber|spring)\b",
+    re.IGNORECASE,
+)
+
+# Health check route string literals
+_HEALTH_ROUTE_STRINGS = re.compile(
+    r"""['"/](?:_health|health(?:z)?|ping|ready|live|status|api/health)['"/ ]""",
+    re.IGNORECASE,
+)
+
+# Kubernetes Deployment kind
+_K8S_DEPLOYMENT_RE   = re.compile(r"^kind\s*:\s*Deployment\b", re.MULTILINE)
+# Container definition marker in K8s spec
+_K8S_CONTAINERS_RE   = re.compile(r"^\s{0,12}containers\s*:", re.MULTILINE)
+# Probe presence
+_K8S_READINESS_RE    = re.compile(r"\breadinessProbe\s*:")
+_K8S_LIVENESS_RE     = re.compile(r"\blivenessProbe\s*:")
+
+_HTTP_FW_EXTS = {".py", ".go", ".js", ".ts", ".java", ".rs"}
+
+
+def find_missing_health_checks(graph: dict, project_root: str) -> list[dict]:
+    """Detect missing health check endpoints and missing K8s readiness/liveness probes.
+
+    Rule IDs: HLTH-001, HLTH-002.
+
+    Returns
+    -------
+    list[dict] with type="missing_health_check".
+    """
+    issues: list[dict] = []
+    root = Path(project_root)
+
+    # ── HLTH-001: project-level check ─────────────────────────────────────────
+    has_http_framework = False
+    has_health_route   = False
+
+    # Check graph nodes for route_path attributes first (fast path)
+    for node in graph.get("nodes", []):
+        route = node.get("route_path", "") or node.get("path", "")
+        if route and _HEALTH_ROUTE_STRINGS.search(f'"{route}"'):
+            has_health_route = True
+            break
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        if has_health_route:
+            break
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext   = fpath.suffix.lower()
+            if ext not in _HTTP_FW_EXTS:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if not has_http_framework and _HTTP_FRAMEWORK_RE.search(content):
+                has_http_framework = True
+            if _HEALTH_ROUTE_STRINGS.search(content):
+                has_health_route = True
+                break
+
+    if has_http_framework and not has_health_route:
+        issues.append({
+            "type": "missing_health_check",
+            "rule_id": "HLTH-001",
+            "severity": "medium",
+            "file": "project-level",
+            "line": 0,
+            "message": (
+                "No health check endpoint found (/health, /healthz, /ping)"
+            ),
+            "fix": (
+                "Add a GET /health (or /healthz, /ping) endpoint that returns HTTP 200 "
+                "so load balancers and orchestrators can verify the service is alive."
+            ),
+        })
+
+    # ── HLTH-002: K8s Deployment without readinessProbe / livenessProbe ───────
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext   = fpath.suffix.lower()
+            if ext not in {".yaml", ".yml"}:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            if not _K8S_DEPLOYMENT_RE.search(content):
+                continue
+
+            rel = str(fpath.relative_to(root))
+
+            # Find the containers: section and check 50 lines after it
+            containers_m = _K8S_CONTAINERS_RE.search(content)
+            if containers_m:
+                container_start = containers_m.start()
+                # Scan up to 50 lines after containers: for probes
+                lines_list = content.splitlines()
+                container_line = content[:container_start].count("\n")
+                end_line = min(len(lines_list), container_line + 50)
+                window   = "\n".join(lines_list[container_line: end_line])
+            else:
+                window = content
+
+            if not _K8S_READINESS_RE.search(window):
+                line_no = content[:containers_m.start()].count("\n") + 1 if containers_m else 1
+                issues.append({
+                    "type": "missing_health_check",
+                    "rule_id": "HLTH-002",
+                    "severity": "medium",
+                    "file": rel,
+                    "line": line_no,
+                    "message": (
+                        "Kubernetes Deployment without readinessProbe "
+                        "— pod receives traffic before ready"
+                    ),
+                    "fix": (
+                        "Add a readinessProbe (httpGet /health or exec) to the container spec "
+                        "so Kubernetes withholds traffic until the pod passes the probe."
+                    ),
+                })
+
+            if not _K8S_LIVENESS_RE.search(window):
+                line_no = content[:containers_m.start()].count("\n") + 1 if containers_m else 1
+                issues.append({
+                    "type": "missing_health_check",
+                    "rule_id": "HLTH-002",
+                    "severity": "medium",
+                    "file": rel,
+                    "line": line_no,
+                    "message": (
+                        "Kubernetes Deployment without livenessProbe "
+                        "— stuck pods are never restarted automatically"
+                    ),
+                    "fix": (
+                        "Add a livenessProbe (httpGet /health or exec) to the container spec "
+                        "so Kubernetes can restart pods that become unresponsive."
+                    ),
+                })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + health summary
 # ---------------------------------------------------------------------------
 
@@ -3042,6 +3441,8 @@ def run_all_checks(graph: dict, project_root: str) -> dict:
         ("idempotency_gaps",       lambda: find_idempotency_gaps(graph, project_root)),
         ("resource_leaks",         lambda: find_resource_leaks(graph, project_root)),
         ("unsafe_migrations",      lambda: find_unsafe_migrations(graph, project_root)),
+        ("connection_pool_misconfigs", lambda: find_connection_pool_misconfigs(graph, project_root)),
+        ("missing_health_checks",  lambda: find_missing_health_checks(graph, project_root)),
     ]
 
     all_issues: list[dict] = []
@@ -3139,6 +3540,13 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     penalty += min(10, leak_findings * 2)             # -2 each, cap -10
     penalty += min(12, migr_findings * 3)             # -3 each, cap -12
 
+    # Checks 18-19 penalties
+    pool_findings   = len([i for i in report["issues"] if i.get("type") == "connection_pool_misconfig"])
+    health_findings = len([i for i in report["issues"] if i.get("type") == "missing_health_check"])
+
+    penalty += min(12, pool_findings   * 3)   # -3 each, cap -12
+    penalty += min(8,  health_findings * 4)   # -4 each, cap -8
+
     score   = max(0, 100 - penalty)
 
     if score >= 90:
@@ -3152,8 +3560,8 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     else:
         grade = "F"
 
-    # Total checks = 17 functional checks
-    total_checks  = 17
+    # Total checks = 19 functional checks
+    total_checks  = 19
     checks_failed = min(
         total_checks,
         (1 if n_critical else 0) + (1 if n_high else 0) +
@@ -3214,6 +3622,16 @@ def graph_resource_leaks_tool(project_root: str) -> dict:
 
 def graph_unsafe_migrations_tool(project_root: str) -> dict:
     findings = find_unsafe_migrations({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_pool_misconfigs_tool(project_root: str) -> dict:
+    findings = find_connection_pool_misconfigs({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_health_checks_tool(project_root: str) -> dict:
+    findings = find_missing_health_checks({}, project_root)
     return {"ok": True, "total": len(findings), "findings": findings}
 
 
@@ -3396,11 +3814,11 @@ def _test_new_structural_2():
         f"MIGR-004 should flag admin.py, got: {migr004_files}"
     print("[PASS] MIGR-004: TRUNCATE in application code flagged")
 
-    # ── Verify total_checks updated to 17 in get_health_summary ──────────────
+    # ── Verify total_checks in get_health_summary ─────────────────────────────
     summary = get_health_summary({}, tmpdir)
-    assert summary["checks_passed"] + summary["checks_failed"] == 17, \
-        f"Expected total_checks=17, got {summary['checks_passed'] + summary['checks_failed']}"
-    print("[PASS] get_health_summary: total_checks == 17")
+    assert summary["checks_passed"] + summary["checks_failed"] == 19, \
+        f"Expected total_checks=19, got {summary['checks_passed'] + summary['checks_failed']}"
+    print("[PASS] get_health_summary: total_checks == 19")
 
     # ── Verify MCP stubs return correct shape ─────────────────────────────────
     result = graph_idempotency_gaps_tool(tmpdir)
@@ -3415,6 +3833,91 @@ def _test_new_structural_2():
     print("[PASS] MCP export stubs return correct shape")
 
     print("\n=== All _test_new_structural_2 tests PASSED ===")
+
+
+def _test_new_structural_3():
+    import tempfile, os
+
+    # ── POOL-001: Go sql.Open without SetMaxOpenConns ─────────────────────────
+    go_bad  = 'import "database/sql"\ndb, err := sql.Open("postgres", dsn)\ndb.SetConnMaxLifetime(time.Minute)\n'
+    go_good = 'import "database/sql"\ndb, err := sql.Open("postgres", dsn)\ndb.SetMaxOpenConns(25)\n'
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "db.go")
+        open(f, "w").write(go_bad)
+        r = find_connection_pool_misconfigs({}, d)
+        assert any(x["rule_id"] == "POOL-001" for x in r), f"POOL-001 not flagged: {r}"
+        print("[PASS] POOL-001: flagged when SetMaxOpenConns absent")
+        open(f, "w").write(go_good)
+        r2 = find_connection_pool_misconfigs({}, d)
+        assert not any(x["rule_id"] == "POOL-001" for x in r2), f"POOL-001 false positive: {r2}"
+        print("[PASS] POOL-001: not flagged when SetMaxOpenConns present")
+
+    # ── POOL-002: SQLAlchemy without pool_size ─────────────────────────────────
+    py_bad  = "from sqlalchemy import create_engine\nengine = create_engine(DATABASE_URL)\n"
+    py_good = "from sqlalchemy import create_engine\nengine = create_engine(DATABASE_URL, pool_size=10)\n"
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "db.py")
+        open(f, "w").write(py_bad)
+        r3 = find_connection_pool_misconfigs({}, d)
+        assert any(x["rule_id"] == "POOL-002" for x in r3), f"POOL-002 not flagged: {r3}"
+        print("[PASS] POOL-002: flagged when pool_size absent")
+        open(f, "w").write(py_good)
+        r4 = find_connection_pool_misconfigs({}, d)
+        assert not any(x["rule_id"] == "POOL-002" for x in r4), f"POOL-002 false positive: {r4}"
+        print("[PASS] POOL-002: not flagged when pool_size present")
+
+    # ── POOL-002: NullPool exclusion ──────────────────────────────────────────
+    py_null = "from sqlalchemy import create_engine, NullPool\nengine = create_engine(DATABASE_URL, pool_class=NullPool)\n"
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "db.py")
+        open(f, "w").write(py_null)
+        r_null = find_connection_pool_misconfigs({}, d)
+        assert not any(x["rule_id"] == "POOL-002" for x in r_null), f"POOL-002 false positive on NullPool: {r_null}"
+        print("[PASS] POOL-002: not flagged when pool_class=NullPool")
+
+    # ── HLTH-002: K8s Deployment without readinessProbe ───────────────────────
+    k8s_bad = (
+        "apiVersion: apps/v1\nkind: Deployment\nspec:\n"
+        "  template:\n    spec:\n      containers:\n"
+        "      - name: app\n        image: myapp:latest\n"
+        "        ports:\n        - containerPort: 8080\n"
+    )
+    k8s_good = (
+        "apiVersion: apps/v1\nkind: Deployment\nspec:\n"
+        "  template:\n    spec:\n      containers:\n"
+        "      - name: app\n        image: myapp:latest\n"
+        "        readinessProbe:\n          httpGet:\n            path: /health\n            port: 8080\n"
+        "        livenessProbe:\n          httpGet:\n            path: /health\n            port: 8080\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "deploy.yaml")
+        open(f, "w").write(k8s_bad)
+        r5 = find_missing_health_checks({}, d)
+        assert any(x["rule_id"] == "HLTH-002" for x in r5), f"HLTH-002 not flagged: {r5}"
+        print("[PASS] HLTH-002: flagged Deployment without readinessProbe")
+        open(f, "w").write(k8s_good)
+        r6 = find_missing_health_checks({}, d)
+        hlth002 = [x for x in r6 if x["rule_id"] == "HLTH-002"]
+        assert not hlth002, f"HLTH-002 false positive with probes present: {hlth002}"
+        print("[PASS] HLTH-002: not flagged when probes present")
+
+    # ── MCP stubs shape check ─────────────────────────────────────────────────
+    with tempfile.TemporaryDirectory() as d:
+        res_pool   = graph_pool_misconfigs_tool(d)
+        res_health = graph_health_checks_tool(d)
+        assert "ok" in res_pool   and "total" in res_pool   and "findings" in res_pool,   f"pool tool bad shape: {res_pool}"
+        assert "ok" in res_health and "total" in res_health and "findings" in res_health, f"health tool bad shape: {res_health}"
+        print("[PASS] MCP stubs graph_pool_misconfigs_tool / graph_health_checks_tool return correct shape")
+
+    # ── total_checks updated to 19 ────────────────────────────────────────────
+    with tempfile.TemporaryDirectory() as d:
+        summary = get_health_summary({}, d)
+        assert summary["checks_passed"] + summary["checks_failed"] == 19, (
+            f"Expected total_checks=19, got {summary['checks_passed'] + summary['checks_failed']}"
+        )
+        print("[PASS] get_health_summary: total_checks == 19")
+
+    print("\n=== All _test_new_structural_3 tests PASSED ===")
 
 
 # ---------------------------------------------------------------------------

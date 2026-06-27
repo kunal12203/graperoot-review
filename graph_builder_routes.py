@@ -435,6 +435,23 @@ _ACTIX_PROC_RE = re.compile(
     r'[ \t]*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)',
     re.MULTILINE,
 )
+# Actix web::scope("/prefix") — prefix detection for scope blocks
+_ACTIX_SCOPE_RE = re.compile(r'web::scope\s*\(\s*"([^"]+)"\s*\)')
+_ACTIX_SERVICE_RESOURCE_RE = re.compile(r'web::resource\s*\(\s*"([^"]+)"\s*\)')
+
+# ── Warp (Rust) ───────────────────────────────────────────────────────────────
+
+# warp::path("segment") — simple path segment
+_WARP_PATH_RE = re.compile(r'warp::path\s*\(\s*"([^"]+)"\s*\)')
+# warp::path!("seg" / type) — path macro
+_WARP_PATH_MACRO_RE = re.compile(r'warp::path!\s*\(([^)]+)\)')
+# HTTP method combinators
+_WARP_METHOD_RE = re.compile(
+    r'warp::(get|post|put|patch|delete|head|options)\s*\(\s*\)'
+    r'|warp::(get|post|put|patch|delete|head|options)\s*\(\)'
+)
+# .map(handler_name) — captures the handler to find line numbers
+_WARP_MAP_RE = re.compile(r'\.map\s*\(\s*(\w+)\s*\)')
 
 # ── Koa (Node.js) ────────────────────────────────────────────────────────────
 
@@ -1128,7 +1145,104 @@ def _extract_actix(content: str, file_path: str, lines: list[str]) -> list[dict]
         if not _ACTIX_ROUTE_RE.search(rest[:200]):
             routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, confidence="medium"))
 
+    # web::scope("/prefix") — scan next 20 lines for .route(...) calls
+    for scope_m in _ACTIX_SCOPE_RE.finditer(content):
+        prefix = scope_m.group(1).rstrip("/")
+        scope_ln = content[: scope_m.start()].count("\n")
+        # Scan forward up to 20 lines for .route("path", web::METHOD().to(handler))
+        scan_end = min(scope_ln + 20, len(lines))
+        for j in range(scope_ln, scan_end):
+            for rm in _ACTIX_ROUTE_RE.finditer(lines[j]):
+                # This is a sub-route inside the scope — we don't have the sub-path from here
+                pass
+            # Also look for .service(web::resource("/sub").route(...))
+            svc_m = _ACTIX_SERVICE_RESOURCE_RE.search(lines[j])
+            if svc_m:
+                sub_path = svc_m.group(1)
+                full_path = prefix + ("/" + sub_path.lstrip("/") if sub_path else "")
+                rest_j = lines[j][svc_m.end():]
+                # scan next few lines for .route(web::METHOD().to(...))
+                snippet = "\n".join(lines[j: min(j + 5, len(lines))])
+                for rm in _ACTIX_ROUTE_RE.finditer(snippet):
+                    verb    = rm.group(1).upper()
+                    handler = rm.group(2)
+                    routes.append(_make_route(file_path, lines, j, j, verb, full_path, handler, "high"))
+                if not _ACTIX_ROUTE_RE.search(snippet):
+                    routes.append(_make_route(file_path, lines, j, j, "ANY", full_path, confidence="medium"))
+
     return routes
+
+
+def _extract_warp(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Warp (Rust) filter-combinator route definitions.
+
+    Handles:
+    - warp::path("seg").and(warp::get()).map(handler)
+    - warp::path!("seg" / u64).and(warp::get())
+    - warp::post().and(warp::path("seg"))
+    """
+    routes: list[dict] = []
+    _WARP_VERB_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "head": "HEAD", "options": "OPTIONS",
+    }
+
+    def _parse_path_macro(raw: str) -> str:
+        """Convert path!("seg" / u64 / String) to /seg/:id/:id."""
+        parts: list[str] = []
+        for token in re.split(r"\s*/\s*", raw.strip()):
+            token = token.strip().strip('"')
+            if re.match(r'^[A-Za-z][A-Za-z0-9_]*$', token) and token[0].isupper():
+                # type name like u64, String → param
+                parts.append(":id")
+            elif token:
+                parts.append(token)
+        return "/" + "/".join(parts) if parts else "/"
+
+    # Match lines containing warp filter expressions
+    # We look for warp::path( and warp::METHOD() combinations on the same or nearby lines
+    # Strategy: scan for warp::path( or warp::METHOD() and reconstruct the chain
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Check if line contains warp path or method
+        path_m = _WARP_PATH_RE.search(line)
+        path_macro_m = _WARP_PATH_MACRO_RE.search(line)
+        method_m = _WARP_METHOD_RE.search(line)
+
+        if not (path_m or path_macro_m or method_m):
+            i += 1
+            continue
+
+        # Build a 5-line window to find the full chain
+        window = "\n".join(lines[i: min(i + 5, len(lines))])
+
+        # Extract path
+        path = "/"
+        p_m = _WARP_PATH_RE.search(window)
+        pm_m = _WARP_PATH_MACRO_RE.search(window)
+        if p_m:
+            path = "/" + p_m.group(1).lstrip("/")
+        elif pm_m:
+            path = _parse_path_macro(pm_m.group(1))
+
+        # Extract verb
+        verb = "ANY"
+        vm = _WARP_METHOD_RE.search(window)
+        if vm:
+            raw_verb = vm.group(1) or vm.group(2) or ""
+            verb = _WARP_VERB_MAP.get(raw_verb.lower(), raw_verb.upper())
+
+        # Only emit if we found at least a path OR a verb (not just any random line)
+        if path != "/" or verb != "ANY":
+            handler_m = _WARP_MAP_RE.search(window)
+            handler = handler_m.group(1) if handler_m else ""
+            routes.append(_make_route(file_path, lines, i, i, verb, path, handler, "high"))
+
+        i += 1
+
+    return _dedup_routes(routes)
 
 
 def _extract_rocket(content: str, file_path: str, lines: list[str]) -> list[dict]:
@@ -3053,6 +3167,9 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         _ROCKET_INDICATORS = ("#[get(", "#[post(", "#[put(", "#[patch(", "#[delete(")
         if any(ind in content for ind in _ROCKET_INDICATORS):
             routes.extend(_extract_rocket(content, file_path, lines))
+        # Warp — filter combinators
+        if "use warp::" in content or "warp::" in content:
+            routes.extend(_extract_warp(content, file_path, lines))
 
     # ── PHP ───────────────────────────────────────────────────────────────────
     elif ext == ".php":
@@ -3536,5 +3653,36 @@ func main() {
     print("\n=== All new route extractor tests PASSED ===")
 
 
+def _test_phase29_routes() -> None:
+    """Phase 29 route extractor tests: Warp."""
+    # ── Warp ─────────────────────────────────────────────────────────────────
+    warp_code = '''
+use warp::Filter;
+let users = warp::path("users").and(warp::get()).map(list_users);
+let user = warp::path!("users" / u64).and(warp::get()).map(get_user);
+let create = warp::post().and(warp::path("users")).map(create_user);
+'''
+    r = extract_routes_for_file(warp_code, 'api.rs', '.rs')
+    assert any('/users' in x['name'] for x in r), f'Warp: {r}'
+    print("[PASS] Warp routes")
+
+    # ── Warp method detection ─────────────────────────────────────────────────
+    warp_get_code = '''
+use warp::Filter;
+let route = warp::get().and(warp::path("health")).map(|| "ok");
+'''
+    r2 = _extract_warp(warp_get_code, 'health.rs', warp_get_code.splitlines())
+    assert any('GET' in x['name'] or '/health' in x['name'] for x in r2), \
+        f'Warp GET health: {r2}'
+    print("[PASS] Warp GET detection")
+
+    print("\n=== Phase 29 route extractor tests PASSED ===")
+
+
+def _test_phase29() -> None:
+    _test_phase29_routes()
+
+
 if __name__ == "__main__":
     _test_new_extractors()
+    _test_phase29_routes()

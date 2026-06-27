@@ -1,6 +1,6 @@
 # GrapeRoot Pro — Feature List
 
-> **Implementation Status**: Phases 1–26 fully implemented in `graph_builder_v6.2.py` + `mcp_graph_server_v7.5.py`
+> **Implementation Status**: Phases 1–30 fully implemented in `graph_builder_v6.2.py` + `mcp_graph_server_v7.5.py`
 > - Phase 1: Language Expansion (Java, Kotlin, Ruby, SQL, Shell, Scala, C#, Prisma) — `graph_builder_parsers.py`, `graph_builder_prisma.py`
 > - Phase 2: Framework Route Detection (20 frameworks) — `graph_builder_routes.py` + 29 MCP tools in `mcp_tools_integration.py`
 > - Phase 3: Service Graph (Kafka/SQS/Redis/RabbitMQ/NATS/EventBridge + Proto/OpenAPI/GraphQL/AsyncAPI) — `graph_builder_service_graph.py`
@@ -27,6 +27,10 @@
 > - Phase 24: Resource Leaks (Go os.Open/http.Get/rows without defer, Python bare open/psycopg2) — `structural_bugs.py`
 > - Phase 25: Migration Safety (ALTER TABLE without online DDL, missing lock timeout, DROP in app code) — `structural_bugs.py`
 > - Phase 26: Framework Gap Closure (Spring Boot, ASP.NET Core, Yii, CakePHP, Hanami, Grails, Plug.Router; Diesel, Spring Data JPA, ActiveRecord) — `graph_builder_routes.py`, `graph_builder_orm.py`
+> - Phase 27: ORM Gap Closure (Hibernate XML, Doctrine ORM, CakePHP ORM, Yii2 ActiveRecord) — `graph_builder_orm.py`
+> - Phase 28: Deep Elixir (GenServer, Supervisor, Phoenix Channels, Absinthe GraphQL, Plug.Builder pipelines, Ecto constraints) — `graph_builder_lang_extended.py`
+> - Phase 29: Rust Gap Closure (SeaORM, sqlx FromRow, Warp framework, Actix scope prefixes) — `graph_builder_orm.py`, `graph_builder_routes.py`
+> - Phase 30: Operational Checks (connection pool misconfigs Go/Python/Node, K8s readinessProbe, health endpoint detection) — `structural_bugs.py`
 
 ## Codebase Intelligence
 - Instant symbol navigation — find any function, class, or variable across your entire project

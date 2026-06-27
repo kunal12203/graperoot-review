@@ -208,6 +208,26 @@ _EX_LIVE = re.compile(
 )
 _EX_USE_ROUTER = re.compile(r'\buse\b.*\bRouter\b', re.IGNORECASE)
 
+# Phase 28: GenServer / Supervisor / Phoenix Channel / Absinthe / Plug.Builder
+_EX_GENSERVER_RE = re.compile(r'use\s+GenServer')
+_EX_SUPERVISOR_RE = re.compile(r'use\s+(?:Dynamic)?Supervisor')
+_EX_CHANNEL_RE = re.compile(r'use\s+Phoenix\.Channel')
+_EX_ABSINTHE_RE = re.compile(r'use\s+Absinthe\.Schema(?:\.Notation)?')
+_EX_PLUG_BUILDER_RE = re.compile(r'use\s+Plug\.Builder')
+_EX_CHANNEL_MACRO_RE = re.compile(r'channel\s+"([^"]+)"\s*,\s*(\w+)')
+_EX_ABSINTHE_FIELD_RE = re.compile(r'^\s+field\s+:(\w+)', re.MULTILINE)
+_EX_SUPERVISOR_CHILD_RE = re.compile(r'\{(\w+),\s*\[|children\s*=\s*\[([^\]]+)\]', re.DOTALL)
+_EX_HANDLE_IN_RE = re.compile(r'def\s+handle_in\s*\(\s*"([^"]+)"')
+_EX_PLUG_PLUG_RE = re.compile(r'^\s+plug\s+(\S+)', re.MULTILINE)
+# GenServer callback hooks
+_EX_GS_CALLBACKS_RE = re.compile(
+    r'^[ \t]*def\s+(handle_call|handle_cast|handle_info|init)\s*\(',
+    re.MULTILINE,
+)
+# Ecto changeset constraint hooks
+_EX_UNIQUE_CONSTRAINT_RE = re.compile(r'unique_constraint\s*\(\s*:(\w+)')
+_EX_FK_CONSTRAINT_RE = re.compile(r'foreign_key_constraint\s*\(\s*:(\w+)')
+
 
 def _strip_elixir_comments(lines: list) -> list:
     cleaned = []
@@ -315,6 +335,198 @@ def _extract_elixir(content: str, file_path: str) -> list:
                 )
             )
 
+        # ----------------------------------------------------------------
+        # Phase 28 additions
+        # ----------------------------------------------------------------
+
+        # --- GenServer: tag module + detect OTP callbacks ---
+        if _EX_GENSERVER_RE.search(clean_content):
+            # Find every module in this file and annotate the matching one
+            for s in symbols:
+                if s.get("symbol_type") == "use_case" and s.get("language") == "elixir":
+                    s["otp_type"] = "genserver"
+                    break  # tag first/only module
+            # Callback hooks
+            seen_cb: set = set()
+            for m in _EX_GS_CALLBACKS_RE.finditer(clean_content):
+                cb_name = m.group(1)
+                if cb_name in seen_cb:
+                    continue
+                seen_cb.add(cb_name)
+                line_no = clean_content[: m.start()].count("\n")
+                symbols.append(
+                    _mk_sym(
+                        file_path, cb_name, "hook", line_no,
+                        lines[line_no] if line_no < len(lines) else cb_name,
+                        "elixir", exported=False,
+                        keywords=_name_keywords(cb_name, ["genserver", "callback"]),
+                    )
+                )
+
+        # --- Supervisor / DynamicSupervisor ---
+        if _EX_SUPERVISOR_RE.search(clean_content):
+            for s in symbols:
+                if s.get("symbol_type") == "use_case" and s.get("language") == "elixir":
+                    s["otp_type"] = "supervisor"
+                    break
+            # Extract children as `needs` edges via symbols with type "hook"
+            for m in re.finditer(
+                r'\bchildren\s*=\s*\[([^\]]+)\]', clean_content, re.DOTALL
+            ):
+                block = m.group(1)
+                line_no = clean_content[: m.start()].count("\n")
+                # Find module names: {ModuleName, ...} or bare ModuleName
+                for child_m in re.finditer(r'\b([A-Z][A-Za-z0-9_.]*)\b', block):
+                    child_mod = child_m.group(1)
+                    symbols.append(
+                        _mk_sym(
+                            file_path,
+                            f"needs:{child_mod}",
+                            "hook",
+                            line_no,
+                            lines[line_no] if line_no < len(lines) else child_mod,
+                            "elixir",
+                            exported=False,
+                            keywords=_name_keywords(child_mod, ["supervisor", "child"]),
+                            extra={"needs": child_mod},
+                        )
+                    )
+
+        # --- Phoenix Channel ---
+        if _EX_CHANNEL_RE.search(clean_content):
+            # Find the module and annotate it
+            for s in symbols:
+                if s.get("symbol_type") == "use_case" and s.get("language") == "elixir":
+                    # Determine route_path from `channel` macro (if this is a socket file)
+                    chan_m = _EX_CHANNEL_MACRO_RE.search(clean_content)
+                    route_path = chan_m.group(1) if chan_m else ""
+                    s["route_method"] = "WS"
+                    if route_path:
+                        s["route_path"] = route_path
+                    break
+            # handle_in callbacks → hook symbols
+            seen_hi: set = set()
+            for m in _EX_HANDLE_IN_RE.finditer(clean_content):
+                event_name = m.group(1)
+                hook_name = f"handle_in:{event_name}"
+                if hook_name in seen_hi:
+                    continue
+                seen_hi.add(hook_name)
+                line_no = clean_content[: m.start()].count("\n")
+                symbols.append(
+                    _mk_sym(
+                        file_path, hook_name, "hook", line_no,
+                        lines[line_no] if line_no < len(lines) else hook_name,
+                        "elixir", exported=False,
+                        keywords=_name_keywords(hook_name, ["channel", "websocket"]),
+                    )
+                )
+            # Also expose channel macro routes (from socket module)
+            for m in _EX_CHANNEL_MACRO_RE.finditer(clean_content):
+                route_path = m.group(1)
+                channel_mod = m.group(2)
+                route_name = f"WS {route_path}"
+                line_no = clean_content[: m.start()].count("\n")
+                symbols.append(
+                    _mk_sym(
+                        file_path, route_name, "api_route", line_no,
+                        lines[line_no] if line_no < len(lines) else route_name,
+                        "elixir", exported=True,
+                        keywords=_name_keywords(route_name, ["ws", "channel", "route"]),
+                        extra={
+                            "route_method": "WS",
+                            "route_path": route_path,
+                            "controller": channel_mod,
+                        },
+                    )
+                )
+
+        # --- Absinthe GraphQL ---
+        if _EX_ABSINTHE_RE.search(clean_content):
+            # Detect query / mutation / subscription blocks and their fields
+            for block_m in re.finditer(
+                r'\b(query|mutation|subscription)\s+do(.*?)end',
+                clean_content, re.DOTALL | re.IGNORECASE,
+            ):
+                block_type = block_m.group(1).upper()
+                block_body = block_m.group(2)
+                block_line = clean_content[: block_m.start()].count("\n")
+                for field_m in _EX_ABSINTHE_FIELD_RE.finditer(block_body):
+                    field_name = field_m.group(1)
+                    route_name = f"{block_type}:{field_name}"
+                    symbols.append(
+                        _mk_sym(
+                            file_path, route_name, "api_route", block_line,
+                            route_name,
+                            "elixir", exported=True,
+                            keywords=_name_keywords(route_name, ["graphql", block_type.lower()]),
+                            extra={
+                                "route_method": block_type,
+                                "route_path": f"/{field_name}",
+                            },
+                        )
+                    )
+            # Detect `object :type_name do` → model symbol
+            for obj_m in re.finditer(
+                r'^\s+object\s+:(\w+)\s+do', clean_content, re.MULTILINE
+            ):
+                obj_name = obj_m.group(1)
+                line_no = clean_content[: obj_m.start()].count("\n")
+                symbols.append(
+                    _mk_sym(
+                        file_path, obj_name, "model", line_no,
+                        lines[line_no] if line_no < len(lines) else obj_name,
+                        "elixir", exported=True,
+                        keywords=_name_keywords(obj_name, ["graphql", "type"]),
+                    )
+                )
+
+        # --- Plug.Builder pipeline ---
+        if _EX_PLUG_BUILDER_RE.search(clean_content):
+            seen_plugs: set = set()
+            for m in _EX_PLUG_PLUG_RE.finditer(clean_content):
+                plug_target = m.group(1).strip().rstrip(",")
+                hook_name = f"plug:{plug_target}"
+                if hook_name in seen_plugs:
+                    continue
+                seen_plugs.add(hook_name)
+                line_no = clean_content[: m.start()].count("\n")
+                symbols.append(
+                    _mk_sym(
+                        file_path, hook_name, "hook", line_no,
+                        lines[line_no] if line_no < len(lines) else hook_name,
+                        "elixir", exported=False,
+                        keywords=_name_keywords(hook_name, ["plug", "pipeline"]),
+                    )
+                )
+
+        # --- Ecto constraints (unique / foreign_key) ---
+        for m in _EX_UNIQUE_CONSTRAINT_RE.finditer(clean_content):
+            field = m.group(1)
+            hook_name = f"constraint_unique_{field}"
+            line_no = clean_content[: m.start()].count("\n")
+            symbols.append(
+                _mk_sym(
+                    file_path, hook_name, "hook", line_no,
+                    lines[line_no] if line_no < len(lines) else hook_name,
+                    "elixir", exported=False,
+                    keywords=_name_keywords(hook_name, ["ecto", "constraint"]),
+                )
+            )
+        for m in _EX_FK_CONSTRAINT_RE.finditer(clean_content):
+            field = m.group(1)
+            hook_name = f"constraint_fk_{field}"
+            line_no = clean_content[: m.start()].count("\n")
+            symbols.append(
+                _mk_sym(
+                    file_path, hook_name, "hook", line_no,
+                    lines[line_no] if line_no < len(lines) else hook_name,
+                    "elixir", exported=False,
+                    keywords=_name_keywords(hook_name, ["ecto", "foreign_key"]),
+                )
+            )
+
+        # ----------------------------------------------------------------
         # --- Phoenix routes ---
         if is_router:
             # Track scope prefixes by finding scope blocks
@@ -1151,11 +1363,9 @@ def get_lang_extended_summary(project_root: str) -> dict:
 # Test suite
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-
-    def _run_tests() -> None:
-        # --- Elixir ---
-        ex_code = '''
+def _run_tests() -> None:
+    # --- Elixir ---
+    ex_code = '''
 defmodule MyApp.User do
   use Ecto.Schema
   schema "users" do
@@ -1172,17 +1382,17 @@ defmodule MyApp.User do
   end
 end
 '''
-        syms = extract_lang_extended_symbols(ex_code, "lib/my_app/user.ex", ".ex")
-        assert any(s["name"] == "MyApp.User" for s in syms), (
-            f"Elixir module: {[s['name'] for s in syms]}"
-        )
-        assert any(s["symbol_type"] == "model" and "users" in s["name"] for s in syms), (
-            f"Elixir schema: {syms}"
-        )
-        print("[PASS] Elixir schema + module")
+    syms = extract_lang_extended_symbols(ex_code, "lib/my_app/user.ex", ".ex")
+    assert any(s["name"] == "MyApp.User" for s in syms), (
+        f"Elixir module: {[s['name'] for s in syms]}"
+    )
+    assert any(s["symbol_type"] == "model" and "users" in s["name"] for s in syms), (
+        f"Elixir schema: {syms}"
+    )
+    print("[PASS] Elixir schema + module")
 
-        # Phoenix router
-        router_code = '''
+    # Phoenix router
+    router_code = '''
 defmodule MyAppWeb.Router do
   use MyAppWeb, :router
   scope "/api", MyAppWeb do
@@ -1194,26 +1404,26 @@ defmodule MyAppWeb.Router do
   end
 end
 '''
-        routes = extract_lang_extended_symbols(router_code, "lib/my_app_web/router.ex", ".ex")
-        route_syms = [s for s in routes if s["symbol_type"] == "api_route"]
-        assert any("GET /api/users" in s["name"] for s in route_syms), (
-            f"Phoenix routes: {[s['name'] for s in route_syms]}"
-        )
-        # resources should expand to multiple routes
-        post_routes = [s for s in route_syms if "posts" in s["name"]]
-        assert len(post_routes) >= 4, (
-            f"Phoenix resources expansion: {[s['name'] for s in post_routes]}"
-        )
-        print("[PASS] Phoenix routes + resources expansion")
+    routes = extract_lang_extended_symbols(router_code, "lib/my_app_web/router.ex", ".ex")
+    route_syms = [s for s in routes if s["symbol_type"] == "api_route"]
+    assert any("GET /api/users" in s["name"] for s in route_syms), (
+        f"Phoenix routes: {[s['name'] for s in route_syms]}"
+    )
+    # resources should expand to multiple routes
+    post_routes = [s for s in route_syms if "posts" in s["name"]]
+    assert len(post_routes) >= 4, (
+        f"Phoenix resources expansion: {[s['name'] for s in post_routes]}"
+    )
+    print("[PASS] Phoenix routes + resources expansion")
 
-        # LiveView
-        assert any(
-            "LIVE" in s["name"] and "dashboard" in s["name"].lower() for s in route_syms
-        ), f"Phoenix live: {[s['name'] for s in route_syms]}"
-        print("[PASS] Phoenix LiveView route")
+    # LiveView
+    assert any(
+        "LIVE" in s["name"] and "dashboard" in s["name"].lower() for s in route_syms
+    ), f"Phoenix live: {[s['name'] for s in route_syms]}"
+    print("[PASS] Phoenix LiveView route")
 
-        # --- Swift ---
-        swift_code = '''
+    # --- Swift ---
+    swift_code = '''
 import Foundation
 import Vapor
 
@@ -1237,19 +1447,19 @@ struct User: Model, Content {
     var name: String
 }
 '''
-        swift_syms = extract_lang_extended_symbols(
-            swift_code, "Sources/App/Controllers/UserController.swift", ".swift"
-        )
-        assert any(s["name"] == "UserController" for s in swift_syms), (
-            f"Swift class: {[s['name'] for s in swift_syms]}"
-        )
-        assert any(s["name"] == "User" for s in swift_syms), (
-            f"Swift struct: {[s['name'] for s in swift_syms]}"
-        )
-        print("[PASS] Swift class + struct detection")
+    swift_syms = extract_lang_extended_symbols(
+        swift_code, "Sources/App/Controllers/UserController.swift", ".swift"
+    )
+    assert any(s["name"] == "UserController" for s in swift_syms), (
+        f"Swift class: {[s['name'] for s in swift_syms]}"
+    )
+    assert any(s["name"] == "User" for s in swift_syms), (
+        f"Swift struct: {[s['name'] for s in swift_syms]}"
+    )
+    print("[PASS] Swift class + struct detection")
 
-        # --- Dart ---
-        dart_code = '''
+    # --- Dart ---
+    dart_code = '''
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
@@ -1266,17 +1476,17 @@ class UserCubit extends Cubit<UserState> {
   Future<void> loadUsers() async { emit(UserLoaded([])); }
 }
 '''
-        dart_syms = extract_lang_extended_symbols(dart_code, "lib/users/user_list_page.dart", ".dart")
-        assert any("UserListPage" in s["name"] for s in dart_syms), (
-            f"Dart widget: {[s['name'] for s in dart_syms]}"
-        )
-        assert any("UserCubit" in s["name"] for s in dart_syms), (
-            f"Dart cubit: {[s['name'] for s in dart_syms]}"
-        )
-        print("[PASS] Dart Flutter widget + Cubit")
+    dart_syms = extract_lang_extended_symbols(dart_code, "lib/users/user_list_page.dart", ".dart")
+    assert any("UserListPage" in s["name"] for s in dart_syms), (
+        f"Dart widget: {[s['name'] for s in dart_syms]}"
+    )
+    assert any("UserCubit" in s["name"] for s in dart_syms), (
+        f"Dart cubit: {[s['name'] for s in dart_syms]}"
+    )
+    print("[PASS] Dart Flutter widget + Cubit")
 
-        # --- Groovy ---
-        groovy_code = '''
+    # --- Groovy ---
+    groovy_code = '''
 plugins {
     id 'java'
     id 'org.springframework.boot' version '3.2.0'
@@ -1297,19 +1507,172 @@ task buildDocker(type: Exec) {
     commandLine 'docker', 'build', '-t', 'myapp', '.'
 }
 '''
-        gradle_syms = extract_lang_extended_symbols(groovy_code, "build.gradle", ".gradle")
-        assert any("spring-boot" in s["name"] for s in gradle_syms), (
-            f"Gradle plugin: {[s['name'] for s in gradle_syms]}"
-        )
-        dep_syms = [s for s in gradle_syms if s.get("symbol_type") == "model"]
-        assert len(dep_syms) >= 2, f"Gradle deps: {dep_syms}"
-        task_syms = [
-            s for s in gradle_syms
-            if s.get("symbol_type") == "use_case" and "buildDocker" in s.get("name", "")
-        ]
-        assert task_syms, f"Gradle task: {[s['name'] for s in gradle_syms]}"
-        print("[PASS] Groovy Gradle plugins + deps + tasks")
+    gradle_syms = extract_lang_extended_symbols(groovy_code, "build.gradle", ".gradle")
+    assert any("spring-boot" in s["name"] for s in gradle_syms), (
+        f"Gradle plugin: {[s['name'] for s in gradle_syms]}"
+    )
+    dep_syms = [s for s in gradle_syms if s.get("symbol_type") == "model"]
+    assert len(dep_syms) >= 2, f"Gradle deps: {dep_syms}"
+    task_syms = [
+        s for s in gradle_syms
+        if s.get("symbol_type") == "use_case" and "buildDocker" in s.get("name", "")
+    ]
+    assert task_syms, f"Gradle task: {[s['name'] for s in gradle_syms]}"
+    print("[PASS] Groovy Gradle plugins + deps + tasks")
 
-        print("\n=== All Phase 21 tests PASSED ===")
+    print("\n=== All Phase 21 tests PASSED ===")
 
+
+# Top-level so it's importable from tests
+def _test_phase28_elixir() -> None:
+    # --- GenServer ---
+    gs_code = '''
+defmodule MyApp.Counter do
+  use GenServer
+
+  def init(state), do: {:ok, state}
+  def handle_call(:get, _from, state), do: {:reply, state, state}
+  def handle_cast({:add, n}, state), do: {:noreply, state + n}
+end
+'''
+    syms = extract_lang_extended_symbols(gs_code, 'counter.ex', '.ex')
+    types = {s['name']: s['symbol_type'] for s in syms}
+    assert 'MyApp.Counter' in types, f'GenServer module missing: {list(types.keys())}'
+    # otp_type annotation
+    gs_mod = next(s for s in syms if s['name'] == 'MyApp.Counter')
+    assert gs_mod.get('otp_type') == 'genserver', f'otp_type not set: {gs_mod}'
+    # GenServer hooks
+    hook_names = [s['name'] for s in syms if s['symbol_type'] == 'hook']
+    assert 'init' in hook_names, f'init hook missing: {hook_names}'
+    assert 'handle_call' in hook_names, f'handle_call hook missing: {hook_names}'
+    assert 'handle_cast' in hook_names, f'handle_cast hook missing: {hook_names}'
+    print('[PASS] GenServer: module, otp_type, callback hooks')
+
+    # --- Phoenix Channel ---
+    ch_code = '''
+defmodule MyAppWeb.RoomChannel do
+  use Phoenix.Channel
+
+  def handle_in("msg:new", payload, socket) do
+    broadcast!(socket, "msg:new", payload)
+    {:noreply, socket}
+  end
+
+  def handle_in("msg:delete", payload, socket) do
+    {:noreply, socket}
+  end
+end
+'''
+    syms2 = extract_lang_extended_symbols(ch_code, 'room_channel.ex', '.ex')
+    names2 = [s['name'] for s in syms2]
+    assert 'MyAppWeb.RoomChannel' in names2, f'Channel module missing: {names2}'
+    hi_hooks = [s for s in syms2 if s['name'].startswith('handle_in:')]
+    assert len(hi_hooks) >= 2, f'handle_in hooks missing: {names2}'
+    assert 'handle_in:msg:new' in names2, f'handle_in:msg:new missing: {names2}'
+    print('[PASS] Phoenix Channel: module + handle_in hooks')
+
+    # --- Absinthe schema ---
+    abs_code = '''
+defmodule MyApp.Schema do
+  use Absinthe.Schema
+
+  query do
+    field :users, list_of(:user)
+    field :user, :user
+  end
+
+  mutation do
+    field :create_user, :user
+  end
+
+  object :user_type do
+    field :name, :string
+    field :email, :string
+  end
+end
+'''
+    syms3 = extract_lang_extended_symbols(abs_code, 'schema.ex', '.ex')
+    names3 = [s['name'] for s in syms3]
+    assert 'MyApp.Schema' in names3, f'Absinthe module missing: {names3}'
+    query_routes = [s for s in syms3 if s.get('route_method') == 'QUERY']
+    assert len(query_routes) >= 2, f'Absinthe QUERY fields missing: {query_routes}'
+    mutation_routes = [s for s in syms3 if s.get('route_method') == 'MUTATION']
+    assert len(mutation_routes) >= 1, f'Absinthe MUTATION field missing: {mutation_routes}'
+    object_models = [s for s in syms3 if s['symbol_type'] == 'model' and s['name'] == 'user_type']
+    assert object_models, f'Absinthe object type model missing: {names3}'
+    print('[PASS] Absinthe: module, QUERY/MUTATION routes, object model')
+
+    # --- Supervisor ---
+    sup_code = '''
+defmodule MyApp.Supervisor do
+  use Supervisor
+
+  def init(_arg) do
+    children = [
+      MyApp.Repo,
+      MyApp.Worker,
+      {MyApp.Cache, []}
+    ]
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+'''
+    syms4 = extract_lang_extended_symbols(sup_code, 'supervisor.ex', '.ex')
+    names4 = [s['name'] for s in syms4]
+    assert 'MyApp.Supervisor' in names4, f'Supervisor module missing: {names4}'
+    sup_mod = next(s for s in syms4 if s['name'] == 'MyApp.Supervisor')
+    assert sup_mod.get('otp_type') == 'supervisor', f'otp_type not supervisor: {sup_mod}'
+    needs_hooks = [s for s in syms4 if s['name'].startswith('needs:')]
+    child_targets = [s['extra']['needs'] for s in needs_hooks if 'extra' in s and 'needs' in s.get('extra', {})]
+    assert 'MyApp.Repo' in child_targets or any('Repo' in n for n in names4), \
+        f'Supervisor children missing: {names4}'
+    print('[PASS] Supervisor: module, otp_type, children needs edges')
+
+    # --- Plug.Builder ---
+    plug_code = '''
+defmodule MyApp.Pipeline do
+  use Plug.Builder
+
+  plug Plug.Logger
+  plug Plug.Parsers, parsers: [:json]
+  plug :authenticate
+end
+'''
+    syms5 = extract_lang_extended_symbols(plug_code, 'pipeline.ex', '.ex')
+    names5 = [s['name'] for s in syms5]
+    assert 'MyApp.Pipeline' in names5, f'Plug.Builder module missing: {names5}'
+    plug_hooks = [s for s in syms5 if s['name'].startswith('plug:')]
+    assert len(plug_hooks) >= 2, f'Plug hooks missing: {names5}'
+    assert any('Plug.Logger' in n for n in names5), f'plug:Plug.Logger missing: {names5}'
+    print('[PASS] Plug.Builder: module + plug hooks')
+
+    # --- Ecto constraints ---
+    ecto_code = '''
+defmodule MyApp.User do
+  use Ecto.Schema
+
+  schema "users" do
+    field :email, :string
+    belongs_to :team, MyApp.Team
+  end
+
+  def changeset(user, attrs) do
+    user
+    |> cast(attrs, [:email])
+    |> unique_constraint(:email)
+    |> foreign_key_constraint(:team_id)
+  end
+end
+'''
+    syms6 = extract_lang_extended_symbols(ecto_code, 'user.ex', '.ex')
+    names6 = [s['name'] for s in syms6]
+    assert 'constraint_unique_email' in names6, f'unique_constraint hook missing: {names6}'
+    assert 'constraint_fk_team_id' in names6, f'foreign_key_constraint hook missing: {names6}'
+    print('[PASS] Ecto constraints: unique + foreign_key hooks')
+
+    print('\n=== All Phase 28 Elixir tests PASSED ===')
+
+
+if __name__ == "__main__":
+    _test_phase28_elixir()
     _run_tests()

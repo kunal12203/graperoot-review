@@ -36,7 +36,7 @@ from typing import Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-ORM_EXTS: set[str] = {".ts", ".js", ".go", ".py", ".cs", ".kt", ".kts", ".rs", ".java", ".rb"}
+ORM_EXTS: set[str] = {".ts", ".js", ".go", ".py", ".cs", ".kt", ".kts", ".rs", ".java", ".rb", ".xml", ".php"}
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -1728,7 +1728,175 @@ def _extract_objection(content: str, file_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 16. Diesel ORM (Rust)
+# 16. SeaORM (Rust)
+# ---------------------------------------------------------------------------
+
+_SEAORM_DERIVE_ENTITY_RE = re.compile(r"#\[derive\([^)]*DeriveEntityModel[^)]*\)\]")
+_SEAORM_TABLE_NAME_RE = re.compile(r'#\[sea_orm\s*\(\s*table_name\s*=\s*"([^"]+)"')
+_SEAORM_STRUCT_RE_ORM = re.compile(r"(?:pub\s+)?struct\s+(\w+)\s*\{")
+_SEAORM_DERIVE_RELATION_RE = re.compile(r"#\[derive\([^)]*DeriveRelation[^)]*\)\]")
+_SEAORM_ENUM_RE = re.compile(r"(?:pub\s+)?enum\s+(\w+)\s*\{")
+_SEAORM_RELATION_VARIANT_RE = re.compile(r"^\s+(\w+)\s*,?\s*$", re.MULTILINE)
+_SEAORM_RELATION_DEF_RE = re.compile(r"\bRelationDef\b")
+
+
+def _extract_seaorm(content: str, file_path: str, ext: str) -> list[dict]:
+    """Extract SeaORM entity models and relation hooks from Rust files."""
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+    _SKIP = {"Copy", "Clone", "Debug", "EnumIter", "Relation"}
+
+    i = 0
+    while i < len(lines):
+        if _SEAORM_DERIVE_ENTITY_RE.search(lines[i]):
+            entity_derive_line = i
+            table_name = ""
+            struct_name: Optional[str] = None
+            for j in range(i, min(i + 15, len(lines))):
+                tbl_m = _SEAORM_TABLE_NAME_RE.search(lines[j])
+                if tbl_m:
+                    table_name = tbl_m.group(1)
+                s_m = _SEAORM_STRUCT_RE_ORM.search(lines[j])
+                if s_m and j > i:
+                    struct_name = s_m.group(1)
+                    i = j
+                    break
+            if struct_name and struct_name not in seen:
+                seen.add(struct_name)
+                end = _find_block_end(lines, i)
+                extra = ["seaorm", "entity", "model"]
+                if table_name:
+                    extra.append(table_name.lower())
+                sym = _make_symbol(file_path, struct_name, "model",
+                                   entity_derive_line, end, lines,
+                                   confidence="high", exported=True, extra_kw=extra)
+                if table_name:
+                    sym["table_name"] = table_name
+                symbols.append(sym)
+                body = "\n".join(lines[entity_derive_line : end + 1])
+                if _SEAORM_RELATION_DEF_RE.search(body):
+                    hook_name = f"{struct_name}.RelationDef"
+                    if hook_name not in seen:
+                        seen.add(hook_name)
+                        symbols.append(_make_symbol(
+                            file_path, hook_name, "hook",
+                            entity_derive_line, end, lines,
+                            confidence="high", exported=False,
+                            extra_kw=["seaorm", "relation_def"],
+                        ))
+        i += 1
+
+    i = 0
+    while i < len(lines):
+        if _SEAORM_DERIVE_RELATION_RE.search(lines[i]):
+            enum_name: Optional[str] = None
+            for j in range(i + 1, min(i + 5, len(lines))):
+                e_m = _SEAORM_ENUM_RE.search(lines[j])
+                if e_m:
+                    enum_name = e_m.group(1)
+                    i = j
+                    break
+            if enum_name:
+                end = _find_block_end(lines, i)
+                body = "\n".join(lines[i : end + 1])
+                for v_m in _SEAORM_RELATION_VARIANT_RE.finditer(body):
+                    variant = v_m.group(1)
+                    if variant in _SKIP:
+                        continue
+                    hook_name = f"relation_{variant.lower()}"
+                    if hook_name not in seen:
+                        seen.add(hook_name)
+                        v_line = i + body[: v_m.start()].count("\n")
+                        symbols.append(_make_symbol(
+                            file_path, hook_name, "hook", v_line, v_line,
+                            lines, confidence="high", exported=False,
+                            extra_kw=["seaorm", "relation", variant.lower()],
+                        ))
+        i += 1
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 16b. sqlx (Rust)
+# ---------------------------------------------------------------------------
+
+_SQLX_FROMROW_DERIVE_RE = re.compile(
+    r"#\[derive\([^)]*(?:FromRow|sqlx::FromRow)[^)]*\)\]"
+)
+_SQLX_STRUCT_RE = re.compile(r"(?:pub\s+)?struct\s+(\w+)\s*\{")
+_SQLX_QUERY_AS_RE = re.compile(r"(?:sqlx::)?query_as!\s*\(\s*(\w+)\s*,")
+_SQLX_QUERY_BANG_RE = re.compile(r"(?:sqlx::)?query!\s*\(")
+_SQLX_FN_RE = re.compile(r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\(")
+
+
+def _extract_sqlx(content: str, file_path: str, ext: str) -> list[dict]:
+    """Extract sqlx FromRow structs and query_as!/query! use_case symbols."""
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    def _enclosing_fn(fn_ln: int) -> str:
+        for j in range(fn_ln, max(-1, fn_ln - 20), -1):
+            fn_m = _SQLX_FN_RE.search(lines[j])
+            if fn_m:
+                return fn_m.group(1)
+        return ""
+
+    i = 0
+    while i < len(lines):
+        if _SQLX_FROMROW_DERIVE_RE.search(lines[i]):
+            derive_line = i
+            struct_name: Optional[str] = None
+            for j in range(i + 1, min(i + 8, len(lines))):
+                s_m = _SQLX_STRUCT_RE.search(lines[j])
+                if s_m:
+                    struct_name = s_m.group(1)
+                    i = j
+                    break
+            if struct_name and struct_name not in seen:
+                seen.add(struct_name)
+                end = _find_block_end(lines, i)
+                symbols.append(_make_symbol(
+                    file_path, struct_name, "model", derive_line, end,
+                    lines, confidence="high", exported=True,
+                    extra_kw=["sqlx", "fromrow", "model"],
+                ))
+        i += 1
+
+    for m in _SQLX_QUERY_AS_RE.finditer(content):
+        type_name = m.group(1)
+        fn_ln = _line_of(content, m.start())
+        fn_name = _enclosing_fn(fn_ln)
+        uc_name = fn_name if fn_name else f"query_as_{type_name}"
+        if uc_name not in seen:
+            seen.add(uc_name)
+            end = _find_block_end(lines, fn_ln)
+            symbols.append(_make_symbol(
+                file_path, uc_name, "use_case", fn_ln, end,
+                lines, confidence="high", exported=True,
+                extra_kw=["sqlx", "query_as", type_name.lower()],
+            ))
+
+    for m in _SQLX_QUERY_BANG_RE.finditer(content):
+        fn_ln = _line_of(content, m.start())
+        fn_name = _enclosing_fn(fn_ln)
+        uc_name = fn_name if fn_name else f"sqlx_query_L{fn_ln + 1}"
+        if uc_name not in seen:
+            seen.add(uc_name)
+            end = _find_block_end(lines, fn_ln)
+            symbols.append(_make_symbol(
+                file_path, uc_name, "use_case", fn_ln, end,
+                lines, confidence="medium", exported=False,
+                extra_kw=["sqlx", "query"],
+            ))
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 17 (was 16). Diesel ORM (Rust)
 # ---------------------------------------------------------------------------
 
 _DIESEL_TABLE_MACRO_RE = re.compile(
@@ -2092,6 +2260,490 @@ def _extract_activerecord(content: str, file_path: str, ext: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 19. Hibernate XML mappings (.hbm.xml, persistence.xml, orm.xml)
+# ---------------------------------------------------------------------------
+
+_HBM_CLASS_RE = re.compile(r'<class\b[^>]*\bname\s*=\s*["\']([^"\']+)["\']')
+_HBM_CLASS_TABLE_RE = re.compile(r'<class\b[^>]*\btable\s*=\s*["\']([^"\']+)["\']')
+_HBM_ENTITY_RE = re.compile(
+    r'<entity\s[^>]*class\s*=\s*["\']([^"\']+)["\']'
+)
+_HBM_SET_ONE_TO_MANY_RE = re.compile(
+    r'<set\s[^>]*name\s*=\s*["\'](\w+)["\'][^>]*>.*?<one-to-many\s[^>]*class\s*=\s*["\'](\w+)["\']',
+    re.DOTALL,
+)
+_HBM_MANY_TO_ONE_NAME_RE = re.compile(r'<many-to-one\b[^>]*\bname\s*=\s*["\'](\w+)["\']')
+_HBM_MANY_TO_ONE_CLASS_RE = re.compile(r'<many-to-one\b[^>]*\bclass\s*=\s*["\'](\w+)["\']')
+_HBM_ONE_TO_MANY_ATTR_RE = re.compile(
+    r'<one-to-many\s[^>]*class\s*=\s*["\'](\w+)["\']'
+)
+
+
+def _extract_hibernate_xml(content: str, file_path: str, ext: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # <class name="com.example.User" table="users"> → model
+    for m in _HBM_CLASS_RE.finditer(content):
+        fqn = m.group(1)
+        name = fqn.split(".")[-1]  # last segment: com.example.User → User
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        # extract table attribute from the full line (tag may span just one line)
+        line_text = lines[ln] if ln < len(lines) else ""
+        tbl_m = _HBM_CLASS_TABLE_RE.search(line_text)
+        table_name = tbl_m.group(1) if tbl_m else ""
+        end = ln
+        # find matching </class>
+        for j in range(ln, min(ln + 200, len(lines))):
+            if "</class>" in lines[j]:
+                end = j
+                break
+        extra = ["hibernate", "xml", "mapping"]
+        if table_name:
+            extra.append(table_name.lower())
+        sym = _make_symbol(
+            file_path,
+            name,
+            "model",
+            ln,
+            end,
+            lines,
+            confidence="high",
+            exported=True,
+            extra_kw=extra,
+        )
+        if table_name:
+            sym["table_name"] = table_name
+        symbols.append(sym)
+
+        # scan the class body for <set> + <one-to-many> → has_many hook
+        body = "\n".join(lines[ln : end + 1])
+        for rel_m in _HBM_SET_ONE_TO_MANY_RE.finditer(body):
+            assoc = rel_m.group(1)
+            hook_name = f"has_many_{assoc}"
+            if hook_name not in seen:
+                seen.add(hook_name)
+                rel_ln = ln + body[: rel_m.start()].count("\n")
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        hook_name,
+                        "hook",
+                        rel_ln,
+                        rel_ln,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["hibernate", "has_many", assoc.lower()],
+                    )
+                )
+
+        # <many-to-one name="customer" class="Customer"/> → belongs_to hook
+        for mto_m in _HBM_MANY_TO_ONE_NAME_RE.finditer(body):
+            assoc = mto_m.group(1)
+            hook_name = f"belongs_to_{assoc}"
+            if hook_name not in seen:
+                seen.add(hook_name)
+                mto_ln = ln + body[: mto_m.start()].count("\n")
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        hook_name,
+                        "hook",
+                        mto_ln,
+                        mto_ln,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["hibernate", "belongs_to", assoc.lower()],
+                    )
+                )
+
+    # <entity class="com.example.Product"> (JPA orm.xml) → model
+    for m in _HBM_ENTITY_RE.finditer(content):
+        fqn = m.group(1)
+        name = fqn.split(".")[-1]
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "model",
+                ln,
+                ln,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["jpa", "orm_xml", "entity"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 20. CakePHP ORM (.php)
+# ---------------------------------------------------------------------------
+
+_CAKE_TABLE_CLASS_RE = re.compile(
+    r"class\s+(\w+Table)\s+extends\s+Table\b"
+)
+_CAKE_ENTITY_CLASS_RE = re.compile(
+    r"class\s+(\w+)\s+extends\s+Entity\b"
+)
+_CAKE_ASSOC_RE = re.compile(
+    r"\$this->(belongsTo|hasMany|hasOne|belongsToMany)\s*\(\s*['\"](\w+)['\"]"
+)
+
+
+def _singularize_simple(name: str) -> str:
+    """Strip trailing 's' if likely plural (very simple heuristic for CakePHP)."""
+    if name.endswith("ies"):
+        return name[:-3] + "y"
+    if name.endswith("s") and not name.endswith("ss"):
+        return name[:-1]
+    return name
+
+
+def _extract_cakephp_orm(content: str, file_path: str, ext: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # class UsersTable extends Table → model
+    for m in _CAKE_TABLE_CLASS_RE.finditer(content):
+        class_name = m.group(1)  # e.g. UsersTable
+        if class_name in seen:
+            continue
+        seen.add(class_name)
+        # Derive table_name: strip "Table" suffix, lower-snake
+        prefix = class_name[: -len("Table")] if class_name.endswith("Table") else class_name
+        table_name = re.sub(r"(?<!^)(?=[A-Z])", "_", prefix).lower()
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        body = "\n".join(lines[ln : end + 1])
+
+        sym = _make_symbol(
+            file_path,
+            class_name,
+            "model",
+            ln,
+            end,
+            lines,
+            confidence="high",
+            exported=True,
+            extra_kw=["cakephp", "table", table_name],
+        )
+        sym["table_name"] = table_name
+        symbols.append(sym)
+
+        # $this->hasMany('Orders') / $this->belongsTo('Groups') → hook symbols
+        for assoc_m in _CAKE_ASSOC_RE.finditer(body):
+            rel_type = assoc_m.group(1)
+            target = assoc_m.group(2)
+            hook_name = f"{class_name}.{rel_type}_{target}"
+            if hook_name not in seen:
+                seen.add(hook_name)
+                rel_ln = ln + body[: assoc_m.start()].count("\n")
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        hook_name,
+                        "hook",
+                        rel_ln,
+                        rel_ln,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["cakephp", rel_type.lower(), target.lower()],
+                    )
+                )
+
+    # class User extends Entity → model
+    for m in _CAKE_ENTITY_CLASS_RE.finditer(content):
+        class_name = m.group(1)
+        if class_name in seen:
+            continue
+        seen.add(class_name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                class_name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["cakephp", "entity"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 21. Yii2 ActiveRecord (.php)
+# ---------------------------------------------------------------------------
+
+_YII_AR_CLASS_RE = re.compile(
+    r"class\s+(\w+)\s+extends\s+(?:\\yii\\db\\)?(?:Active|Base)?ActiveRecord\b"
+)
+_YII_HAS_MANY_RE = re.compile(
+    r"return\s+\$this->hasMany\s*\(\s*(\w+)::class"
+)
+_YII_HAS_ONE_RE = re.compile(
+    r"return\s+\$this->hasOne\s*\(\s*(\w+)::class"
+)
+_YII_GETTER_RE = re.compile(
+    r"public\s+function\s+get(\w+)\s*\(\s*\)"
+)
+
+
+def _extract_yii_activerecord(content: str, file_path: str, ext: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _YII_AR_CLASS_RE.finditer(content):
+        class_name = m.group(1)
+        if class_name in seen:
+            continue
+        seen.add(class_name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        body = "\n".join(lines[ln : end + 1])
+
+        symbols.append(
+            _make_symbol(
+                file_path,
+                class_name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["yii2", "activerecord"],
+            )
+        )
+
+        # Scan getters that call hasMany/hasOne
+        # Match getter names and check their bodies
+        getter_positions = list(_YII_GETTER_RE.finditer(body))
+        for i, getter_m in enumerate(getter_positions):
+            getter_prop = getter_m.group(1)  # e.g. "Orders" from getOrders
+            # Body of this getter: from getter start to next getter or end of class body
+            getter_start = getter_m.start()
+            getter_end = getter_positions[i + 1].start() if i + 1 < len(getter_positions) else len(body)
+            getter_body = body[getter_start:getter_end]
+
+            # hasMany
+            hm = _YII_HAS_MANY_RE.search(getter_body)
+            if hm:
+                target = hm.group(1)
+                prop_lower = getter_prop[0].lower() + getter_prop[1:]
+                hook_name = f"has_many_{prop_lower}"
+                if hook_name not in seen:
+                    seen.add(hook_name)
+                    rel_ln = ln + body[:getter_m.start()].count("\n")
+                    symbols.append(
+                        _make_symbol(
+                            file_path,
+                            hook_name,
+                            "hook",
+                            rel_ln,
+                            rel_ln,
+                            lines,
+                            confidence="high",
+                            exported=False,
+                            extra_kw=["yii2", "has_many", target.lower()],
+                        )
+                    )
+
+            # hasOne
+            ho = _YII_HAS_ONE_RE.search(getter_body)
+            if ho:
+                target = ho.group(1)
+                prop_lower = getter_prop[0].lower() + getter_prop[1:]
+                hook_name = f"has_one_{prop_lower}"
+                if hook_name not in seen:
+                    seen.add(hook_name)
+                    rel_ln = ln + body[:getter_m.start()].count("\n")
+                    symbols.append(
+                        _make_symbol(
+                            file_path,
+                            hook_name,
+                            "hook",
+                            rel_ln,
+                            rel_ln,
+                            lines,
+                            confidence="high",
+                            exported=False,
+                            extra_kw=["yii2", "has_one", target.lower()],
+                        )
+                    )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 22. Doctrine ORM (.php)
+# ---------------------------------------------------------------------------
+
+_DOCTRINE_ENTITY_ANNOT_RE = re.compile(
+    r"@ORM\\Entity\b|@ORM\s*\\\s*Entity\b"
+)
+_DOCTRINE_ENTITY_ATTR_RE = re.compile(
+    r"#\[ORM\\Entity"
+)
+_DOCTRINE_TABLE_ANNOT_RE = re.compile(
+    r'@ORM\\Table\s*\(\s*name\s*=\s*["\']([^"\']+)["\']'
+)
+_DOCTRINE_TABLE_ATTR_RE = re.compile(
+    r'#\[ORM\\Table\s*\(\s*name\s*:\s*["\']([^"\']+)["\']'
+)
+_DOCTRINE_CLASS_RE = re.compile(
+    r"(?:abstract\s+)?class\s+(\w+)\b"
+)
+_DOCTRINE_OBJECT_REPO_RE = re.compile(
+    r"class\s+(\w+)\s+implements\s+(?:\\?\w+\\)*ObjectRepository\b"
+)
+_DOCTRINE_TARGET_ENTITY_RE = re.compile(
+    r'targetEntity\s*[=:]\s*(?:["\'](\w+)["\']|(\w+)::class)'
+)
+_DOCTRINE_ONE_TO_MANY_RE = re.compile(
+    r'@ORM\\OneToMany\s*\([^)]*targetEntity\s*=\s*["\'](\w+)["\']'
+    r'|#\[ORM\\OneToMany\s*\([^)]*targetEntity\s*:\s*["\'](\w+)["\']'
+)
+_DOCTRINE_MANY_TO_ONE_RE = re.compile(
+    r'@ORM\\ManyToOne\s*\([^)]*targetEntity\s*=\s*["\'](\w+)["\']'
+    r'|#\[ORM\\ManyToOne\s*\([^)]*targetEntity\s*:\s*["\'](\w+)["\']'
+)
+_DOCTRINE_MANY_TO_MANY_RE = re.compile(
+    r'@ORM\\ManyToMany\s*\([^)]*targetEntity\s*=\s*["\'](\w+)["\']'
+    r'|#\[ORM\\ManyToMany\s*\([^)]*targetEntity\s*:\s*["\'](\w+)["\']'
+)
+_DOCTRINE_REL_LABEL_RE = re.compile(
+    r'@ORM\\(OneToMany|ManyToOne|ManyToMany)\s*\('
+    r'|#\[ORM\\(OneToMany|ManyToOne|ManyToMany)\s*\('
+)
+
+
+def _extract_doctrine(content: str, file_path: str, ext: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # class Foo implements ObjectRepository → use_case
+    for m in _DOCTRINE_OBJECT_REPO_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "use_case",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["doctrine", "repository"],
+            )
+        )
+
+    # @ORM\Entity or #[ORM\Entity above a class → model
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        is_entity = bool(
+            _DOCTRINE_ENTITY_ANNOT_RE.search(line)
+            or _DOCTRINE_ENTITY_ATTR_RE.search(line)
+        )
+        if is_entity:
+            entity_line = i
+            table_name = ""
+            class_name: Optional[str] = None
+            # scan ahead up to 15 lines for @ORM\Table and class declaration
+            for j in range(i, min(i + 15, len(lines))):
+                tbl_m = _DOCTRINE_TABLE_ANNOT_RE.search(lines[j])
+                if not tbl_m:
+                    tbl_m = _DOCTRINE_TABLE_ATTR_RE.search(lines[j])
+                if tbl_m:
+                    table_name = tbl_m.group(1)
+                cls_m = _DOCTRINE_CLASS_RE.search(lines[j])
+                if cls_m and j >= i:
+                    class_name = cls_m.group(1)
+                    i = j
+                    break
+            if class_name and class_name not in seen:
+                seen.add(class_name)
+                end = _find_block_end(lines, i)
+                body = "\n".join(lines[entity_line : end + 1])
+
+                extra = ["doctrine", "entity"]
+                if table_name:
+                    extra.append(table_name.lower())
+
+                # Relationship annotations → hook symbols
+                for rel_m in _DOCTRINE_REL_LABEL_RE.finditer(body):
+                    rel_type = rel_m.group(1) or rel_m.group(2)
+                    hook_name = f"{class_name}.{rel_type}"
+                    if hook_name not in seen:
+                        seen.add(hook_name)
+                        rel_ln = entity_line + body[: rel_m.start()].count("\n")
+                        # extract target entity from the same annotation
+                        snippet = body[rel_m.start(): rel_m.start() + 200]
+                        te_m = _DOCTRINE_TARGET_ENTITY_RE.search(snippet)
+                        te_kw = [te_m.group(1) or te_m.group(2)] if te_m else []
+                        symbols.append(
+                            _make_symbol(
+                                file_path,
+                                hook_name,
+                                "hook",
+                                rel_ln,
+                                rel_ln,
+                                lines,
+                                confidence="high",
+                                exported=False,
+                                extra_kw=["doctrine", rel_type.lower()] + te_kw,
+                            )
+                        )
+
+                sym = _make_symbol(
+                    file_path,
+                    class_name,
+                    "model",
+                    entity_line,
+                    end,
+                    lines,
+                    confidence="high",
+                    exported=True,
+                    extra_kw=extra,
+                )
+                if table_name:
+                    sym["table_name"] = table_name
+                symbols.append(sym)
+        i += 1
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -2211,6 +2863,15 @@ def supports_orm(content: str, file_path: str, ext: str) -> bool:
             "diesel::table!",
             "#[derive(Queryable)]",
             "#[derive(Insertable)]",
+            # SeaORM
+            "use sea_orm::",
+            "sea_orm::entity::prelude",
+            "DeriveEntityModel",
+            # sqlx
+            "use sqlx::",
+            "sqlx::query",
+            "#[derive(FromRow)]",
+            "sqlx::FromRow",
         )
         for token in _quick_rs:
             if token in c_top:
@@ -2240,6 +2901,39 @@ def supports_orm(content: str, file_path: str, ext: str) -> bool:
             "< ActiveRecord::Base",
         )
         for token in _quick_rb:
+            if token in c_top:
+                return True
+        return False
+
+    if ext == ".xml":
+        # Hibernate HBM, JPA persistence.xml, orm.xml
+        _quick_xml = (
+            "hibernate-mapping",
+            "<persistence",
+            "<entity-mappings",
+        )
+        for token in _quick_xml:
+            if token in content:
+                return True
+        return False
+
+    if ext == ".php":
+        # CakePHP ORM, Yii2 ActiveRecord, Doctrine
+        _quick_php = (
+            # CakePHP
+            "extends Table",
+            "extends Entity",
+            # Yii2
+            "extends ActiveRecord",
+            "extends \\yii\\db\\ActiveRecord",
+            "extends \\yii\\db\\BaseActiveRecord",
+            # Doctrine
+            "@ORM\\Entity",
+            "#[ORM\\Entity",
+            "use Doctrine\\ORM\\",
+            "use Doctrine\\Persistence\\",
+        )
+        for token in _quick_php:
             if token in c_top:
                 return True
         return False
@@ -2384,6 +3078,23 @@ def extract_orm_symbols(content: str, file_path: str, ext: str) -> list[dict]:
         ):
             symbols.extend(_extract_diesel(content, file_path, ext))
 
+        # SeaORM
+        if (
+            "use sea_orm::" in content
+            or "sea_orm::entity::prelude" in content
+            or "DeriveEntityModel" in content
+        ):
+            symbols.extend(_extract_seaorm(content, file_path, ext))
+
+        # sqlx
+        if (
+            "use sqlx::" in content
+            or "sqlx::query" in content
+            or "#[derive(FromRow)]" in content
+            or "sqlx::FromRow" in content
+        ):
+            symbols.extend(_extract_sqlx(content, file_path, ext))
+
     elif ext == ".java":
         # Spring Data JPA / Hibernate
         if (
@@ -2399,6 +3110,41 @@ def extract_orm_symbols(content: str, file_path: str, ext: str) -> list[dict]:
         # ActiveRecord (Rails)
         if "< ApplicationRecord" in content or "< ActiveRecord::Base" in content:
             symbols.extend(_extract_activerecord(content, file_path, ext))
+
+    elif ext == ".xml":
+        # Hibernate HBM / JPA orm.xml / persistence.xml
+        if (
+            "hibernate-mapping" in content
+            or "<persistence" in content
+            or "<entity-mappings" in content
+        ):
+            symbols.extend(_extract_hibernate_xml(content, file_path, ext))
+
+    elif ext == ".php":
+        # CakePHP ORM
+        if (
+            "extends Table" in content
+            or "extends Entity" in content
+            or ("class" in content and "Table" in content and "$this->" in content)
+        ):
+            symbols.extend(_extract_cakephp_orm(content, file_path, ext))
+
+        # Yii2 ActiveRecord
+        if (
+            "extends ActiveRecord" in content
+            or "extends \\yii\\db\\ActiveRecord" in content
+            or "extends \\yii\\db\\BaseActiveRecord" in content
+        ):
+            symbols.extend(_extract_yii_activerecord(content, file_path, ext))
+
+        # Doctrine ORM
+        if (
+            "@ORM\\Entity" in content
+            or "#[ORM\\Entity" in content
+            or "use Doctrine\\ORM\\" in content
+            or "use Doctrine\\Persistence\\" in content
+        ):
+            symbols.extend(_extract_doctrine(content, file_path, ext))
 
     # Deduplicate by id (in case two extractors overlap on a generic file)
     seen_ids: set[str] = set()
@@ -2659,6 +3405,87 @@ def parse_orm_imports(content: str, file_id: str, ext: str) -> list[dict]:
                 }
             )
 
+    elif ext == ".xml":
+        # Hibernate: <many-to-one class="Foo"> → use edge to Foo (class attr is the target)
+        for m in _HBM_MANY_TO_ONE_CLASS_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "use",
+                    "orm": "hibernate_xml",
+                }
+            )
+        # Hibernate: <one-to-many class="Bar"> → use edge to Bar
+        for m in _HBM_ONE_TO_MANY_ATTR_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "use",
+                    "orm": "hibernate_xml",
+                }
+            )
+
+    elif ext == ".php":
+        # CakePHP: belongsTo('Foo') → use edge to Foo
+        # hasMany('Bars') → use edge to Bar (singularize)
+        for m in _CAKE_ASSOC_RE.finditer(content):
+            rel_type = m.group(1)
+            target = m.group(2)
+            if rel_type == "belongsTo":
+                edges.append(
+                    {
+                        "source": file_id,
+                        "target_name": target,
+                        "edge_type": "use",
+                        "orm": "cakephp",
+                    }
+                )
+            elif rel_type in ("hasMany", "hasOne", "belongsToMany"):
+                edges.append(
+                    {
+                        "source": file_id,
+                        "target_name": _singularize_simple(target),
+                        "edge_type": "use",
+                        "orm": "cakephp",
+                    }
+                )
+
+        # Yii2: hasMany(Foo::class, ...) → use edge to Foo
+        for m in _YII_HAS_MANY_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "use",
+                    "orm": "yii2",
+                }
+            )
+        # Yii2: hasOne(Bar::class, ...) → use edge to Bar
+        for m in _YII_HAS_ONE_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "use",
+                    "orm": "yii2",
+                }
+            )
+
+        # Doctrine: targetEntity="Foo" or targetEntity=Foo::class → use edge to Foo
+        for m in _DOCTRINE_TARGET_ENTITY_RE.finditer(content):
+            target = m.group(1) or m.group(2)
+            if target:
+                edges.append(
+                    {
+                        "source": file_id,
+                        "target_name": target,
+                        "edge_type": "use",
+                        "orm": "doctrine",
+                    }
+                )
+
     return edges
 
 
@@ -2762,6 +3589,118 @@ end
     assert "LineItem" in ar_targets, f"AR has_many edge: {ar_targets}"
 
     print("PASS  _test_phase26_orm (Diesel + JPA + ActiveRecord)")
+
+
+# ---------------------------------------------------------------------------
+# Phase-27 ORM tests: Hibernate XML, CakePHP, Yii2, Doctrine
+# ---------------------------------------------------------------------------
+
+
+def _test_phase27_orm() -> None:
+    # ── Hibernate XML ─────────────────────────────────────────────────────────
+    xml_code = '''<?xml version="1.0"?>
+<!DOCTYPE hibernate-mapping PUBLIC "-//Hibernate/Hibernate Mapping DTD//EN"
+  "http://hibernate.sourceforge.net/hibernate-mapping-3.0.dtd">
+<hibernate-mapping>
+  <class name="com.example.User" table="users">
+    <id name="id"/>
+    <property name="name"/>
+    <set name="orders"><one-to-many class="Order"/></set>
+    <many-to-one name="role" class="Role"/>
+  </class>
+</hibernate-mapping>'''
+    assert supports_orm(xml_code, "User.hbm.xml", ".xml"), "Hibernate not detected"
+    syms = extract_orm_symbols(xml_code, "User.hbm.xml", ".xml")
+    names = [s["name"] for s in syms]
+    assert "User" in names, f"Hibernate class: {names}"
+    assert any(s["symbol_type"] == "model" and s["name"] == "User" for s in syms), \
+        f"Hibernate model symbol missing: {syms}"
+    # has_many hook for orders
+    assert any("has_many_orders" in s["name"] for s in syms), \
+        f"Hibernate has_many hook missing: {names}"
+    # belongs_to hook for role
+    assert any("belongs_to_role" in s["name"] for s in syms), \
+        f"Hibernate belongs_to hook missing: {names}"
+    # table_name on model symbol
+    user_sym = next(s for s in syms if s["name"] == "User")
+    assert user_sym.get("table_name") == "users", f"Hibernate table_name: {user_sym}"
+    # edges
+    xml_edges = parse_orm_imports(xml_code, "User.hbm.xml", ".xml")
+    xml_targets = [e["target_name"] for e in xml_edges]
+    assert "Role" in xml_targets, f"Hibernate ManyToOne edge: {xml_targets}"
+    assert "Order" in xml_targets, f"Hibernate OneToMany edge: {xml_targets}"
+
+    # ── Doctrine ─────────────────────────────────────────────────────────────
+    php_doctrine = '''<?php
+use Doctrine\\ORM\\Mapping as ORM;
+/**
+ * @ORM\\Entity
+ * @ORM\\Table(name="products")
+ */
+class Product {
+    /** @ORM\\ManyToOne(targetEntity="Category") */
+    private $category;
+}'''
+    assert supports_orm(php_doctrine, "Product.php", ".php"), "Doctrine not detected"
+    syms2 = extract_orm_symbols(php_doctrine, "Product.php", ".php")
+    names2 = [s["name"] for s in syms2]
+    assert "Product" in names2, f"Doctrine: {names2}"
+    assert any(s["name"] == "Product" and s["symbol_type"] == "model" for s in syms2), \
+        f"Doctrine model missing: {syms2}"
+    assert any(s["symbol_type"] == "hook" for s in syms2), \
+        f"Doctrine hook missing: {syms2}"
+    prod_sym = next(s for s in syms2 if s["name"] == "Product")
+    assert prod_sym.get("table_name") == "products", f"Doctrine table_name: {prod_sym}"
+    doc_edges = parse_orm_imports(php_doctrine, "Product.php", ".php")
+    doc_targets = [e["target_name"] for e in doc_edges]
+    assert "Category" in doc_targets, f"Doctrine targetEntity edge: {doc_targets}"
+
+    # ── CakePHP ORM ───────────────────────────────────────────────────────────
+    php_cake = '''<?php
+class UsersTable extends Table {
+    public function initialize(array $config) {
+        $this->hasMany('Orders');
+        $this->belongsTo('Groups');
+    }
+}'''
+    assert supports_orm(php_cake, "UsersTable.php", ".php"), "CakePHP not detected"
+    syms3 = extract_orm_symbols(php_cake, "UsersTable.php", ".php")
+    names3 = [s["name"] for s in syms3]
+    assert "UsersTable" in names3, f"CakePHP ORM: {names3}"
+    assert any(s["name"] == "UsersTable" and s["symbol_type"] == "model" for s in syms3), \
+        f"CakePHP model missing: {syms3}"
+    assert any(s["symbol_type"] == "hook" for s in syms3), \
+        f"CakePHP hook missing: {syms3}"
+    cake_edges = parse_orm_imports(php_cake, "UsersTable.php", ".php")
+    cake_targets = [e["target_name"] for e in cake_edges]
+    assert "Groups" in cake_targets, f"CakePHP belongsTo edge: {cake_targets}"
+
+    # ── Yii2 ActiveRecord ─────────────────────────────────────────────────────
+    php_yii = '''<?php
+class Order extends \\yii\\db\\ActiveRecord {
+    public function getUser() {
+        return $this->hasOne(User::class, ['id' => 'user_id']);
+    }
+    public function getItems() {
+        return $this->hasMany(Item::class, ['order_id' => 'id']);
+    }
+}'''
+    assert supports_orm(php_yii, "Order.php", ".php"), "Yii2 not detected"
+    syms4 = extract_orm_symbols(php_yii, "Order.php", ".php")
+    names4 = [s["name"] for s in syms4]
+    assert "Order" in names4, f"Yii AR: {names4}"
+    assert any(s["name"] == "Order" and s["symbol_type"] == "model" for s in syms4), \
+        f"Yii2 model missing: {syms4}"
+    assert any("has_one" in s["name"] for s in syms4), \
+        f"Yii2 has_one hook missing: {syms4}"
+    assert any("has_many" in s["name"] for s in syms4), \
+        f"Yii2 has_many hook missing: {syms4}"
+    yii_edges = parse_orm_imports(php_yii, "Order.php", ".php")
+    yii_targets = [e["target_name"] for e in yii_edges]
+    assert "User" in yii_targets, f"Yii2 hasOne edge: {yii_targets}"
+    assert "Item" in yii_targets, f"Yii2 hasMany edge: {yii_targets}"
+
+    print("PASS  _test_phase27_orm (Hibernate XML + CakePHP + Yii2 + Doctrine)")
 
 
 # ---------------------------------------------------------------------------
@@ -3023,4 +3962,67 @@ class User extends Model {
     assert any(s["name"] == "User" for s in syms), f"Objection model: {syms}"
     print("PASS  Objection.js")
 
+    _test_phase27_orm()
+
     print("\nALL ORM TESTS PASSED")
+
+
+# ---------------------------------------------------------------------------
+# Phase-29 ORM tests: SeaORM + sqlx
+# ---------------------------------------------------------------------------
+
+
+def _test_phase29_orm() -> None:
+    # ── SeaORM ────────────────────────────────────────────────────────────────
+    rs_sea = '''
+use sea_orm::entity::prelude::*;
+#[derive(Clone, Debug, DeriveEntityModel)]
+#[sea_orm(table_name = "products")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i32,
+    pub name: String,
+}
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {
+    #[sea_orm(belongs_to = "super::category::Entity")]
+    Category,
+}
+'''
+    assert supports_orm(rs_sea, 'product.rs', '.rs'), 'SeaORM not detected'
+    syms = extract_orm_symbols(rs_sea, 'product.rs', '.rs')
+    names = [s['name'] for s in syms]
+    assert any('Model' in n or 'products' in n for n in names), f'SeaORM model: {names}'
+    # relation hook from DeriveRelation enum
+    assert any('relation_' in n or 'category' in n.lower() for n in names), \
+        f'SeaORM relation hook: {names}'
+    # table_name field
+    model_sym = next((s for s in syms if s['name'] == 'Model'), None)
+    assert model_sym is not None, f'SeaORM Model symbol missing: {names}'
+    assert model_sym.get('table_name') == 'products', f'SeaORM table_name: {model_sym}'
+
+    # ── sqlx ──────────────────────────────────────────────────────────────────
+    rs_sqlx = '''
+use sqlx::FromRow;
+#[derive(FromRow, Debug)]
+pub struct User {
+    pub id: i32,
+    pub name: String,
+}
+'''
+    assert supports_orm(rs_sqlx, 'user.rs', '.rs'), 'sqlx not detected'
+    syms2 = extract_orm_symbols(rs_sqlx, 'user.rs', '.rs')
+    names2 = [s['name'] for s in syms2]
+    assert 'User' in names2, f'sqlx FromRow: {names2}'
+    assert any(s['symbol_type'] == 'model' and s['name'] == 'User' for s in syms2), \
+        f'sqlx model type: {syms2}'
+
+    print("PASS  _test_phase29_orm (SeaORM + sqlx)")
+
+
+def _test_phase29() -> None:
+    _test_phase29_orm()
+
+
+if __name__ == "__main__":
+    _test_phase29_orm()
