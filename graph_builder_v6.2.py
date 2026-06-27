@@ -23,6 +23,61 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from graph_builder_parsers import (
+    extract_symbols_for_ext as _ext_extract_symbols,
+    parse_imports_for_ext as _ext_parse_imports,
+    supports_ext as _ext_supports,
+    LANG_EXTENSIONS as _EXT_LANG_MAP,
+)
+
+try:
+    from graph_builder_prisma import (
+        extract_symbols_for_prisma as _prisma_extract_symbols,
+        parse_imports_for_prisma as _prisma_parse_imports,
+        PRISMA_EXTS as _PRISMA_EXTS,
+    )
+    _PRISMA_AVAILABLE = True
+except ImportError:
+    _PRISMA_AVAILABLE = False
+    _PRISMA_EXTS: set = set()
+
+try:
+    from graph_builder_service_graph import (
+        extract_contract_symbols as _sg_extract_contract,
+        is_contract_file as _sg_is_contract,
+        extract_service_graph_edges as _sg_extract_mq_edges,
+        CONTRACT_EXTS as _SG_CONTRACT_EXTS,
+        SERVICE_GRAPH_EXTS as _SG_SOURCE_EXTS,
+    )
+    _SERVICE_GRAPH_AVAILABLE = True
+except ImportError:
+    _SERVICE_GRAPH_AVAILABLE = False
+    _SG_CONTRACT_EXTS: set = set()
+    _SG_SOURCE_EXTS: set = set()
+
+try:
+    from graph_builder_infra import (
+        extract_infra_symbols as _infra_extract_symbols,
+        parse_infra_imports as _infra_parse_imports,
+        is_infra_file as _infra_is_infra,
+        INFRA_EXTS as _INFRA_EXTS,
+    )
+    _INFRA_AVAILABLE = True
+except ImportError:
+    _INFRA_AVAILABLE = False
+    _INFRA_EXTS: set = set()
+
+try:
+    from graph_builder_routes import (
+        extract_routes_for_file as _routes_extract,
+        extract_file_based_route as _routes_file_based,
+        ROUTE_EXTS as _ROUTE_EXTS,
+    )
+    _ROUTES_AVAILABLE = True
+except ImportError:
+    _ROUTES_AVAILABLE = False
+    _ROUTE_EXTS: set = set()
+
 # ── Tree-sitter setup ──────────────────────────────────────────────────────────
 try:
     import tree_sitter_typescript as _tsts
@@ -59,7 +114,16 @@ MAX_CONTENT_CHARS = 24_000
 # Only extract symbols from code files (not config/markdown)
 SYMBOL_EXTS = {".ts", ".tsx", ".js", ".jsx", ".py", ".php", ".go",
                ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx",
-               ".rs"}
+               ".rs",
+               ".java", ".kt", ".kts",
+               ".rb", ".rake", ".gemspec",
+               ".sql", ".ddl",
+               ".sh", ".bash", ".zsh", ".ksh",
+               ".scala", ".sc", ".sbt",
+               ".cs", ".csx",
+               ".prisma",
+               ".proto", ".graphql", ".gql",
+               ".tf", ".tfvars"}
 
 # ── Named import regexes (for dead-export detection — unchanged from v6) ──────
 _RE_TS_NAMED_IMPORT = re.compile(
@@ -123,6 +187,9 @@ class Node:
     body_hash: str = ""
     confidence: str = ""    # high | medium | low
     exported: bool = False
+    # api_route-specific
+    route_method: str = ""  # GET | POST | PUT | DELETE | PATCH | ANY
+    route_path: str = ""    # /users/:id
 
     def as_dict(self) -> dict:
         d = {
@@ -145,6 +212,9 @@ class Node:
             d["body_hash"] = self.body_hash
             d["confidence"] = self.confidence
             d["exported"] = self.exported
+            if self.symbol_type == "api_route":
+                d["route_method"] = self.route_method
+                d["route_path"] = self.route_path
         return d
 
 
@@ -884,10 +954,13 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
                 edges.append({"from": file_id, "to": to, "rel": "requires"})
 
         # File-reference edges
-        for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx|rs))', text):
+        for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx|rs|java|kt|kts|rb|sql|sh|scala|cs))', text):
             candidate = match.group(1)
             if "/" in candidate:
                 edges.append({"from": file_id, "to": candidate, "rel": "references"})
+        # MQ edges for TS/JS
+        if _SERVICE_GRAPH_AVAILABLE and ext in _SG_SOURCE_EXTS:
+            edges.extend(_sg_extract_mq_edges(text, file_id, ext))
         return edges
 
     # C/C++ #include parsing
@@ -897,6 +970,27 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
     # Rust use/extern crate parsing
     if ext == ".rs":
         return _parse_imports_rust(text, file_id)
+
+    # New language import parsers (Java, Kotlin, Ruby, SQL, Shell, Scala, C#)
+    if _ext_supports(ext):
+        edges = _ext_parse_imports(text, file_id, ext)
+        # Also add MQ edges for supported source languages
+        if _SERVICE_GRAPH_AVAILABLE and ext in _SG_SOURCE_EXTS:
+            edges.extend(_sg_extract_mq_edges(text, file_id, ext))
+        return edges
+
+    # Prisma import edges (model references via @relation)
+    if _PRISMA_AVAILABLE and ext in _PRISMA_EXTS:
+        return _prisma_parse_imports(text, file_id, ext)
+
+    # Contract file edges (proto imports, OpenAPI $ref, etc.)
+    if _SERVICE_GRAPH_AVAILABLE and ext in _SG_CONTRACT_EXTS:
+        _, contract_edges = _sg_extract_contract(text, file_id)
+        return contract_edges
+
+    # IaC import edges (Terraform modules, Docker depends_on, K8s refs)
+    if _INFRA_AVAILABLE and _infra_is_infra(file_id):
+        return _infra_parse_imports(text, file_id, file_id)
 
     # Regex fallback (identical to v6 parse_relations)
     edges: list[dict] = []
@@ -915,10 +1009,13 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
     if path.suffix == ".swift":
         for match in re.finditer(r'^import\s+([A-Za-z_]\w*)', text, flags=re.MULTILINE):
             edges.append({"from": file_id, "to": match.group(1), "rel": "imports"})
-    for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx|rs))', text):
+    for match in re.finditer(r'([A-Za-z0-9_\-\/]+\.(go|py|ts|tsx|js|jsx|swift|md|json|yaml|yml|c|cpp|cc|cxx|h|hpp|hh|hxx|rs|java|kt|kts|rb|sql|sh|scala|cs))', text):
         candidate = match.group(1)
         if "/" in candidate:
             edges.append({"from": file_id, "to": candidate, "rel": "references"})
+    # MQ edges for .py / .go (which fall through to regex fallback)
+    if _SERVICE_GRAPH_AVAILABLE and ext in _SG_SOURCE_EXTS:
+        edges.extend(_sg_extract_mq_edges(text, file_id, ext))
     return edges
 
 
@@ -1082,6 +1179,16 @@ def should_scan(path: Path) -> bool:
         ".json", ".yaml", ".yml", ".md",
         ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx",
         ".rs",
+        ".java", ".kt", ".kts",
+        ".rb", ".rake", ".gemspec",
+        ".sql", ".ddl",
+        ".sh", ".bash", ".zsh", ".ksh",
+        ".scala", ".sc", ".sbt",
+        ".cs", ".csx",
+        ".prisma",
+        ".proto", ".graphql", ".gql",
+        ".tf", ".tfvars",
+        ".hcl",
     }
 
 
@@ -1130,6 +1237,15 @@ def _extract_symbols_for_file(content: str, file_id: str, ext: str) -> list[dict
         return extract_symbols_cpp(content, file_id)
     if ext == ".rs":
         return extract_symbols_rust(content, file_id)
+    if _ext_supports(ext):
+        return _ext_extract_symbols(content, file_id, ext)
+    if _PRISMA_AVAILABLE and ext in _PRISMA_EXTS:
+        return _prisma_extract_symbols(content, file_id, ext)
+    if _SERVICE_GRAPH_AVAILABLE and ext in _SG_CONTRACT_EXTS:
+        syms, _ = _sg_extract_contract(content, file_id)
+        return syms
+    if _INFRA_AVAILABLE and _infra_is_infra(file_id):
+        return _infra_extract_symbols(content, file_id)
     return []
 
 
@@ -1143,6 +1259,8 @@ def _append_symbol_nodes(nodes: list[Node], edges: list[dict], syms: list[dict],
             line_start=s["line_start"], line_end=s["line_end"],
             body_hash=s["body_hash"], confidence=s["confidence"],
             exported=s["exported"],
+            route_method=s.get("route_method", ""),
+            route_path=s.get("route_path", ""),
         ))
         edges.append({"from": file_id, "to": s["id"], "rel": "contains"})
 
@@ -1193,6 +1311,8 @@ def scan(root: Path, existing_nodes: dict[str, dict] | None = None) -> dict:
                 edges.extend(parse_relations(path, content, root))
                 if ext in SYMBOL_EXTS:
                     _append_symbol_nodes(nodes, edges, _extract_symbols_for_file(content, file_id, ext), file_id, ext)
+                if _ROUTES_AVAILABLE and ext in _ROUTE_EXTS:
+                    _append_symbol_nodes(nodes, edges, _routes_extract(content, file_id, ext), file_id, ext)
                 continue
 
         summary = _make_summary(content, file_id, ext)
@@ -1204,6 +1324,8 @@ def scan(root: Path, existing_nodes: dict[str, dict] | None = None) -> dict:
         edges.extend(parse_relations(path, content, root))
         if ext in SYMBOL_EXTS:
             _append_symbol_nodes(nodes, edges, _extract_symbols_for_file(content, file_id, ext), file_id, ext)
+        if _ROUTES_AVAILABLE and ext in _ROUTE_EXTS:
+            _append_symbol_nodes(nodes, edges, _routes_extract(content, file_id, ext), file_id, ext)
 
     unique_edges = dedupe_edges(edges)
     symbol_count = sum(1 for n in nodes if n.kind == "symbol")

@@ -4460,6 +4460,18 @@ def main() -> int:
     _bind_host = os.environ.get("HOST", "127.0.0.1")
     mcp = build_server(host=_bind_host, port=port)
 
+    # Register Phase 2-8 tools (routes, service graph, infra, security, health, analysis, observability)
+    try:
+        from mcp_tools_integration import register_all_new_tools as _register_new_tools
+        _register_new_tools(
+            mcp,
+            get_dg_data_dir=lambda: DG_DATA_DIR,
+            get_project_root=lambda: PROJECT_ROOT,
+            get_turn_state=lambda: TURN_STATE,
+        )
+    except ImportError:
+        pass  # mcp_tools_integration.py not present — graceful degradation
+
     # Custom /ingest-graph route: accepts pre-built graph JSON from local machine
     # so users can run: graph_builder.py locally -> POST here -> chat via MCP
     async def ingest_graph(request: Request) -> JSONResponse:
