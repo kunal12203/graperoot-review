@@ -14,6 +14,9 @@ Checks implemented
 5.  Unhandled error paths                   (Python async, Go, JS/TS, Java)
 6.  Import cycles (enhanced)                (symbols + fix hint)
 7.  Dead event handlers                     (Spring + JS EventEmitter patterns)
+8.  Missing pagination                      (SQLAlchemy, Django ORM, TypeORM, Mongoose, GORM, raw SQL)
+9.  Missing indexes on FK fields            (Prisma, SQLAlchemy, Django, TypeORM, ActiveRecord)
+10. N+1 query risk                          (Python, TypeScript, Ruby)
 
 Aggregator
 ----------
@@ -1255,6 +1258,497 @@ def find_dead_event_handlers(graph: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 8. Missing pagination
+# ---------------------------------------------------------------------------
+
+# Python — SQLAlchemy: .all() call (we check whether .limit( appears before it)
+_SA_ALL_RE = re.compile(r"\.all\s*\(\s*\)")
+_SA_LIMIT_BEFORE_RE = re.compile(r"\.limit\s*\(")
+
+# Python — Django ORM: .objects.all() or .objects.filter() without slicing/iterator/paginator
+_DJ_QUERY_RE = re.compile(r"\.objects\s*\.\s*(?:all|filter|exclude)\s*\(")
+_DJ_SAFE_RE  = re.compile(
+    r"(?:\.limit\s*\(|\[:\d|\[:[-\w]|\.iterator\s*\(|Paginator\s*\(|paginate\s*\()",
+)
+
+# TypeScript/JavaScript — TypeORM: .find() without take / limit
+_TS_TYPEORM_FIND_RE   = re.compile(r"\brepository\b.*?\.find\s*\(|\.find\s*\(\s*\{")
+_TS_TAKE_LIMIT_RE     = re.compile(r"\btake\s*:|\.limit\s*\(")
+
+# TypeScript/JavaScript — Mongoose: Model.find() without .limit()
+_TS_MONGOOSE_FIND_RE  = re.compile(r"""[A-Z]\w*\.find\s*\(""")
+_TS_MONGOOSE_LIMIT_RE = re.compile(r"\.limit\s*\(")
+
+# Go — GORM: .Find(&v) without .Limit(n)
+_GO_GORM_FIND_RE  = re.compile(r"\.Find\s*\(&\w+\)")
+_GO_GORM_LIMIT_RE = re.compile(r"\.Limit\s*\(")
+
+# Raw SQL SELECT without LIMIT
+_SQL_SELECT_RE = re.compile(
+    r"""(?:["'`])?\s*SELECT\b.+?\bFROM\b""",
+    re.IGNORECASE | re.DOTALL,
+)
+_SQL_LIMIT_RE  = re.compile(r"\bLIMIT\b", re.IGNORECASE)
+
+# Window to look backward for a .limit() in a query chain (chars)
+_CHAIN_WINDOW = 300
+
+
+def find_missing_pagination(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect database query calls that fetch unbounded result sets.
+
+    Patterns covered:
+    - SQLAlchemy .all() without a preceding .limit()
+    - Django ORM .objects.all/filter/exclude() without slicing / .iterator() / Paginator
+    - TypeORM .find() without take: / .limit()
+    - Mongoose .find() without .limit()
+    - GORM .Find() without .Limit()
+    - Raw SQL SELECT … FROM … without LIMIT
+
+    Returns
+    -------
+    list[dict] with type="missing_pagination".
+    """
+    issues: list[dict] = []
+    _PY_EXTS  = {".py"}
+    _TS_EXTS  = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+    _GO_EXTS  = {".go"}
+    _ALL_EXTS = _PY_EXTS | _TS_EXTS | _GO_EXTS
+
+    for fpath, content in _iter_source_files(
+        project_root, _ALL_EXTS, skip_tests=True, max_files=3000
+    ):
+        rel = _rel(fpath, project_root)
+        ext = fpath.suffix.lower()
+        lines_list = content.splitlines()
+
+        if ext in _PY_EXTS:
+            # SQLAlchemy: .all() without .limit() in preceding chain window
+            for m in _SA_ALL_RE.finditer(content):
+                line_no = content[: m.start()].count("\n") + 1
+                # look back up to _CHAIN_WINDOW chars for .limit(
+                window_start = max(0, m.start() - _CHAIN_WINDOW)
+                window = content[window_start: m.start()]
+                if not _SA_LIMIT_BEFORE_RE.search(window):
+                    snippet = lines_list[line_no - 1].strip()
+                    issues.append({
+                        "type": "missing_pagination",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "pattern": "SQLAlchemy .all() without .limit()",
+                        "severity": "medium",
+                        "fix": "Add .limit(page_size) before .all() or use paginate().",
+                    })
+
+            # Django ORM
+            for m in _DJ_QUERY_RE.finditer(content):
+                line_no = content[: m.start()].count("\n") + 1
+                # look forward and backward for safe pagination
+                window_start = max(0, m.start() - 50)
+                window_end   = min(len(content), m.end() + 300)
+                window = content[window_start:window_end]
+                if not _DJ_SAFE_RE.search(window):
+                    snippet = lines_list[line_no - 1].strip()
+                    issues.append({
+                        "type": "missing_pagination",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "pattern": "Django ORM .objects.all/filter() without pagination",
+                        "severity": "medium",
+                        "fix": "Use Django Paginator, queryset slicing [:N], or .iterator().",
+                    })
+
+        elif ext in _TS_EXTS:
+            # TypeORM .find()
+            for m in _TS_TYPEORM_FIND_RE.finditer(content):
+                line_no = content[: m.start()].count("\n") + 1
+                window_start = max(0, m.start() - 50)
+                window_end   = min(len(content), m.end() + 200)
+                window = content[window_start:window_end]
+                if not _TS_TAKE_LIMIT_RE.search(window):
+                    snippet = lines_list[line_no - 1].strip()
+                    issues.append({
+                        "type": "missing_pagination",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "pattern": "TypeORM .find() without {take: N} or .limit()",
+                        "severity": "medium",
+                        "fix": "Pass {take: pageSize, skip: offset} to .find() or use .limit(N).",
+                    })
+
+            # Mongoose .find()
+            for m in _TS_MONGOOSE_FIND_RE.finditer(content):
+                line_no = content[: m.start()].count("\n") + 1
+                window_start = max(0, m.start() - 50)
+                window_end   = min(len(content), m.end() + 200)
+                window = content[window_start:window_end]
+                if not _TS_MONGOOSE_LIMIT_RE.search(window):
+                    snippet = lines_list[line_no - 1].strip()
+                    issues.append({
+                        "type": "missing_pagination",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "pattern": "Mongoose .find() without .limit()",
+                        "severity": "medium",
+                        "fix": "Chain .limit(pageSize).skip(offset) on the Mongoose query.",
+                    })
+
+        elif ext in _GO_EXTS:
+            # GORM .Find()
+            for m in _GO_GORM_FIND_RE.finditer(content):
+                line_no = content[: m.start()].count("\n") + 1
+                window_start = max(0, m.start() - _CHAIN_WINDOW)
+                window = content[window_start: m.start()]
+                if not _GO_GORM_LIMIT_RE.search(window):
+                    snippet = lines_list[line_no - 1].strip()
+                    issues.append({
+                        "type": "missing_pagination",
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": snippet,
+                        "pattern": "GORM .Find() without .Limit()",
+                        "severity": "medium",
+                        "fix": "Chain .Limit(pageSize).Offset(offset) before .Find().",
+                    })
+
+    # Raw SQL strings across all source files
+    for fpath, content in _iter_source_files(
+        project_root, _ALL_EXTS, skip_tests=True, max_files=3000
+    ):
+        rel = _rel(fpath, project_root)
+        lines_list = content.splitlines()
+        for m in _SQL_SELECT_RE.finditer(content):
+            # Check if LIMIT appears in the same string literal (up to 400 chars ahead)
+            window_end = min(len(content), m.end() + 400)
+            window = content[m.start():window_end]
+            if not _SQL_LIMIT_RE.search(window):
+                line_no = content[: m.start()].count("\n") + 1
+                snippet = lines_list[line_no - 1].strip()[:100]
+                issues.append({
+                    "type": "missing_pagination",
+                    "file": rel,
+                    "line": line_no,
+                    "snippet": snippet,
+                    "pattern": "Raw SQL SELECT without LIMIT clause",
+                    "severity": "medium",
+                    "fix": "Add a LIMIT clause (and OFFSET for pagination) to the SQL query.",
+                })
+
+    # Deduplicate by (file, line) — raw SQL scan may overlap with ORM scan
+    seen: set[tuple[str, int]] = set()
+    unique: list[dict] = []
+    for item in issues:
+        key = (item["file"], item["line"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# 9. Missing indexes on foreign key fields
+# ---------------------------------------------------------------------------
+
+# Prisma: @relation(...)  — field name from preceding line
+_PRISMA_MODEL_RE    = re.compile(r"^model\s+(\w+)\s*\{", re.MULTILINE)
+_PRISMA_RELATION_RE = re.compile(r"^\s+(\w+)\s+\w+.*?@relation", re.MULTILINE)
+_PRISMA_INDEX_RE    = re.compile(r"@@index\s*\(\s*\[([^\]]+)\]")
+
+# SQLAlchemy: Column(Integer, ForeignKey(...)) without index=True
+_SA_FK_COL_RE     = re.compile(
+    r"""^(\s*)(\w+)\s*=\s*(?:mapped_column|Column)\s*\([^)]*ForeignKey\s*\([^)]+\)""",
+    re.MULTILINE,
+)
+_SA_INDEX_TRUE_RE = re.compile(r"\bindex\s*=\s*True")
+
+# Django: ForeignKey(..., db_index=False)  — Django adds index by default, flag only explicit False
+_DJ_FK_NO_IDX_RE  = re.compile(
+    r"""(\w+)\s*=\s*models\.ForeignKey\s*\([^)]*db_index\s*=\s*False[^)]*\)""",
+    re.MULTILINE,
+)
+
+# TypeORM: @ManyToOne or @JoinColumn without preceding @Index()
+_TS_MANYTOONE_RE  = re.compile(r"@(?:ManyToOne|JoinColumn)\s*\(")
+_TS_INDEX_RE      = re.compile(r"@Index\s*\(")
+
+# ActiveRecord: belongs_to :model
+_AR_BELONGS_TO_RE = re.compile(r"^\s*belongs_to\s+:(\w+)", re.MULTILINE)
+# migration add_index
+_AR_ADD_INDEX_RE  = re.compile(r"add_index\s+[:\w\"']+,\s*:(\w+)")
+
+
+def find_missing_indexes(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect foreign key fields that likely lack a database index.
+
+    Covers Prisma, SQLAlchemy, Django (explicit db_index=False only),
+    TypeORM, and ActiveRecord.
+
+    Returns
+    -------
+    list[dict] with type="missing_index".
+    """
+    issues: list[dict] = []
+    root = Path(project_root)
+
+    # ── Prisma ──────────────────────────────────────────────────────────────
+    for fpath, content in _iter_source_files(
+        root, {".prisma"}, skip_tests=False, max_files=500
+    ):
+        rel = _rel(fpath, project_root)
+        # Find each model block
+        model_starts = list(_PRISMA_MODEL_RE.finditer(content))
+        for idx_m, model_m in enumerate(model_starts):
+            model_name = model_m.group(1)
+            block_start = model_m.end()
+            block_end   = model_starts[idx_m + 1].start() if idx_m + 1 < len(model_starts) else len(content)
+            block = content[block_start:block_end]
+
+            # Collect @@index field names in this block
+            indexed_fields: set[str] = set()
+            for im in _PRISMA_INDEX_RE.finditer(block):
+                for fname in im.group(1).split(","):
+                    indexed_fields.add(fname.strip())
+
+            # Check each @relation field
+            for rm in _PRISMA_RELATION_RE.finditer(block):
+                field_name = rm.group(1)
+                if field_name not in indexed_fields:
+                    line_no = content[:block_start + rm.start()].count("\n") + 1
+                    issues.append({
+                        "type": "missing_index",
+                        "file": rel,
+                        "line": line_no,
+                        "field": field_name,
+                        "target": model_name,
+                        "severity": "medium",
+                        "fix": "Add an index on the foreign key column to avoid full-table scans on joins.",
+                    })
+
+    # ── SQLAlchemy ───────────────────────────────────────────────────────────
+    for fpath, content in _iter_source_files(
+        root, {".py"}, skip_tests=False, max_files=3000
+    ):
+        rel = _rel(fpath, project_root)
+        for m in _SA_FK_COL_RE.finditer(content):
+            # Check the full Column(...) expression for index=True
+            col_end = content.find(")", m.end()) + 1
+            col_expr = content[m.start():col_end] if col_end > m.start() else m.group(0)
+            if not _SA_INDEX_TRUE_RE.search(col_expr):
+                field_name = m.group(2)
+                line_no = content[: m.start()].count("\n") + 1
+                # extract target table from ForeignKey("table.col")
+                fk_m = re.search(r'ForeignKey\s*\(\s*["\']([^"\']+)["\']', col_expr)
+                target = fk_m.group(1).split(".")[0] if fk_m else "unknown"
+                issues.append({
+                    "type": "missing_index",
+                    "file": rel,
+                    "line": line_no,
+                    "field": field_name,
+                    "target": target,
+                    "severity": "medium",
+                    "fix": "Add an index on the foreign key column to avoid full-table scans on joins.",
+                })
+
+    # ── Django (explicit db_index=False only) ───────────────────────────────
+    for fpath, content in _iter_source_files(
+        root, {".py"}, skip_tests=False, max_files=3000
+    ):
+        rel = _rel(fpath, project_root)
+        for m in _DJ_FK_NO_IDX_RE.finditer(content):
+            field_name = m.group(1)
+            line_no = content[: m.start()].count("\n") + 1
+            # extract target model
+            tgt_m = re.search(r'ForeignKey\s*\(\s*["\']?(\w+)', m.group(0))
+            target = tgt_m.group(1) if tgt_m else "unknown"
+            issues.append({
+                "type": "missing_index",
+                "file": rel,
+                "line": line_no,
+                "field": field_name,
+                "target": target,
+                "severity": "medium",
+                "fix": "Add an index on the foreign key column to avoid full-table scans on joins.",
+            })
+
+    # ── TypeORM ─────────────────────────────────────────────────────────────
+    for fpath, content in _iter_source_files(
+        root, {".ts", ".tsx"}, skip_tests=False, max_files=3000
+    ):
+        rel = _rel(fpath, project_root)
+        lines_list = content.splitlines()
+        for m in _TS_MANYTOONE_RE.finditer(content):
+            line_no = content[: m.start()].count("\n") + 1
+            # Check within 5 preceding lines for @Index decorator
+            start = max(0, line_no - 6)
+            preceding = "\n".join(lines_list[start: line_no - 1])
+            if not _TS_INDEX_RE.search(preceding):
+                snippet_line = lines_list[line_no - 1].strip()
+                # Try to extract field name from next non-empty line
+                field_name = "unknown"
+                for nxt in lines_list[line_no:line_no + 3]:
+                    prop_m = re.match(r"\s*(\w+)\s*[!?:]", nxt)
+                    if prop_m:
+                        field_name = prop_m.group(1)
+                        break
+                issues.append({
+                    "type": "missing_index",
+                    "file": rel,
+                    "line": line_no,
+                    "field": field_name,
+                    "target": snippet_line[:60],
+                    "severity": "medium",
+                    "fix": "Add an index on the foreign key column to avoid full-table scans on joins.",
+                })
+
+    # ── ActiveRecord ─────────────────────────────────────────────────────────
+    # Collect all add_index calls from migration files
+    migration_indexed: set[str] = set()
+    migrations_root = root / "db" / "migrate"
+    if migrations_root.exists():
+        for fpath, content in _iter_source_files(
+            str(migrations_root), {".rb"}, skip_tests=False, max_files=500
+        ):
+            for m in _AR_ADD_INDEX_RE.finditer(content):
+                migration_indexed.add(m.group(1))
+
+    for fpath, content in _iter_source_files(
+        root, {".rb"}, skip_tests=False, max_files=3000
+    ):
+        rel = _rel(fpath, project_root)
+        for m in _AR_BELONGS_TO_RE.finditer(content):
+            assoc_name = m.group(1)
+            # Default FK column name is association_name + "_id"
+            fk_col = assoc_name + "_id"
+            if fk_col not in migration_indexed:
+                line_no = content[: m.start()].count("\n") + 1
+                issues.append({
+                    "type": "missing_index",
+                    "file": rel,
+                    "line": line_no,
+                    "field": fk_col,
+                    "target": assoc_name,
+                    "severity": "medium",
+                    "fix": "Add an index on the foreign key column to avoid full-table scans on joins.",
+                })
+
+    # Deduplicate by (file, line, field)
+    seen: set[tuple[str, int, str]] = set()
+    unique: list[dict] = []
+    for item in issues:
+        key = (item["file"], item["line"], item["field"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# 10. N+1 query risk
+# ---------------------------------------------------------------------------
+
+# Loop markers
+_PY_FOR_RE        = re.compile(r"^\s*for\s+\w", re.MULTILINE)
+_PY_WHILE_RE      = re.compile(r"^\s*while\s+", re.MULTILINE)
+# Python DB access inside loop
+_PY_DB_CALL_RE    = re.compile(r"\.objects\.\s*(?:get|filter|exclude|all|first|last|aggregate)\s*\(|\.query\.")
+
+# JS/TS loop patterns
+_TS_LOOP_RE       = re.compile(r"(?:\.forEach\s*\(|\.map\s*\(|for\s*\(|for\s+\w)")
+# JS/TS DB calls inside loop
+_TS_DB_CALL_RE    = re.compile(r"\.find(?:One)?\s*\(|\.query\s*\(|\.execute\s*\(|await\s+\w+\.find")
+
+# Ruby loop
+_RB_LOOP_RE       = re.compile(r"\.each\s*(?:do|\{)|\.map\s*(?:do|\{)")
+# Ruby DB call
+_RB_DB_CALL_RE    = re.compile(r"\.find\s*\(|\.where\s*\(|[A-Z]\w*\.find\b")
+
+_N1_PROXIMITY = 20  # max lines between loop and DB call to flag
+
+
+def _lines_in_range(content: str, start_line: int, end_line: int) -> str:
+    """Return content between start_line and end_line (1-indexed, inclusive)."""
+    lines = content.splitlines()
+    return "\n".join(lines[max(0, start_line - 1): min(len(lines), end_line)])
+
+
+def find_n_plus_one_risk(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect patterns where a DB query is called inside a loop.
+
+    Only flags when the loop and the query call are within 20 lines of each
+    other (same function body heuristic).
+
+    Returns
+    -------
+    list[dict] with type="n_plus_one_risk".
+    """
+    issues: list[dict] = []
+
+    _PY_EXTS = {".py"}
+    _TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+    _RB_EXTS = {".rb"}
+    _ALL_EXTS = _PY_EXTS | _TS_EXTS | _RB_EXTS
+
+    for fpath, content in _iter_source_files(
+        project_root, _ALL_EXTS, skip_tests=True, max_files=3000
+    ):
+        rel = _rel(fpath, project_root)
+        ext = fpath.suffix.lower()
+
+        if ext in _PY_EXTS:
+            loop_pats = [_PY_FOR_RE, _PY_WHILE_RE]
+            db_re     = _PY_DB_CALL_RE
+        elif ext in _TS_EXTS:
+            loop_pats = [_TS_LOOP_RE]
+            db_re     = _TS_DB_CALL_RE
+        elif ext in _RB_EXTS:
+            loop_pats = [_RB_LOOP_RE]
+            db_re     = _RB_DB_CALL_RE
+        else:
+            continue
+
+        lines_list = content.splitlines()
+
+        for loop_pat in loop_pats:
+            for lm in loop_pat.finditer(content):
+                loop_line = content[: lm.start()].count("\n") + 1
+                # Scan the next _N1_PROXIMITY lines for a DB query call
+                end_line = min(len(lines_list), loop_line + _N1_PROXIMITY)
+                window   = _lines_in_range(content, loop_line + 1, end_line)
+                db_m     = db_re.search(window)
+                if db_m:
+                    db_line = loop_line + 1 + window[: db_m.start()].count("\n")
+                    snippet = lines_list[db_line - 1].strip() if db_line <= len(lines_list) else ""
+                    issues.append({
+                        "type": "n_plus_one_risk",
+                        "file": rel,
+                        "line": loop_line,
+                        "snippet": snippet,
+                        "severity": "high",
+                        "fix": (
+                            "Use eager loading (.includes(), .eager_load(), joinedload()) "
+                            "instead of querying inside loops."
+                        ),
+                    })
+
+    # Deduplicate by (file, line)
+    seen: set[tuple[str, int]] = set()
+    unique: list[dict] = []
+    for item in issues:
+        key = (item["file"], item["line"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    return unique
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + health summary
 # ---------------------------------------------------------------------------
 
@@ -1280,6 +1774,9 @@ def run_all_checks(graph: dict, project_root: str) -> dict:
         ("unhandled_errors",       lambda: find_unhandled_errors(graph, project_root)),
         ("import_cycles",          lambda: find_import_cycles_detailed(graph)),
         ("dead_event_handlers",    lambda: find_dead_event_handlers(graph)),
+        ("missing_pagination",     lambda: find_missing_pagination(graph, project_root)),
+        ("missing_indexes",        lambda: find_missing_indexes(graph, project_root)),
+        ("n_plus_one_risk",        lambda: find_n_plus_one_risk(graph, project_root)),
     ]
 
     all_issues: list[dict] = []
@@ -1344,6 +1841,16 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
 
     # Penalty model:  critical=-20, high=-10, medium=-4, low=-1  (floor 0)
     penalty = (n_critical * 20) + (n_high * 10) + (n_medium * 4) + (n_low * 1)
+
+    # Additional per-finding penalties for new checks (each capped at -20)
+    n_plus_one_findings   = len([i for i in report["issues"] if i.get("type") == "n_plus_one_risk"])
+    missing_pag_findings  = len([i for i in report["issues"] if i.get("type") == "missing_pagination"])
+    missing_idx_findings  = len([i for i in report["issues"] if i.get("type") == "missing_index"])
+
+    penalty += min(20, n_plus_one_findings  * 5)
+    penalty += min(20, missing_pag_findings * 3)
+    penalty += min(20, missing_idx_findings * 2)
+
     score   = max(0, 100 - penalty)
 
     if score >= 90:
@@ -1357,8 +1864,8 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     else:
         grade = "F"
 
-    # Total checks = 7 functional checks
-    total_checks  = 7
+    # Total checks = 10 functional checks
+    total_checks  = 10
     checks_failed = min(
         total_checks,
         (1 if n_critical else 0) + (1 if n_high else 0) +
@@ -1367,7 +1874,7 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     checks_passed = total_checks - checks_failed
 
     critical_issues: list[str] = [
-        issue["description"]
+        issue.get("description") or issue.get("snippet", "")
         for issue in report["issues"]
         if issue.get("severity") in {"critical", "high"}
     ][:3]

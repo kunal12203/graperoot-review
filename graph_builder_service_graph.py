@@ -33,7 +33,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 CONTRACT_EXTS: set[str] = {".proto", ".graphql", ".gql"}
-SERVICE_GRAPH_EXTS: set[str] = {".py", ".ts", ".tsx", ".js", ".jsx", ".kt", ".java", ".go"}
+SERVICE_GRAPH_EXTS: set[str] = {".py", ".ts", ".tsx", ".js", ".jsx", ".kt", ".java", ".go", ".rb"}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -278,6 +278,136 @@ def _build_mq_patterns() -> list[tuple]:
     # queue.process('job-name', ...) — Bull subscriber
     patterns.append((re.compile(
         r'queue\s*\.\s*process\s*\(\s*' + ANY_LIT, re.I), S, "bullmq", H))
+
+    # ------------------------------------------------------------------ Celery (Python task queue)
+    # Python: app.send_task('module.task_name', ...) — explicit task name → high confidence
+    patterns.append((re.compile(
+        r'(?:celery_app|app|celery)\s*\.\s*send_task\s*\(\s*' + ANY_LIT, re.I), P, "celery", H))
+
+    # Python: task_var.delay(...) or task_var.apply_async(...) — publish without literal topic
+    # topic is inferred as generic placeholder; medium confidence
+    patterns.append((re.compile(
+        r'(?<!\w)(\w+)\s*\.\s*(?:delay|apply_async)\s*\(', re.I), P, "celery", M))
+
+    # Python: @app.task(name='custom.name') — explicit named task → subscribes_from
+    patterns.append((re.compile(
+        r'@(?:app|celery|celery_app)\s*\.\s*task\s*\([^)]*\bname\s*=\s*' + ANY_LIT, re.I), S, "celery", H))
+
+    # Python: @app.task (no name kwarg) — subscribes with generic placeholder
+    patterns.append((re.compile(
+        r'@(?:app|celery|celery_app)\s*\.\s*task\s*(?:\(\s*\))?\s*\n', re.I), S, "celery", M))
+
+    # ------------------------------------------------------------------ Azure Service Bus
+    # Python: client.get_queue_sender(queue_name='orders') → publishes_to
+    patterns.append((re.compile(
+        r'get_queue_sender\s*\([^)]*\bqueue_name\s*=\s*' + ANY_LIT, re.I | re.DOTALL), P, "azure_servicebus", H))
+
+    # Python: client.get_topic_sender(topic_name='events') → publishes_to
+    patterns.append((re.compile(
+        r'get_topic_sender\s*\([^)]*\btopic_name\s*=\s*' + ANY_LIT, re.I | re.DOTALL), P, "azure_servicebus", H))
+
+    # Python: client.get_queue_receiver(queue_name='payments') → subscribes_from
+    patterns.append((re.compile(
+        r'get_queue_receiver\s*\([^)]*\bqueue_name\s*=\s*' + ANY_LIT, re.I | re.DOTALL), S, "azure_servicebus", H))
+
+    # Python: client.get_subscription_receiver(topic_name='events', ...) → subscribes_from
+    patterns.append((re.compile(
+        r'get_subscription_receiver\s*\([^)]*\btopic_name\s*=\s*' + ANY_LIT, re.I | re.DOTALL), S, "azure_servicebus", H))
+
+    # Python: ServiceBusSender.send_messages() — medium, no topic literal
+    patterns.append((re.compile(
+        r'ServiceBusSender\s*\.\s*send_messages\s*\(', re.I), P, "azure_servicebus", M))
+
+    # TS/JS: @azure/service-bus — sbClient.createSender('queue-name')
+    patterns.append((re.compile(
+        r'createSender\s*\(\s*' + ANY_LIT, re.I), P, "azure_servicebus", H))
+
+    # TS/JS: sbClient.createReceiver('queue-name')
+    patterns.append((re.compile(
+        r'createReceiver\s*\(\s*' + ANY_LIT, re.I), S, "azure_servicebus", H))
+
+    # ------------------------------------------------------------------ Google Cloud Pub/Sub
+    # Python: publisher.publish(topic_path, ...) — medium, no literal topic at call site
+    patterns.append((re.compile(
+        r'publisher\s*\.\s*publish\s*\(\s*(?:topic_path|topic)\b', re.I), P, "gcp_pubsub", M))
+
+    # Python: publisher.topic_path(project, 'topic-name') — extract literal topic name
+    patterns.append((re.compile(
+        r'topic_path\s*\([^,]+,\s*' + ANY_LIT, re.I), P, "gcp_pubsub", H))
+
+    # Python: subscriber.subscribe(subscription_path, ...) — medium, no literal topic
+    patterns.append((re.compile(
+        r'subscriber\s*\.\s*subscribe\s*\(\s*subscription_path\b', re.I), S, "gcp_pubsub", M))
+
+    # Python: subscriber.subscription_path(project, 'sub-name') — extract literal subscription name
+    patterns.append((re.compile(
+        r'subscription_path\s*\([^,]+,\s*' + ANY_LIT, re.I), S, "gcp_pubsub", H))
+
+    # TS/JS: @google-cloud/pubsub — pubsub.topic('topic-name')
+    patterns.append((re.compile(
+        r'\bpubsub\s*\.\s*topic\s*\(\s*' + ANY_LIT, re.I), P, "gcp_pubsub", H))
+
+    # TS/JS: pubsub.subscription('sub-name')
+    patterns.append((re.compile(
+        r'\bpubsub\s*\.\s*subscription\s*\(\s*' + ANY_LIT, re.I), S, "gcp_pubsub", H))
+
+    # ------------------------------------------------------------------ Temporal (workflow orchestration)
+    # Python: client.start_workflow(WorkflowClass.run, ...) — medium, workflow class is not a string literal
+    patterns.append((re.compile(
+        r'client\s*\.\s*start_workflow\s*\(', re.I), P, "temporal", M))
+
+    # Python: workflow_handle.signal(...) — publishes signal, medium
+    patterns.append((re.compile(
+        r'workflow_handle\s*\.\s*signal\s*\(', re.I), P, "temporal", M))
+
+    # Python: @workflow.defn decorator — marks workflow definition, subscribes_from
+    patterns.append((re.compile(
+        r'@workflow\s*\.\s*defn\b', re.I), S, "temporal", M))
+
+    # TS/JS: client.workflow.start('workflowFunctionName', ...) — extract literal workflow name
+    patterns.append((re.compile(
+        r'client\s*\.\s*workflow\s*\.\s*start\s*\(\s*' + ANY_LIT, re.I), P, "temporal", H))
+
+    # TS/JS: defineSignal('signal-name') — signal definition
+    patterns.append((re.compile(
+        r'\bdefineSignal\s*\(\s*' + ANY_LIT, re.I), S, "temporal", H))
+
+    # TS/JS: defineQuery('query-name') — query definition
+    patterns.append((re.compile(
+        r'\bdefineQuery\s*\(\s*' + ANY_LIT, re.I), S, "temporal", H))
+
+    # ------------------------------------------------------------------ Sidekiq / Resque (Ruby)
+    # Ruby: SomeWorker.perform_async(args) — publishes to sidekiq queue, worker class as topic
+    patterns.append((re.compile(
+        r'\b(\w+Worker)\s*\.\s*perform_async\s*\(', re.I), P, "sidekiq", M))
+
+    # Ruby: SomeWorker.perform_in(delay, args) — scheduled publish
+    patterns.append((re.compile(
+        r'\b(\w+Worker)\s*\.\s*perform_in\s*\(', re.I), P, "sidekiq", M))
+
+    # Ruby: SomeWorker.perform_at(time, args) — scheduled publish
+    patterns.append((re.compile(
+        r'\b(\w+Worker)\s*\.\s*perform_at\s*\(', re.I), P, "sidekiq", M))
+
+    # Ruby: include Sidekiq::Worker — worker class definition, subscribes
+    patterns.append((re.compile(
+        r'\binclude\s+Sidekiq::Worker\b', re.I), S, "sidekiq", M))
+
+    # Ruby: include Sidekiq::Job (newer Sidekiq 6+ alias)
+    patterns.append((re.compile(
+        r'\binclude\s+Sidekiq::Job\b', re.I), S, "sidekiq", M))
+
+    # Ruby: Resque.enqueue(SomeWorker, args) — publishes to Resque queue
+    patterns.append((re.compile(
+        r'\bResque\s*\.\s*enqueue\s*\(\s*(\w+)', re.I), P, "resque", M))
+
+    # Ruby: Resque.enqueue_to('queue-name', SomeWorker, args) — explicit queue name
+    patterns.append((re.compile(
+        r'\bResque\s*\.\s*enqueue_to\s*\(\s*' + ANY_LIT, re.I), P, "resque", H))
+
+    # Ruby: include Resque::Job / extend Resque::Plugins::... — subscriber definition
+    patterns.append((re.compile(
+        r'\bextend\s+Resque::', re.I), S, "resque", M))
 
     return patterns
 

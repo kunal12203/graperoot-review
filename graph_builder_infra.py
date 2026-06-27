@@ -1105,6 +1105,279 @@ def parse_imports_ansible(content: str, file_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 4B-6: CircleCI
+# ---------------------------------------------------------------------------
+
+_RE_CCI_WORKFLOW_NAME = re.compile(r"^  ([A-Za-z0-9_\-]+)\s*:", re.MULTILINE)
+_RE_CCI_JOB_IN_WF    = re.compile(r"^\s+-\s+([A-Za-z0-9_\-]+)\s*(?::|$)", re.MULTILINE)
+_RE_CCI_REQUIRES     = re.compile(r"^\s+requires\s*:", re.MULTILINE)
+_RE_CCI_CONTEXT      = re.compile(r"^\s+-\s+([A-Za-z0-9_\-]+)\s*$", re.MULTILINE)
+_RE_CCI_JOB_DEF      = re.compile(r"^  ([A-Za-z0-9_\-]+)\s*:", re.MULTILINE)
+
+
+def _cci_find_block_end(lines: list[str], start: int) -> int:
+    """Find the end of a 2-space-indented YAML block starting at ``start``."""
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        if not line.startswith("   ") and not line.startswith("\t  "):
+            return i - 1
+    return len(lines) - 1
+
+
+def extract_symbols_circleci(content: str, file_path: str) -> list[dict]:
+    """Extract workflow and job symbols from a CircleCI config.yml."""
+    lines   = content.splitlines()
+    symbols: list[dict] = []
+    seen:   set[str] = set()
+
+    # ── workflows ────────────────────────────────────────────────────────────
+    wf_m = re.search(r"^workflows\s*:", content, re.MULTILINE)
+    if wf_m:
+        wf_line = _line_of(content, wf_m.start())
+        for i in range(wf_line + 1, len(lines)):
+            line = lines[i]
+            if not line.strip():
+                continue
+            if not line.startswith(" ") and not line.startswith("\t"):
+                break
+            m = re.match(r"^  ([A-Za-z0-9_\-]+)\s*:", line)
+            if m:
+                wf_name = m.group(1)
+                if wf_name in ("version",) or wf_name in seen:
+                    continue
+                seen.add(wf_name)
+                end_ln = _cci_find_block_end(lines, i)
+                sym = _make_symbol(
+                    file_path, f"workflow:{wf_name}", "use_case",
+                    i, end_ln, lines, "high",
+                    ["circleci", "workflow", "ci", wf_name],
+                )
+                symbols.append(sym)
+
+    # ── jobs ─────────────────────────────────────────────────────────────────
+    jobs_m = re.search(r"^jobs\s*:", content, re.MULTILINE)
+    if jobs_m:
+        jobs_line = _line_of(content, jobs_m.start())
+        for i in range(jobs_line + 1, len(lines)):
+            line = lines[i]
+            if not line.strip():
+                continue
+            if not line.startswith(" ") and not line.startswith("\t"):
+                break
+            m = re.match(r"^  ([A-Za-z0-9_\-]+)\s*:", line)
+            if m:
+                job_name = m.group(1)
+                if job_name in seen:
+                    continue
+                seen.add(job_name)
+                end_ln = _cci_find_block_end(lines, i)
+                sym = _make_symbol(
+                    file_path, f"job:{job_name}", "utility",
+                    i, end_ln, lines, "high",
+                    ["circleci", "job", "ci", job_name],
+                )
+                symbols.append(sym)
+
+    return symbols
+
+
+def parse_imports_circleci(content: str, file_id: str) -> list[dict]:
+    """Extract 'requires' dependency edges and 'context' usage edges from CircleCI."""
+    edges: list[dict] = []
+    lines = content.splitlines()
+
+    # Parse workflow jobs block to extract requires/context edges
+    wf_m = re.search(r"^workflows\s*:", content, re.MULTILINE)
+    if not wf_m:
+        return edges
+
+    wf_line = _line_of(content, wf_m.start())
+    current_wf: str | None = None
+    current_job: str | None = None
+    in_requires = False
+    in_context  = False
+
+    for i in range(wf_line + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        # Top-level block end
+        if not line.startswith(" ") and not line.startswith("\t"):
+            break
+
+        # Workflow name (2-space indent)
+        m_wf = re.match(r"^  ([A-Za-z0-9_\-]+)\s*:", line)
+        if m_wf and not line.startswith("    "):
+            current_wf  = m_wf.group(1)
+            current_job = None
+            in_requires = False
+            in_context  = False
+            continue
+
+        # requires: block  (check before job-name detection to avoid collision)
+        if re.match(r"^\s+requires\s*:", line):
+            in_requires = True
+            in_context  = False
+            continue
+
+        # context: block
+        if re.match(r"^\s+context\s*:", line):
+            in_context  = True
+            in_requires = False
+            continue
+
+        # List items under requires/context take priority over job detection
+        m_item = re.match(r"^\s+-\s+([A-Za-z0-9_\-]+)\s*$", line)
+        if m_item and (in_requires or in_context):
+            item = m_item.group(1)
+            src = f"{file_id}::job:{current_job}" if current_job else file_id
+            if in_requires:
+                edges.append(_make_edge(src, f"job:{item}", "needs"))
+            elif in_context:
+                edges.append(_make_edge(src, f"context:{item}", "uses_context"))
+            continue
+
+        # Job name inside workflow jobs list: "- jobname" or "- jobname:"
+        m_job = re.match(r"^\s+-\s+([A-Za-z0-9_\-]+)\s*(?::|$)", line)
+        if m_job:
+            current_job = m_job.group(1)
+            in_requires = False
+            in_context  = False
+            continue
+
+        # Anything non-list resets the flags
+        if line.strip() and not line.strip().startswith("-"):
+            in_requires = False
+            in_context  = False
+
+    return edges
+
+
+def _is_circleci(file_path: str) -> bool:
+    """Detect .circleci/config.yml files."""
+    p = Path(file_path)
+    parts = p.parts
+    for i, part in enumerate(parts):
+        if part == ".circleci" and i + 1 < len(parts):
+            return p.suffix.lower() in (".yml", ".yaml")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 4B-7: Buildkite
+# ---------------------------------------------------------------------------
+
+_RE_BK_LABEL    = re.compile(r"^\s+-\s+label\s*:\s*(.+)$",      re.MULTILINE)
+_RE_BK_TRIGGER  = re.compile(r"^\s+-\s+trigger\s*:\s*(.+)$",    re.MULTILINE)
+_RE_BK_DEPENDS  = re.compile(r"^\s+depends_on\s*:\s*(.+)$",     re.MULTILINE)
+_RE_BK_COMMAND  = re.compile(r"^\s+command\s*:\s*(.+)$",        re.MULTILINE)
+
+
+def extract_symbols_buildkite(content: str, file_path: str) -> list[dict]:
+    """Extract step symbols from a Buildkite pipeline file."""
+    lines   = content.splitlines()
+    symbols: list[dict] = []
+    seen:   set[str] = set()
+
+    for m in _RE_BK_LABEL.finditer(content):
+        label = m.group(1).strip().strip('"').strip("'")
+        # Skip emoji-only or blank labels
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        ln     = _line_of(content, m.start())
+        end_ln = ln
+        # Find end of this step block (next "- " at same indent level)
+        indent = len(lines[ln]) - len(lines[ln].lstrip()) if ln < len(lines) else 0
+        for j in range(ln + 1, min(ln + 50, len(lines))):
+            ll = lines[j]
+            if not ll.strip():
+                continue
+            cur_indent = len(ll) - len(ll.lstrip())
+            if cur_indent <= indent and re.match(r"\s*-\s+", ll):
+                break
+            end_ln = j
+        sym = _make_symbol(
+            file_path, f"step:{label}", "utility",
+            ln, end_ln, lines, "high",
+            ["buildkite", "step", "ci", label.lower()],
+        )
+        symbols.append(sym)
+
+    # Trigger steps — no label but a trigger: key
+    for m in _RE_BK_TRIGGER.finditer(content):
+        pipeline = m.group(1).strip().strip('"').strip("'")
+        name = f"trigger:{pipeline}"
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        sym = _make_symbol(
+            file_path, name, "utility",
+            ln, ln, lines, "high",
+            ["buildkite", "trigger", "ci", pipeline],
+        )
+        symbols.append(sym)
+
+    return symbols
+
+
+def parse_imports_buildkite(content: str, file_id: str) -> list[dict]:
+    """Extract depends_on and trigger edges from a Buildkite pipeline file."""
+    edges: list[dict] = []
+    lines = content.splitlines()
+
+    # Map label → step id (label string used as identifier)
+    step_at_line: dict[int, str] = {}
+    for m in _RE_BK_LABEL.finditer(content):
+        label = m.group(1).strip().strip('"').strip("'")
+        ln    = _line_of(content, m.start())
+        step_at_line[ln] = label
+
+    def nearest_step(line_no: int) -> str | None:
+        """Return the label of the step containing line_no."""
+        best: str | None = None
+        best_ln = -1
+        for ln, lbl in step_at_line.items():
+            if ln <= line_no and ln > best_ln:
+                best    = lbl
+                best_ln = ln
+        return best
+
+    for m in _RE_BK_DEPENDS.finditer(content):
+        raw    = m.group(1).strip().strip('"').strip("'")
+        ln     = _line_of(content, m.start())
+        src_lbl = nearest_step(ln)
+        src    = f"{file_id}::step:{src_lbl}" if src_lbl else file_id
+        for dep in re.findall(r"[A-Za-z0-9_\-]+", raw):
+            edges.append(_make_edge(src, f"step:{dep}", "needs"))
+
+    for m in _RE_BK_TRIGGER.finditer(content):
+        pipeline = m.group(1).strip().strip('"').strip("'")
+        ln       = _line_of(content, m.start())
+        src_lbl  = nearest_step(ln)
+        src      = f"{file_id}::step:{src_lbl}" if src_lbl else file_id
+        edges.append(_make_edge(src, f"pipeline:{pipeline}", "dispatches_to"))
+
+    return edges
+
+
+def _is_buildkite(file_path: str) -> bool:
+    """Detect .buildkite/pipeline.yml or buildkite.yml files."""
+    name = os.path.basename(file_path).lower()
+    p    = Path(file_path)
+    parts = p.parts
+    # .buildkite/pipeline.yml
+    for i, part in enumerate(parts):
+        if part == ".buildkite" and i + 1 < len(parts):
+            return p.suffix.lower() in (".yml", ".yaml")
+    # standalone buildkite.yml at any level
+    return name == "buildkite.yml" or name == "buildkite.yaml"
+
+
+# ---------------------------------------------------------------------------
 # File type classification
 # ---------------------------------------------------------------------------
 
@@ -1133,6 +1406,10 @@ def is_infra_file(file_path: str, content_hint: str = "") -> bool:
     if _is_kustomize(file_path):
         return True
     if _is_docker_compose(file_path):
+        return True
+    if _is_circleci(file_path):
+        return True
+    if _is_buildkite(file_path):
         return True
 
     # Generic YAML files: detect by content
@@ -1163,6 +1440,10 @@ def _detect_yaml_type(file_path: str, content: str) -> str:
         return "kustomize"
     if _is_docker_compose(file_path):
         return "docker_compose"
+    if _is_circleci(file_path):
+        return "circleci"
+    if _is_buildkite(file_path):
+        return "buildkite"
     # Content-based detection — order matters
     if _is_kubernetes(content):
         return "kubernetes"
@@ -1211,6 +1492,10 @@ def extract_infra_symbols(content: str, file_path: str) -> list[dict]:
             return extract_symbols_kustomize(content, file_path)
         if yaml_type == "docker_compose":
             return extract_symbols_docker_compose(content, file_path)
+        if yaml_type == "circleci":
+            return extract_symbols_circleci(content, file_path)
+        if yaml_type == "buildkite":
+            return extract_symbols_buildkite(content, file_path)
         if yaml_type == "kubernetes":
             return extract_symbols_kubernetes(content, file_path)
         if yaml_type == "ansible":
@@ -1249,6 +1534,10 @@ def parse_infra_imports(content: str, file_id: str, file_path: str) -> list[dict
             return [_make_edge(file_id, r, "includes") for r in refs]
         if yaml_type == "docker_compose":
             return parse_imports_docker_compose(content, file_id)
+        if yaml_type == "circleci":
+            return parse_imports_circleci(content, file_id)
+        if yaml_type == "buildkite":
+            return parse_imports_buildkite(content, file_id)
         if yaml_type == "kubernetes":
             return parse_imports_kubernetes(content, file_id)
         if yaml_type == "ansible":

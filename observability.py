@@ -1287,6 +1287,272 @@ def extract_log_patterns(content: str, file_path: str, ext: str) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 8E  SENTRY INSTRUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SENTRY_PATTERNS: dict[str, list[tuple[re.Pattern, str, str]]] = {
+    # (pattern, kind, symbol_type)
+    ".py": [
+        (re.compile(r"sentry_sdk\.init\s*\("), "init", "utility"),
+        (re.compile(r"sentry_sdk\.capture_exception\s*\("), "capture_exception", "hook"),
+        (re.compile(r"sentry_sdk\.capture_message\s*\("), "capture_message", "hook"),
+        (re.compile(r"@sentry_sdk\.trace"), "trace_decorator", "hook"),
+        (re.compile(r"with\s+sentry_sdk\.start_transaction\s*\("), "start_transaction", "hook"),
+    ],
+    ".ts": [
+        (re.compile(r"Sentry\.init\s*\("), "init", "utility"),
+        (re.compile(r"Sentry\.captureException\s*\("), "captureException", "hook"),
+        (re.compile(r"Sentry\.captureMessage\s*\("), "captureMessage", "hook"),
+        (re.compile(r"Sentry\.startTransaction\s*\("), "startTransaction", "hook"),
+        (re.compile(r"withSentryConfig\s*\("), "withSentryConfig", "utility"),
+    ],
+    ".js": [],   # filled below
+    ".tsx": [],  # filled below
+    ".jsx": [],  # filled below
+    ".go": [
+        (re.compile(r"sentry\.Init\s*\("), "init", "utility"),
+        (re.compile(r"sentry\.CaptureException\s*\("), "CaptureException", "hook"),
+        (re.compile(r"sentry\.StartSpan\s*\("), "StartSpan", "hook"),
+    ],
+    ".java": [
+        (re.compile(r"Sentry\.init\s*\("), "init", "utility"),
+        (re.compile(r"Sentry\.captureException\s*\("), "captureException", "hook"),
+    ],
+    ".kt": [],  # filled below
+}
+_SENTRY_PATTERNS[".js"] = _SENTRY_PATTERNS[".ts"]
+_SENTRY_PATTERNS[".tsx"] = _SENTRY_PATTERNS[".ts"]
+_SENTRY_PATTERNS[".jsx"] = _SENTRY_PATTERNS[".js"]
+_SENTRY_PATTERNS[".kt"] = _SENTRY_PATTERNS[".java"]
+
+# DSN extraction patterns
+_SENTRY_DSN_PY = re.compile(r'dsn\s*=\s*["\']([^"\']+)["\']')
+_SENTRY_DSN_JS = re.compile(r'dsn\s*:\s*["\']([^"\']+)["\']')
+_SENTRY_TRANSACTION_JS = re.compile(r'name\s*:\s*["\']([^"\']+)["\']')
+_SENTRY_SPAN_GO = re.compile(r'sentry\.StartSpan\s*\(\s*\w+\s*,\s*["\']([^"\']+)["\']')
+
+
+def extract_sentry_instrumentation(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract Sentry SDK instrumentation call sites from source code.
+
+    Detects Sentry SDK usage in Python (sentry-sdk), TypeScript/JavaScript (@sentry/*),
+    Go (sentry-go), and Java/Kotlin.
+
+    Returns symbol dicts with symbol_type='utility' (init calls) or 'hook' (capture/trace calls).
+    """
+    patterns = _SENTRY_PATTERNS.get(ext, [])
+    if not patterns:
+        return []
+
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    for lineno, line in enumerate(lines):
+        for pat, kind, sym_type in patterns:
+            if not pat.search(line):
+                continue
+
+            sym_id = f"{file_path}::sentry_{kind}_{lineno}"
+            if sym_id in seen:
+                continue
+            seen.add(sym_id)
+
+            # Extract extra keywords (dsn, transaction name, span name)
+            extra_kw: list[str] = []
+            if kind == "init":
+                # Try to pull DSN value as a keyword hint
+                dsn_pat = _SENTRY_DSN_PY if ext == ".py" else _SENTRY_DSN_JS
+                m_dsn = dsn_pat.search(line)
+                if m_dsn:
+                    extra_kw.append("dsn")
+            elif kind in ("startTransaction", "StartSpan"):
+                m_name = _SENTRY_TRANSACTION_JS.search(line)
+                if m_name:
+                    extra_kw.extend(_name_keywords(m_name.group(1)))
+
+            symbols.append({
+                "id": sym_id,
+                "name": f"sentry:{kind}",
+                "symbol_type": sym_type,
+                "line_start": lineno,
+                "line_end": lineno,
+                "body_hash": _body_hash(lines, lineno, lineno),
+                "confidence": "high",
+                "exported": False,
+                "keywords": list(dict.fromkeys(
+                    ["sentry", kind] + extra_kw
+                ))[:10],
+            })
+
+    return symbols
+
+
+_SENTRY_CONFIG_FILE_NAMES = re.compile(
+    r"(?i)sentry\.(properties|ya?ml|json)$"
+)
+_SENTRY_INIT_PY = re.compile(r"sentry_sdk\.init\s*\(")
+_SENTRY_INIT_JS = re.compile(r"Sentry\.init\s*\(")
+
+
+def find_sentry_configs(project_root: str) -> list[str]:
+    """
+    Walk project_root and return paths to Sentry config files and source files
+    that contain a Sentry.init / sentry_sdk.init call.
+    """
+    results: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in {"node_modules", ".git", "__pycache__", ".venv", "venv",
+                         "dist", "build", "target", ".tox"}
+        ]
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            if _SENTRY_CONFIG_FILE_NAMES.search(fname):
+                results.append(fpath)
+                continue
+            _, ext = os.path.splitext(fname.lower())
+            if ext in OBSERVABILITY_SOURCE_EXTS:
+                ok, content, _ = _safe_read(fpath)
+                if ok and (_SENTRY_INIT_PY.search(content) or _SENTRY_INIT_JS.search(content)):
+                    results.append(fpath)
+    return sorted(results)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8F  DATADOG INSTRUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DATADOG_PATTERNS: dict[str, list[tuple[re.Pattern, str, str]]] = {
+    ".py": [
+        (re.compile(r"tracer\.trace\s*\("), "tracer_trace", "hook"),
+        (re.compile(r"@tracer\.wrap\s*\("), "tracer_wrap", "hook"),
+        (re.compile(r"DD_AGENT_HOST|DD_SERVICE|DD_ENV|DD_VERSION"), "datadog_config", "utility"),
+        (re.compile(r"DogStatsD|statsd\.increment\s*\(|statsd\.gauge\s*\(|statsd\.histogram\s*\("), "statsd", "hook"),
+        (re.compile(r"tracer\.configure\s*\("), "tracer_configure", "utility"),
+    ],
+    ".ts": [
+        (re.compile(r"tracer\.init\s*\("), "tracer_init", "utility"),
+        (re.compile(r"tracer\.startSpan\s*\("), "startSpan", "hook"),
+        (re.compile(r"tracer\.trace\s*\("), "tracer_trace", "hook"),
+    ],
+    ".js": [],   # filled below
+    ".tsx": [],  # filled below
+    ".jsx": [],  # filled below
+    ".go": [
+        (re.compile(r"tracer\.Start\s*\("), "tracer_Start", "utility"),
+        (re.compile(r"tracer\.StartSpan\s*\("), "StartSpan", "hook"),
+        (re.compile(r"tracer\.StartSpanFromContext\s*\("), "StartSpanFromContext", "hook"),
+    ],
+    ".java": [
+        (re.compile(r"GlobalTracer\.get\s*\(\s*\)\.buildSpan\s*\("), "buildSpan", "hook"),
+        (re.compile(r"@Trace\b"), "trace_annotation", "hook"),
+    ],
+    ".kt": [],  # filled below
+}
+_DATADOG_PATTERNS[".js"] = _DATADOG_PATTERNS[".ts"]
+_DATADOG_PATTERNS[".tsx"] = _DATADOG_PATTERNS[".ts"]
+_DATADOG_PATTERNS[".jsx"] = _DATADOG_PATTERNS[".js"]
+_DATADOG_PATTERNS[".kt"] = _DATADOG_PATTERNS[".java"]
+
+_DD_OPERATION_PY = re.compile(r"tracer\.\w+\s*\(\s*['\"]([^'\"]+)['\"]")
+_DD_SERVICE_JS = re.compile(r"service\s*:\s*['\"]([^'\"]+)['\"]")
+_DD_SPAN_GO = re.compile(r"tracer\.Start\w*\s*\(\s*['\"]([^'\"]+)['\"]")
+
+
+def extract_datadog_instrumentation(content: str, file_path: str, ext: str) -> list[dict]:
+    """
+    Extract Datadog APM/tracing SDK instrumentation call sites from source code.
+
+    Detects dd-trace (JS/TS), ddtrace (Python), and dd-trace-go (Go) usage.
+
+    Returns symbol dicts with symbol_type='utility' (init/config calls) or 'hook' (span/trace calls).
+    """
+    patterns = _DATADOG_PATTERNS.get(ext, [])
+    if not patterns:
+        return []
+
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    for lineno, line in enumerate(lines):
+        for pat, kind, sym_type in patterns:
+            if not pat.search(line):
+                continue
+
+            sym_id = f"{file_path}::dd_{kind}_{lineno}"
+            if sym_id in seen:
+                continue
+            seen.add(sym_id)
+
+            # Extract operation/service name as extra keyword
+            extra_kw: list[str] = []
+            if ext == ".py":
+                m_op = _DD_OPERATION_PY.search(line)
+                if m_op:
+                    extra_kw.extend(_name_keywords(m_op.group(1)))
+            elif ext in (".ts", ".js", ".tsx", ".jsx"):
+                m_svc = _DD_SERVICE_JS.search(line)
+                if m_svc:
+                    extra_kw.extend(_name_keywords(m_svc.group(1)))
+            elif ext == ".go":
+                m_span = _DD_SPAN_GO.search(line)
+                if m_span:
+                    extra_kw.extend(_name_keywords(m_span.group(1)))
+
+            symbols.append({
+                "id": sym_id,
+                "name": f"dd:{kind}",
+                "symbol_type": sym_type,
+                "line_start": lineno,
+                "line_end": lineno,
+                "body_hash": _body_hash(lines, lineno, lineno),
+                "confidence": "high",
+                "exported": False,
+                "keywords": list(dict.fromkeys(
+                    ["datadog", "dd", kind] + extra_kw
+                ))[:10],
+            })
+
+    return symbols
+
+
+_DD_CONFIG_FILE_NAMES = re.compile(
+    r"(?i)(datadog|ddconfig)\.(ya?ml)$"
+)
+_DD_INIT_JS = re.compile(r"tracer\.init\s*\(")
+_DD_START_GO = re.compile(r"tracer\.Start\s*\(")
+
+
+def find_datadog_configs(project_root: str) -> list[str]:
+    """
+    Walk project_root and return paths to Datadog config files and source files
+    that contain a tracer.init (dd-trace JS) or tracer.Start (Go) call.
+    """
+    results: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in {"node_modules", ".git", "__pycache__", ".venv", "venv",
+                         "dist", "build", "target", ".tox"}
+        ]
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            if _DD_CONFIG_FILE_NAMES.search(fname):
+                results.append(fpath)
+                continue
+            _, ext = os.path.splitext(fname.lower())
+            if ext in OBSERVABILITY_SOURCE_EXTS:
+                ok, content, _ = _safe_read(fpath)
+                if ok and (_DD_INIT_JS.search(content) or _DD_START_GO.search(content)):
+                    results.append(fpath)
+    return sorted(results)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN DISPATCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1320,6 +1586,8 @@ def extract_observability_symbols(content: str, file_path: str) -> list[dict]:
     elif ext in OBSERVABILITY_SOURCE_EXTS:
         symbols.extend(extract_otel_instrumentation(content, file_path, ext))
         symbols.extend(extract_log_patterns(content, file_path, ext))
+        symbols.extend(extract_sentry_instrumentation(content, file_path, ext))
+        symbols.extend(extract_datadog_instrumentation(content, file_path, ext))
 
     return symbols
 
@@ -1410,6 +1678,10 @@ def get_observability_summary(project_root: str) -> dict:
     metric_count = 0
     log_file_count = 0
     instrumented_files = 0
+    sentry_init_files = 0
+    sentry_total_files = 0
+    datadog_init_files = 0
+    datadog_total_files = 0
 
     for dirpath, dirnames, filenames in os.walk(project_root):
         dirnames[:] = [
@@ -1428,6 +1700,8 @@ def get_observability_summary(project_root: str) -> dict:
 
             otel_syms = extract_otel_instrumentation(content, fpath, ext)
             log_syms = extract_log_patterns(content, fpath, ext)
+            sentry_syms = extract_sentry_instrumentation(content, fpath, ext)
+            dd_syms = extract_datadog_instrumentation(content, fpath, ext)
 
             file_spans = sum(1 for s in otel_syms if s["symbol_type"] == "hook")
             file_metrics = sum(1 for s in otel_syms if s["symbol_type"] == "use_case")
@@ -1438,6 +1712,16 @@ def get_observability_summary(project_root: str) -> dict:
                 instrumented_files += 1
             if log_syms:
                 log_file_count += 1
+
+            if sentry_syms:
+                sentry_total_files += 1
+                if any("init" in s["name"] for s in sentry_syms):
+                    sentry_init_files += 1
+
+            if dd_syms:
+                datadog_total_files += 1
+                if any(s["symbol_type"] == "utility" for s in dd_syms):
+                    datadog_init_files += 1
 
     # Coverage score
     score = 0
@@ -1457,6 +1741,10 @@ def get_observability_summary(project_root: str) -> dict:
         score += 10
     if scrape_job_count > 0:
         score += 10
+    if sentry_init_files > 0:
+        score += 5
+    if datadog_init_files > 0:
+        score += 5
 
     # Recommendations
     recommendations: list[str] = []
@@ -1495,6 +1783,16 @@ def get_observability_summary(project_root: str) -> dict:
             "Prometheus config found but no scrape_configs jobs detected. "
             "Verify your prometheus.yml exposes the correct targets."
         )
+    if sentry_init_files == 0:
+        recommendations.append(
+            "No Sentry SDK initialisation detected. "
+            "Add sentry_sdk.init / Sentry.init to capture unhandled errors in production."
+        )
+    if datadog_init_files == 0:
+        recommendations.append(
+            "No Datadog APM tracer initialisation detected. "
+            "Add tracer.init / tracer.Start to enable distributed tracing."
+        )
 
     return {
         "ok": True,
@@ -1504,6 +1802,14 @@ def get_observability_summary(project_root: str) -> dict:
         "instrumented_files": instrumented_files,
         "span_count": span_count,
         "metric_count": metric_count,
+        "sentry_coverage": {
+            "init_files": sentry_init_files,
+            "total_files_with_sentry": sentry_total_files,
+        },
+        "datadog_coverage": {
+            "init_files": datadog_init_files,
+            "total_files_with_datadog": datadog_total_files,
+        },
         "coverage_score": min(score, 100),
         "recommendations": recommendations,
     }

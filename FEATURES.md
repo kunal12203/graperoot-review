@@ -1,6 +1,6 @@
 # GrapeRoot Pro — Feature List
 
-> **Implementation Status**: Phases 1–8 fully implemented in `graph_builder_v6.2.py` + `mcp_graph_server_v7.5.py`
+> **Implementation Status**: Phases 1–14 fully implemented in `graph_builder_v6.2.py` + `mcp_graph_server_v7.5.py`
 > - Phase 1: Language Expansion (Java, Kotlin, Ruby, SQL, Shell, Scala, C#, Prisma) — `graph_builder_parsers.py`, `graph_builder_prisma.py`
 > - Phase 2: Framework Route Detection (20 frameworks) — `graph_builder_routes.py` + 29 MCP tools in `mcp_tools_integration.py`
 > - Phase 3: Service Graph (Kafka/SQS/Redis/RabbitMQ/NATS/EventBridge + Proto/OpenAPI/GraphQL/AsyncAPI) — `graph_builder_service_graph.py`
@@ -9,6 +9,12 @@
 > - Phase 6: Structural Bug Detection (bean collisions, config parity, Kafka group collisions) — `structural_bugs.py`
 > - Phase 7: Multi-Service & Advanced Tools (test coverage, PR impact, snapshots, federated search) — `advanced_tools.py`
 > - Phase 8: Observability (OTel, Prometheus, Grafana, log patterns) — `observability.py`
+> - Phase 9: ORM Detection (TypeORM, Sequelize, GORM, Drizzle, Mongoose, SQLAlchemy)
+> - Phase 10: Framework Expansion (Fiber, Koa, Ktor, Quarkus, Rocket, Sinatra, Grape, Beego + CircleCI, Buildkite)
+> - Phase 11: Security Expansion (21 new secret patterns, SAST for C#/Ruby/PHP/Kotlin, IaC misconfig scanner) — `security.py`
+> - Phase 12: MQ Expansion (Celery, Azure Service Bus, GCP Pub/Sub, Temporal, Sidekiq/Resque)
+> - Phase 13: Structural Checks (N+1 risk, missing pagination, missing indexes) — `structural_bugs.py`
+> - Phase 14: Sentry + Datadog Observability Coverage — `observability.py`
 
 ## Codebase Intelligence
 - Instant symbol navigation — find any function, class, or variable across your entire project
@@ -231,6 +237,26 @@ Tested on production Java repos (resilience4j, eureka) — 100% compile rate aft
 
 ## Infrastructure as Code (Phase 2)
 
+## IaC Security Scanning (Phase 11)
+
+`graph_iac_security()` — scans Terraform, Kubernetes manifests, and Dockerfiles for security misconfigurations. Filter by `severity_min='low'|'medium'|'high'|'critical'`.
+
+| Rule | What it detects | Severity |
+|------|----------------|---------|
+| TF001 | S3 bucket with public ACL | HIGH |
+| TF002 | Security group ingress open to `0.0.0.0/0` | HIGH |
+| TF003 | Security group egress open to `0.0.0.0/0` | MEDIUM |
+| TF004 | RDS instance with `publicly_accessible = true` | HIGH |
+| TF005 | S3 bucket missing versioning | MEDIUM |
+| TF006 | EKS cluster with public endpoint enabled | HIGH |
+| TF007 | IAM policy with overly permissive `*` actions | HIGH |
+| TF008 | KMS key without key rotation enabled | MEDIUM |
+| K8S001 | Container running without a security context | MEDIUM |
+| K8S002 | Container with `allowPrivilegeEscalation: true` | HIGH |
+| K8S003 | Container running as root (`runAsNonRoot: false`) | HIGH |
+| DOCKER001 | Dockerfile `USER root` or no `USER` directive | HIGH |
+| DOCKER002 | Dockerfile `FROM` using `:latest` tag | MEDIUM |
+
 ### Terraform / OpenTofu
 `graph_tf_resources()` — list all cloud infrastructure resources from `.tf` and `.hcl` files.
 
@@ -272,6 +298,19 @@ Filter by `namespace='production'` or `base_filter='../../base'` to narrow resul
 | Prisma | `model {}` blocks in `.prisma` schema | TypeScript / any |
 | JPA / Hibernate | `@Entity` + `@Table` annotations | Java, Kotlin |
 | ActiveRecord | `class Model < ApplicationRecord` + `belongs_to`/`has_many` | Ruby |
+
+## ORM Support (Phase 9)
+
+`graph_db_models()` extended to detect six additional ORM patterns across TypeScript, JavaScript, Go, and Python.
+
+| ORM | Detection | Language |
+|-----|-----------|----------|
+| TypeORM | `@Entity`, `@Column`, `@ManyToOne` relations | TypeScript |
+| Sequelize | `class extends Model`, `Model.init()` | JavaScript/TypeScript |
+| GORM | struct with `gorm.io/gorm` import + gorm tags | Go |
+| Drizzle ORM | `pgTable()`, `mysqlTable()`, `sqliteTable()` | TypeScript |
+| Mongoose | `new mongoose.Schema()` + `mongoose.model()` | JavaScript/TypeScript |
+| SQLAlchemy | class extends `Base` with `__tablename__` | Python |
 
 ## Modern Frontend Routes (Phase 2)
 
@@ -340,6 +379,42 @@ Filter by `signal_type='traces'`, `'metrics'`, or `'logs'`.
 Parses `prometheus.rules.yaml`, `alerting_rules.yaml`, `recording_rules.yaml`:
 - Alert name, severity label, PromQL expression
 - Filter by `severity='critical'` or `group='api-alerts'`
+
+## Sentry + Datadog Coverage (Phase 14)
+
+`graph_sentry_coverage()` — scans every `.py`, `.ts`, `.js`, `.go`, `.java`, `.kt` file for Sentry SDK usage.
+
+| Detection | Languages |
+|-----------|-----------|
+| `sentry_sdk.init(dsn=...)` | Python |
+| `sentry_sdk.capture_exception()` / `capture_message()` | Python |
+| `@sentry_sdk.trace` decorator | Python |
+| `with sentry_sdk.start_transaction(...)` | Python |
+| `Sentry.init({dsn: '...'})` | TypeScript/JavaScript |
+| `Sentry.captureException()` / `captureMessage()` | TypeScript/JavaScript |
+| `Sentry.startTransaction({name: '...'})` | TypeScript/JavaScript |
+| `withSentryConfig(...)` in `next.config.js` | TypeScript/JavaScript |
+| `sentry.Init(...)` / `sentry.CaptureException()` / `sentry.StartSpan()` | Go |
+| `Sentry.init(options ->` / `Sentry.captureException()` | Java/Kotlin |
+
+Returns: `total_files_scanned`, `files_with_sentry`, `sentry_calls` (file + line + kind), `coverage_pct`.
+
+`graph_datadog_coverage()` — scans for Datadog APM tracing SDK usage.
+
+| Detection | Languages |
+|-----------|-----------|
+| `tracer.trace('operation')` / `tracer.configure()` | Python (ddtrace) |
+| `@tracer.wrap(name='...')` decorator | Python (ddtrace) |
+| `DD_AGENT_HOST` / `DD_SERVICE` / `DD_ENV` env var references | Python |
+| `DogStatsD` / `statsd.increment()` | Python |
+| `tracer.init({service: '...'})` | TypeScript/JavaScript (dd-trace) |
+| `tracer.startSpan()` / `tracer.trace()` | TypeScript/JavaScript |
+| `tracer.Start(tracer.WithService("..."))` | Go |
+| `tracer.StartSpan()` / `tracer.StartSpanFromContext()` | Go |
+
+Returns: `total_files_scanned`, `files_with_datadog`, `datadog_spans` (file + line + operation), `coverage_pct`.
+
+`find_sentry_configs()` and `find_datadog_configs()` walk the project for `sentry.properties`, `sentry.yml`, `datadog.yaml`, `ddconfig.yaml`, and any source file with an init call.
 
 ## Developer Workflow (Phase 3)
 

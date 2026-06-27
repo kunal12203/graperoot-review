@@ -114,6 +114,42 @@ _SECRET_PATTERNS: list[tuple[str, str, str]] = [
     (r"""api_key\s*=\s*["'][A-Za-z0-9\-_]{16,}["']""", "generic_api_key", "medium"),
     (r"Authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*", "bearer_token", "high"),
     (r"""PRIVATE_KEY\s*=\s*["']-----""", "private_key_env", "critical"),
+    # Stripe
+    (r"sk_live_[A-Za-z0-9]{24,}", "stripe_secret_key", "critical"),
+    (r"rk_live_[A-Za-z0-9]{24,}", "stripe_restricted_key", "critical"),
+    (r"pk_live_[A-Za-z0-9]{24,}", "stripe_publishable_key", "medium"),
+    # Google
+    (r"AIza[0-9A-Za-z\-_]{35}", "google_api_key", "high"),
+    (r'"type":\s*"service_account"', "gcp_service_account_json", "critical"),
+    # Twilio
+    (r"AC[a-f0-9]{32}", "twilio_account_sid", "high"),
+    (r"SK[a-f0-9]{32}", "twilio_api_key", "high"),
+    # SendGrid
+    (r"SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}", "sendgrid_api_key", "critical"),
+    # Anthropic
+    (r"sk-ant-[A-Za-z0-9\-_]{40,}", "anthropic_api_key", "critical"),
+    # npm
+    (r"npm_[A-Za-z0-9]{36}", "npm_token", "high"),
+    # Docker Hub
+    (r"dckr_pat_[A-Za-z0-9\-_]{27}", "dockerhub_pat", "high"),
+    # Azure
+    (r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}", "azure_storage_connection_string", "critical"),
+    (r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}.*client.?secret", "azure_client_secret", "high"),
+    # HashiCorp Vault
+    (r"hvs\.[A-Za-z0-9]{24,}", "vault_token", "critical"),
+    (r"hvb\.[A-Za-z0-9]{24,}", "vault_batch_token", "high"),
+    # Okta
+    (r"00[A-Za-z0-9\-_]{38}", "okta_api_token", "high"),
+    # Datadog
+    (r"DD_API_KEY\s*=\s*[A-Za-z0-9]{32}", "datadog_api_key", "high"),
+    # Grafana
+    (r"glsa_[A-Za-z0-9]{32}_[A-Za-z0-9]{8}", "grafana_service_account", "high"),
+    # Algolia
+    (r"[A-Za-z0-9]{32}.*algolia", "algolia_api_key", "medium"),
+    # Mapbox
+    (r"pk\.eyJ1IjoiJ[A-Za-z0-9\._-]{50,}", "mapbox_token", "medium"),
+    # Vercel
+    (r"vercel_[A-Za-z0-9_-]{24,}", "vercel_token", "high"),
 ]
 
 _COMPILED_SECRETS = [
@@ -125,6 +161,7 @@ _SUPPRESS_MARKERS = (
     "# noqa", "# nosec", "// nosec",
     "example", "placeholder", "<your-", "YOUR_", "REPLACE_ME",
     "your_", "<YOUR", "EXAMPLE", "DUMMY", "FAKE",
+    "test_", "testing", "sample_", "demo_", "<placeholder>", "INSERT_HERE",
 )
 
 _SECRET_SKIP_EXT = {".md", ".rst", ".txt"}  # skip obvious docs? No — scan all per spec
@@ -499,13 +536,53 @@ _SAST_RULES: dict[str, list[dict]] = {
             "fix": "Throw an exception or return an error code instead.",
         },
     ],
+    "csharp": [
+        {"id": "CS001", "pattern": r"(?:Process\.Start|\.Start)\s*\(", "title": "Process.Start() — potential command injection", "severity": "high", "cwe": "CWE-78", "fix": "Avoid Process.Start with untrusted input; validate all args."},
+        {"id": "CS002", "pattern": r"SqlCommand\s*\(", "title": "SqlCommand construction — review for SQL injection", "severity": "high", "cwe": "CWE-89", "fix": "Use parameterized queries with SqlParameter."},
+        {"id": "CS003", "pattern": r"Response\.Write\s*\(", "title": "Response.Write() — XSS risk", "severity": "medium", "cwe": "CWE-79", "fix": "Use HtmlEncoder.Default.Encode() before writing user input."},
+        {"id": "CS004", "pattern": r"BinaryFormatter\(\)", "title": "BinaryFormatter deserialization — arbitrary code execution", "severity": "critical", "cwe": "CWE-502", "fix": "Use System.Text.Json or XmlSerializer instead."},
+        {"id": "CS005", "pattern": r"MD5\.Create\(\)|SHA1\.Create\(\)", "title": "Weak hash (MD5/SHA-1) — not collision resistant", "severity": "medium", "cwe": "CWE-327", "fix": "Use SHA-256 or SHA-512 via SHA256.Create()."},
+        {"id": "CS006", "pattern": r'allowUnsafeUpdates\s*=\s*true', "title": "allowUnsafeUpdates=true (SharePoint) — CSRF risk", "severity": "high", "cwe": "CWE-352", "fix": "Remove allowUnsafeUpdates or add proper validation."},
+        {"id": "CS007", "pattern": r'new Random\(\)', "title": "System.Random — not cryptographically secure", "severity": "medium", "cwe": "CWE-338", "fix": "Use System.Security.Cryptography.RandomNumberGenerator instead."},
+        {"id": "CS008", "pattern": r'catch\s*\(\s*Exception\s+\w+\s*\)\s*\{[^}]*\}', "title": "Broad catch(Exception) — hides bugs", "severity": "low", "cwe": "CWE-390", "fix": "Catch specific exception types."},
+    ],
+    "ruby": [
+        {"id": "RB001", "pattern": r'\beval\s*[(\s]', "title": "eval() — arbitrary code execution", "severity": "high", "cwe": "CWE-95", "fix": "Avoid eval; refactor to explicit logic."},
+        {"id": "RB002", "pattern": r'`[^`]+`|\bsystem\s*\(|\bexec\s*\(|\bspawn\s*\(', "title": "Shell command execution — command injection risk", "severity": "high", "cwe": "CWE-78", "fix": "Use Open3 with an array form to avoid shell interpolation."},
+        {"id": "RB003", "pattern": r'ActiveRecord.*where\s*\(["\'][^"\']*#\{', "title": "ActiveRecord where() with string interpolation — SQL injection", "severity": "high", "cwe": "CWE-89", "fix": "Use parameterized queries: where('col = ?', value)."},
+        {"id": "RB004", "pattern": r'render\s+inline\s*:', "title": "render inline: — XSS if user content rendered", "severity": "medium", "cwe": "CWE-79", "fix": "Use templates; avoid inline: with user-controlled data."},
+        {"id": "RB005", "pattern": r'Marshal\.load\s*\(', "title": "Marshal.load — arbitrary object deserialization", "severity": "critical", "cwe": "CWE-502", "fix": "Use JSON.parse or a safe serializer instead."},
+        {"id": "RB006", "pattern": r'params\[.*\].*\.constantize', "title": "String#constantize with user input — remote code execution", "severity": "critical", "cwe": "CWE-94", "fix": "Whitelist allowed class names before constantize."},
+        {"id": "RB007", "pattern": r'Digest::MD5|Digest::SHA1', "title": "Weak hash — MD5/SHA1 not collision-safe", "severity": "medium", "cwe": "CWE-327", "fix": "Use Digest::SHA256 or bcrypt for passwords."},
+    ],
+    "php": [
+        {"id": "PHP001", "pattern": r'\beval\s*\(', "title": "eval() — arbitrary PHP execution", "severity": "critical", "cwe": "CWE-95", "fix": "Remove eval(); refactor to explicit logic."},
+        {"id": "PHP002", "pattern": r'mysql_query\s*\(\s*["\'][^"\']*\$', "title": "mysql_query with variable interpolation — SQL injection", "severity": "critical", "cwe": "CWE-89", "fix": "Use PDO with prepared statements."},
+        {"id": "PHP003", "pattern": r'\$_(?:GET|POST|REQUEST|COOKIE)\[[^\]]+\].*(?:echo|print|printf)', "title": "Echoing superglobal directly — XSS", "severity": "high", "cwe": "CWE-79", "fix": "Use htmlspecialchars() or htmlentities() before output."},
+        {"id": "PHP004", "pattern": r'shell_exec\s*\(|passthru\s*\(|system\s*\(|exec\s*\(|popen\s*\(', "title": "Shell execution function — command injection", "severity": "high", "cwe": "CWE-78", "fix": "Avoid shell execution; use PHP native functions instead."},
+        {"id": "PHP005", "pattern": r'unserialize\s*\(', "title": "unserialize() — arbitrary object injection", "severity": "critical", "cwe": "CWE-502", "fix": "Use json_decode() instead; never unserialize untrusted input."},
+        {"id": "PHP006", "pattern": r'md5\s*\(|sha1\s*\(', "title": "Weak hash — md5/sha1 for passwords", "severity": "medium", "cwe": "CWE-327", "fix": "Use password_hash() with PASSWORD_BCRYPT or PASSWORD_ARGON2ID."},
+        {"id": "PHP007", "pattern": r'file_get_contents\s*\(\s*\$_', "title": "file_get_contents with user-controlled path — LFI/SSRF", "severity": "high", "cwe": "CWE-73", "fix": "Validate and whitelist allowed paths before reading."},
+        {"id": "PHP008", "pattern": r'include\s*\(\s*\$|require\s*\(\s*\$|include_once\s*\(\s*\$|require_once\s*\(\s*\$', "title": "include/require with variable — remote/local file inclusion", "severity": "critical", "cwe": "CWE-98", "fix": "Whitelist allowed files; never include() with user input."},
+    ],
+    "kotlin": [
+        {"id": "KT001", "pattern": r'Runtime\.getRuntime\(\)\.exec\s*\(', "title": "Runtime.exec() — command injection risk", "severity": "high", "cwe": "CWE-78", "fix": "Use ProcessBuilder with a list to avoid shell injection."},
+        {"id": "KT002", "pattern": r'MessageDigest\.getInstance\s*\(\s*"(?:MD5|SHA-1)"', "title": "Weak hash algorithm — MD5/SHA-1", "severity": "medium", "cwe": "CWE-327", "fix": "Use SHA-256 or SHA-512 instead."},
+        {"id": "KT003", "pattern": r'ObjectInputStream\s*\(', "title": "ObjectInputStream — unsafe deserialization", "severity": "high", "cwe": "CWE-502", "fix": "Use JSON/Protobuf; validate class types if deserialization is required."},
+        {"id": "KT004", "pattern": r'Log\.[dviwe]\s*\([^,]+,\s*(?:password|token|secret|key)', "title": "Logging sensitive data (Kotlin Log)", "severity": "medium", "cwe": "CWE-532", "fix": "Remove sensitive values from log statements."},
+        {"id": "KT005", "pattern": r'\.execute\s*\(\s*"[^"]*\$\{', "title": "JDBC execute() with string template — SQL injection", "severity": "high", "cwe": "CWE-89", "fix": "Use PreparedStatement with parameters."},
+    ],
 }
 
 _LANG_EXTENSIONS: dict[str, set[str]] = {
     "python": {".py"},
     "javascript": {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"},
     "go": {".go"},
-    "java": {".java", ".kt"},
+    "java": {".java"},
+    "csharp": {".cs", ".csx"},
+    "ruby": {".rb", ".rake"},
+    "php": {".php"},
+    "kotlin": {".kt", ".kts"},
 }
 
 _COMPILED_SAST: dict[str, list[tuple[re.Pattern, re.Pattern | None, re.Pattern | None, dict]]] = {}
@@ -591,6 +668,7 @@ def scan_sast(project_root: str, language: str = "auto") -> list[dict]:
                     "file": rel_path,
                     "line": lineno,
                     "rule": rule["id"],
+                    "rule_id": rule["id"],
                     "title": rule["title"],
                     "severity": rule["severity"],
                     "context": line.strip(),
@@ -602,7 +680,213 @@ def scan_sast(project_root: str, language: str = "auto") -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 5A-3  Vulnerability Scanner (OSV.dev)
+# 5A-3  IaC Misconfiguration Scanner
+# ---------------------------------------------------------------------------
+
+_IAC_RULES: list[dict] = [
+    {
+        "id": "TF001",
+        "title": "S3 bucket with public ACL",
+        "pattern": r'acl\s*=\s*"public-read(?:-write)?"',
+        "file_glob": r"\.tf$",
+        "severity": "high",
+        "fix": 'Set acl = "private" or use bucket policies with explicit grants.',
+    },
+    {
+        "id": "TF002",
+        "title": "Security group allows 0.0.0.0/0 ingress on port 22 (SSH)",
+        "pattern": r'(?s)ingress[^}]*cidr_blocks[^}]*0\.0\.0\.0/0',
+        "file_glob": r"\.tf$",
+        "severity": "critical",
+        "fix": "Restrict SSH to known IP ranges.",
+    },
+    {
+        "id": "TF003",
+        "title": "Security group allows 0.0.0.0/0 on all ports",
+        "pattern": r'(?s)(?:from_port|to_port)\s*=\s*0[^}]*cidr_blocks[^}]*0\.0\.0\.0/0',
+        "file_glob": r"\.tf$",
+        "severity": "critical",
+        "fix": "Restrict to specific ports and CIDR ranges.",
+    },
+    {
+        "id": "TF004",
+        "title": "RDS instance publicly accessible",
+        "pattern": r'publicly_accessible\s*=\s*true',
+        "file_glob": r"\.tf$",
+        "severity": "high",
+        "fix": "Set publicly_accessible = false; access via bastion or VPC.",
+    },
+    {
+        "id": "TF005",
+        "title": "S3 bucket missing versioning",
+        "pattern": r'resource\s+"aws_s3_bucket"\s+"[^"]+"\s*\{(?:(?!versioning)[^}])*\}',
+        "file_glob": r"\.tf$",
+        "severity": "medium",
+        "fix": "Add a versioning { enabled = true } block to the S3 bucket resource.",
+    },
+    {
+        "id": "TF006",
+        "title": "EKS cluster with public endpoint access",
+        "pattern": r'endpoint_public_access\s*=\s*true',
+        "file_glob": r"\.tf$",
+        "severity": "medium",
+        "fix": "Set endpoint_public_access = false and use private networking.",
+    },
+    {
+        "id": "TF007",
+        "title": "Lambda function with wide IAM permissions (*)",
+        "pattern": r'"Action"\s*:\s*"\*"',
+        "file_glob": r"\.(tf|json)$",
+        "severity": "high",
+        "fix": "Apply least-privilege — specify exact IAM actions needed.",
+    },
+    {
+        "id": "TF008",
+        "title": "KMS key with no key rotation",
+        "pattern": r'resource\s+"aws_kms_key"(?:(?!enable_key_rotation)[^}])*\}',
+        "file_glob": r"\.tf$",
+        "severity": "medium",
+        "fix": "Add enable_key_rotation = true to the aws_kms_key resource.",
+    },
+    {
+        "id": "K8S001",
+        "title": "Container running as root (no runAsNonRoot)",
+        "pattern": r'(?s)containers:[^-]*-[^-]*image:[^-]*(?!runAsNonRoot)',
+        "file_glob": r"\.(yaml|yml)$",
+        "severity": "medium",
+        "fix": "Add securityContext.runAsNonRoot: true to container spec.",
+    },
+    {
+        "id": "K8S002",
+        "title": "Privileged container",
+        "pattern": r'privileged\s*:\s*true',
+        "file_glob": r"\.(yaml|yml)$",
+        "severity": "critical",
+        "fix": "Remove privileged: true; use specific capabilities instead.",
+    },
+    {
+        "id": "K8S003",
+        "title": "Container missing resource limits",
+        "pattern": r'(?s)containers:\s*-[^-]*image:[^-]*(?!limits:)',
+        "file_glob": r"\.(yaml|yml)$",
+        "severity": "low",
+        "fix": "Add resources.limits.cpu and resources.limits.memory to prevent noisy-neighbor issues.",
+    },
+    {
+        "id": "DOCKER001",
+        "title": "Dockerfile runs as root (no USER directive)",
+        "pattern": r'^FROM\s+\S+',
+        "file_glob": r"Dockerfile",
+        "severity": "medium",
+        "fix": "Add a USER instruction to run as a non-root user.",
+        "negative_pattern": r'^USER\s+\S+',  # flag only if USER is absent
+    },
+    {
+        "id": "DOCKER002",
+        "title": "Dockerfile uses :latest tag",
+        "pattern": r'FROM\s+\S+:latest\b',
+        "file_glob": r"Dockerfile",
+        "severity": "low",
+        "fix": "Pin to a specific image version for reproducible builds.",
+    },
+]
+
+_IAC_SKIP_PATHS = {"node_modules", ".git", "venv", ".venv", "__pycache__", "dist", "build"}
+
+
+def scan_iac_misconfigs(project_root: str) -> list[dict]:
+    """Scan Terraform, Kubernetes YAML, and Dockerfile for security misconfigs.
+
+    Returns a list of finding dicts with keys:
+        rule_id, title, severity, fix, file, line, snippet
+    """
+    root = Path(project_root).resolve()
+    findings: list[dict] = []
+
+    # Pre-compile all rule patterns
+    compiled_rules: list[tuple[re.Pattern, re.Pattern | None, dict]] = []
+    for rule in _IAC_RULES:
+        pat = re.compile(rule["pattern"], re.MULTILINE)
+        neg_pat = (
+            re.compile(rule["negative_pattern"], re.MULTILINE)
+            if "negative_pattern" in rule
+            else None
+        )
+        compiled_rules.append((pat, neg_pat, rule))
+
+    def _file_matches_glob(path: Path, glob_pattern: str) -> bool:
+        """Return True if the file path matches the rule's file_glob."""
+        # Dockerfile rules: match by exact filename
+        if not glob_pattern.startswith(r"\."):
+            return re.search(glob_pattern, path.name) is not None
+        return bool(re.search(glob_pattern, path.name))
+
+    for filepath in root.rglob("*"):
+        if not filepath.is_file():
+            continue
+        # Skip build/vendor dirs
+        if any(p in _IAC_SKIP_PATHS for p in filepath.parts):
+            continue
+        if filepath.stat().st_size > 2_097_152:  # 2 MB cap
+            continue
+
+        for compiled_pat, neg_pat, rule in compiled_rules:
+            if not _file_matches_glob(filepath, rule["file_glob"]):
+                continue
+
+            content = ""
+            for enc in ("utf-8", "latin-1"):
+                try:
+                    content = filepath.read_text(encoding=enc)
+                    break
+                except (UnicodeDecodeError, OSError):
+                    pass
+            if not content:
+                continue
+
+            # For rules with a negative_pattern, flag only if the negative
+            # pattern is ABSENT from the whole file.
+            if neg_pat is not None:
+                if compiled_pat.search(content) and not neg_pat.search(content):
+                    # Report at line 1 (file-level finding)
+                    findings.append({
+                        "rule_id": rule["id"],
+                        "title": rule["title"],
+                        "severity": rule["severity"],
+                        "fix": rule["fix"],
+                        "file": _rel(filepath, root),
+                        "line": 1,
+                        "snippet": content.splitlines()[0].strip() if content else "",
+                    })
+                continue
+
+            # Standard: report each match with its line number
+            lines = content.splitlines()
+            # Use finditer for line-level precision; for multi-line patterns
+            # find the line number from match start offset.
+            for m in compiled_pat.finditer(content):
+                # Compute line number from offset
+                line_no = content[: m.start()].count("\n") + 1
+                snippet = lines[line_no - 1].strip() if line_no <= len(lines) else ""
+                findings.append({
+                    "rule_id": rule["id"],
+                    "title": rule["title"],
+                    "severity": rule["severity"],
+                    "fix": rule["fix"],
+                    "file": _rel(filepath, root),
+                    "line": line_no,
+                    "snippet": snippet,
+                })
+                # For multi-line rules (re.DOTALL via (?s)), only report once
+                # per file to avoid flooding.
+                if "(?s)" in rule["pattern"]:
+                    break
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# 5A-4  Vulnerability Scanner (OSV.dev)
 # ---------------------------------------------------------------------------
 
 _LOCK_FILE_ECOSYSTEM: dict[str, str] = {

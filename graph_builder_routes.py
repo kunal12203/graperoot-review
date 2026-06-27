@@ -1,14 +1,18 @@
 """
 HTTP route/endpoint extractor for GrapeRoot Pro — Phase 2.
 
-Supports 20 framework patterns across TypeScript/JavaScript, Python, Go, Rust, and PHP:
+Supports 28 framework patterns across TypeScript/JavaScript, Python, Go, Rust, PHP,
+Kotlin, and Ruby:
 
   TS/JS  : Express, Fastify, Hono, NestJS, tRPC, Next.js App Router,
-            Next.js Pages Router, Remix, SvelteKit, Nuxt
+            Next.js Pages Router, Remix, SvelteKit, Nuxt, Koa
   Python : FastAPI, Flask, Django
-  Go     : Gin, Gorilla Mux, Echo, Chi
-  Rust   : Axum, Actix
+  Go     : Gin, Gorilla Mux, Echo, Chi, Fiber, Beego
+  Rust   : Axum, Actix, Rocket
   PHP    : Laravel
+  Kotlin : Ktor
+  Java   : Quarkus / JAX-RS (Jersey, Micronaut)
+  Ruby   : Sinatra, Grape
 
 Entry points
 ------------
@@ -58,6 +62,12 @@ ROUTE_EXTS: set[str] = {
     ".rs",
     # PHP
     ".php",
+    # Kotlin
+    ".kt",
+    # Java
+    ".java",
+    # Ruby
+    ".rb",
 }
 
 
@@ -416,6 +426,121 @@ _ACTIX_PROC_RE = re.compile(
     re.MULTILINE,
 )
 
+# ── Koa (Node.js) ────────────────────────────────────────────────────────────
+
+# router.get('/path', ...) / router.post('/path', ...) on a Router instance
+# Deliberately excludes 'app' to avoid double-matching Express.
+_KOA_VERB_RE = re.compile(
+    r"""(?:^|[^\w])
+    (?:router|koaRouter|Router)\s*\.\s*
+    (get|post|put|patch|delete|del|head|options)\s*\(
+    \s*['"`]([^'"`]+)['"`]""",
+    re.MULTILINE | re.VERBOSE,
+)
+_KOA_ALL_RE = re.compile(
+    r"""(?:^|[^\w])
+    (?:router|koaRouter|Router)\s*\.\s*all\s*\(
+    \s*['"`]([^'"`]+)['"`]""",
+    re.MULTILINE | re.VERBOSE,
+)
+
+# ── Fiber (Go) ───────────────────────────────────────────────────────────────
+
+_FIBER_VERB_RE = re.compile(
+    r"""(?:app|api|grp|v\d+|fiber)\s*\.\s*
+    (Get|Post|Put|Patch|Delete|Head|Options|All)\s*\(
+    \s*"([^"]+)"""  ,
+    re.MULTILINE | re.VERBOSE,
+)
+_FIBER_GROUP_RE = re.compile(
+    r"""(?:app|api|grp|v\d+|fiber)\s*\.\s*Group\s*\(\s*"([^"]+)"\s*\)""",
+    re.MULTILINE,
+)
+
+# ── Beego (Go) ───────────────────────────────────────────────────────────────
+
+_BEEGO_ROUTER_RE = re.compile(
+    r"""beego\s*\.\s*Router\s*\(\s*"([^"]+)"\s*,""",
+    re.MULTILINE,
+)
+_BEEGO_NAMESPACE_RE = re.compile(
+    r"""beego\s*\.\s*NewNamespace\s*\(\s*"([^"]+)"""  ,
+    re.MULTILINE,
+)
+_BEEGO_NS_ROUTER_RE = re.compile(
+    r"""beego\s*\.\s*NSRouter\s*\(\s*"([^"]+)""",
+    re.MULTILINE,
+)
+
+# ── Ktor (Kotlin) ────────────────────────────────────────────────────────────
+
+# get("/path") { ... } / post("/path") { ... }
+_KTOR_VERB_RE = re.compile(
+    r"""(?:^|[^\w])
+    (get|post|put|patch|delete|head|options|route)\s*\(
+    \s*"([^"]+)""",
+    re.MULTILINE | re.VERBOSE,
+)
+# route("/prefix") { ... } — outer prefix block
+_KTOR_ROUTE_RE = re.compile(
+    r"""(?:^|[^\w])route\s*\(\s*"([^"]+)"\s*\)""",
+    re.MULTILINE,
+)
+
+# ── Quarkus / JAX-RS (Java) ──────────────────────────────────────────────────
+
+# Class-level @Path
+_JAXRS_CLASS_PATH_RE = re.compile(
+    r"""@Path\s*\(\s*"([^"]+)"\s*\)
+    (?:[^{]{0,200}?)          # optional other annotations / modifiers
+    class\s+\w+""",
+    re.MULTILINE | re.VERBOSE | re.DOTALL,
+)
+# Method-level HTTP verb annotation (may come before or after @Path)
+_JAXRS_METHOD_RE = re.compile(
+    r"""(@GET|@POST|@PUT|@DELETE|@PATCH|@HEAD|@OPTIONS)\s*\n
+    (?:[ \t]*(?:@[^\n]+\n))*    # any number of other annotations
+    [ \t]*(?:public\s+|private\s+|protected\s+)?
+    (?:static\s+)?
+    \S+\s+(\w+)\s*\(""",        # return-type methodName(
+    re.MULTILINE | re.VERBOSE,
+)
+# Optional sub-path on the method itself: @Path("/{id}")
+_JAXRS_SUB_PATH_RE = re.compile(
+    r"""@Path\s*\(\s*"([^"]+)"\s*\)""",
+    re.MULTILINE,
+)
+
+# ── Rocket (Rust) ────────────────────────────────────────────────────────────
+
+_ROCKET_ATTR_RE = re.compile(
+    r'#\[\s*(get|post|put|patch|delete|head|options)\s*\(\s*"([^"]+)"[^)]*\)\s*\]'
+    r'(?:\s*\n(?:[ \t]*#\[[^\]]+\]\s*\n)*)'
+    r'[ \t]*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)',
+    re.MULTILINE,
+)
+
+# ── Sinatra (Ruby) ───────────────────────────────────────────────────────────
+
+_SINATRA_VERB_RE = re.compile(
+    r"""^[ \t]*(get|post|put|patch|delete|options|head)\s+
+    ['"]([^'"]+)['"]\s+do\b""",
+    re.MULTILINE | re.VERBOSE,
+)
+
+# ── Grape (Ruby) ─────────────────────────────────────────────────────────────
+
+_GRAPE_RESOURCE_RE = re.compile(
+    r"""^[ \t]*(?:resource|namespace)\s+
+    (?::(\w+)|'([^']+)'|"([^"]+)")\s+do\b""",
+    re.MULTILINE | re.VERBOSE,
+)
+_GRAPE_VERB_RE = re.compile(
+    r"""^[ \t]*(get|post|put|patch|delete)\s+
+    (?::(\w+)|'([^']+)'|"([^"]+)")?\s*(?:do\b|$)""",
+    re.MULTILINE | re.VERBOSE,
+)
+
 # ── Laravel (PHP) ────────────────────────────────────────────────────────────
 
 _LARAVEL_VERB_RE = re.compile(
@@ -505,6 +630,34 @@ def _extract_hono(content: str, file_path: str, lines: list[str]) -> list[dict]:
     Keeping it as a named entry point for clarity and future Hono-specific patterns.
     """
     return []
+
+
+def _extract_koa(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Koa router route registrations (koa-router / @koa/router).
+
+    Matches ``router.get('/path', ...)`` style calls on a Router instance.
+    Deliberately avoids matching ``app.get(...)`` to prevent double-counting
+    with the Express extractor.
+    """
+    routes: list[dict] = []
+    _METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "del": "DELETE", "head": "HEAD", "options": "OPTIONS",
+    }
+    for m in _KOA_VERB_RE.finditer(content):
+        verb = _METHOD_MAP.get(m.group(1).lower(), m.group(1).upper())
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        end  = _find_block_end_paren(lines, ln, limit=60)
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, confidence="high"))
+
+    for m in _KOA_ALL_RE.finditer(content):
+        path = m.group(1)
+        ln   = content[: m.start()].count("\n")
+        end  = _find_block_end_paren(lines, ln, limit=60)
+        routes.append(_make_route(file_path, lines, ln, end, "ANY", path, confidence="high"))
+
+    return routes
 
 
 def _extract_nestjs(content: str, file_path: str, lines: list[str]) -> list[dict]:
@@ -836,6 +989,74 @@ def _extract_chi(content: str, file_path: str, lines: list[str]) -> list[dict]:
     return routes
 
 
+def _extract_fiber(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Fiber (Go) route registrations.
+
+    Handles both direct ``app.Get("/path", handler)`` calls and group-prefixed
+    calls like ``api := app.Group("/api"); api.Get("/users", handler)``.
+    """
+    routes: list[dict] = []
+    _FIBER_METHOD_MAP = {
+        "Get": "GET", "Post": "POST", "Put": "PUT", "Patch": "PATCH",
+        "Delete": "DELETE", "Head": "HEAD", "Options": "OPTIONS", "All": "ANY",
+    }
+
+    # Collect Group prefixes: `api := app.Group("/api")`
+    group_prefixes: dict[str, str] = {}
+    for m in _FIBER_GROUP_RE.finditer(content):
+        prefix = m.group(1)
+        line_start_pos = content.rfind("\n", 0, m.start()) + 1
+        line = content[line_start_pos: content.find("\n", m.start())]
+        var_m = re.match(r"\s*(\w+)\s*(?::=|=)", line)
+        if var_m:
+            group_prefixes[var_m.group(1)] = prefix
+
+    for m in _FIBER_VERB_RE.finditer(content):
+        verb = _FIBER_METHOD_MAP.get(m.group(1), m.group(1).upper())
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        end  = _find_block_end_brace(lines, ln, limit=60)
+
+        # Check if called on a group variable
+        line_start_pos = content.rfind("\n", 0, m.start()) + 1
+        line_prefix    = content[line_start_pos: m.start()]
+        recv_m         = re.search(r"(\w+)\s*\.\s*$", line_prefix)
+        if recv_m and recv_m.group(1) in group_prefixes:
+            path = group_prefixes[recv_m.group(1)].rstrip("/") + "/" + path.lstrip("/")
+
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, confidence="high"))
+    return routes
+
+
+def _extract_beego(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Beego (Go) route registrations.
+
+    Handles ``beego.Router("/path", &Controller{})`` and
+    ``beego.NSRouter("/path", &Controller{})`` inside a namespace.
+    """
+    routes: list[dict] = []
+
+    # Collect namespace prefixes
+    ns_prefixes: list[str] = []
+    for m in _BEEGO_NAMESPACE_RE.finditer(content):
+        ns_prefixes.append(m.group(1))
+
+    for m in _BEEGO_ROUTER_RE.finditer(content):
+        path = m.group(1)
+        ln   = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, confidence="high"))
+
+    for m in _BEEGO_NS_ROUTER_RE.finditer(content):
+        path = m.group(1)
+        ln   = content[: m.start()].count("\n")
+        # Apply first namespace prefix if available
+        if ns_prefixes:
+            path = ns_prefixes[0].rstrip("/") + "/" + path.lstrip("/")
+        routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, confidence="high"))
+
+    return routes
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUST EXTRACTORS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -896,6 +1117,248 @@ def _extract_actix(content: str, file_path: str, lines: list[str]) -> list[dict]
             routes.append(_make_route(file_path, lines, ln, ln, verb, path, handler, "high"))
         if not _ACTIX_ROUTE_RE.search(rest[:200]):
             routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, confidence="medium"))
+
+    return routes
+
+
+def _extract_rocket(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Rocket (Rust) attribute-macro route definitions.
+
+    Handles ``#[get("/path")] fn handler()`` and the data/guard variants.
+    Rocket uses ``<id>`` for path params — ``_normalize_path`` already converts
+    those to ``:id``.
+    """
+    routes: list[dict] = []
+    for m in _ROCKET_ATTR_RE.finditer(content):
+        verb    = m.group(1).upper()
+        path    = m.group(2)
+        handler = m.group(3)
+        ln      = content[: m.start()].count("\n")
+        end     = _find_block_end_brace(lines, ln, limit=80)
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, handler, "high"))
+    return routes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KOTLIN EXTRACTORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_ktor(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Ktor (Kotlin) routing DSL route definitions.
+
+    Handles the ``routing { get("/path") { ... } }`` DSL, including nested
+    ``route("/prefix") { get { ... } }`` blocks, and ``authenticate { ... }``
+    wrappers (ignored for path purposes — inner routes are still extracted).
+    """
+    routes: list[dict] = []
+    _KTOR_METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "head": "HEAD", "options": "OPTIONS",
+    }
+
+    # Collect route("prefix") blocks and their prefix strings
+    route_prefixes: dict[int, str] = {}  # line_no -> prefix
+    for m in _KTOR_ROUTE_RE.finditer(content):
+        ln = content[: m.start()].count("\n")
+        route_prefixes[ln] = m.group(1)
+
+    for m in _KTOR_VERB_RE.finditer(content):
+        verb_raw = m.group(1).lower()
+        if verb_raw == "route":
+            continue  # handled separately as prefix blocks
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        verb = _KTOR_METHOD_MAP.get(verb_raw, verb_raw.upper())
+        end  = _find_block_end_brace(lines, ln, limit=60)
+
+        # Check whether this verb call is inside a route("prefix") block by
+        # scanning backwards for the nearest route_prefix whose block contains ln
+        best_prefix = ""
+        for prefix_ln, prefix_val in route_prefixes.items():
+            if prefix_ln < ln:
+                # Approximate: find the brace block end for this prefix line
+                block_end = _find_block_end_brace(lines, prefix_ln, limit=200)
+                if ln <= block_end:
+                    # Longer prefix wins (innermost nesting)
+                    if len(prefix_val) >= len(best_prefix):
+                        best_prefix = prefix_val
+
+        if best_prefix:
+            path = best_prefix.rstrip("/") + "/" + path.lstrip("/")
+
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, confidence="high"))
+
+    return routes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JAVA EXTRACTORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_jaxrs(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract JAX-RS annotated routes (Quarkus, Micronaut, Jersey).
+
+    Combines class-level ``@Path`` with method-level ``@GET/@POST/...``.
+    Also handles an optional method-level ``@Path`` sub-path.
+    """
+    routes: list[dict] = []
+    _JAXRS_VERB_MAP = {
+        "@GET": "GET", "@POST": "POST", "@PUT": "PUT",
+        "@DELETE": "DELETE", "@PATCH": "PATCH",
+        "@HEAD": "HEAD", "@OPTIONS": "OPTIONS",
+    }
+
+    # Find class-level @Path annotations and their line ranges
+    class_paths: list[tuple[str, int, int]] = []  # (path, start_line, end_line)
+    for m in _JAXRS_CLASS_PATH_RE.finditer(content):
+        class_path = m.group(1)
+        start_ln   = content[: m.start()].count("\n")
+        end_ln     = _find_block_end_brace(lines, start_ln, limit=500)
+        class_paths.append((class_path, start_ln, end_ln))
+
+    if not class_paths:
+        return routes
+
+    for m in _JAXRS_METHOD_RE.finditer(content):
+        verb_ann = m.group(1)
+        handler  = m.group(2)
+        verb     = _JAXRS_VERB_MAP.get(verb_ann, "ANY")
+        ln       = content[: m.start()].count("\n")
+        end      = _find_block_end_brace(lines, ln, limit=60)
+
+        # Look for a @Path on the method itself.
+        # Strategy: collect all consecutive annotation lines that form the
+        # annotation cluster around the verb annotation (no blank lines, no '}'
+        # separator).  Search only that cluster, excluding the class-level paths.
+        cluster_start = ln
+        for back in range(ln - 1, max(-1, ln - 8), -1):
+            back_line = lines[back].strip() if back < len(lines) else ""
+            if not back_line:
+                break  # blank line separates clusters
+            if back_line.startswith("}") or back_line.startswith("{"):
+                break  # block boundary
+            if re.match(r"(public|private|protected|static|final|abstract)\b", back_line):
+                break
+            cluster_start = back
+
+        cluster_end = ln
+        for fwd in range(ln + 1, min(ln + 5, len(lines))):
+            fwd_line = lines[fwd].strip() if fwd < len(lines) else ""
+            if not fwd_line:
+                break
+            if not fwd_line.startswith("@") and not fwd_line.startswith("public") \
+                    and not fwd_line.startswith("private") and not fwd_line.startswith("protected"):
+                break
+            cluster_end = fwd
+
+        annotation_cluster = "\n".join(lines[cluster_start: cluster_end + 1])
+        sub_path = ""
+        for pm in _JAXRS_SUB_PATH_RE.finditer(annotation_cluster):
+            candidate = pm.group(1)
+            already_class = any(cp == candidate for cp, _, _ in class_paths)
+            if not already_class:
+                sub_path = candidate  # last non-class match wins
+
+        # Which class does this method belong to?
+        base_class_path = ""
+        for cp, cp_start, cp_end in class_paths:
+            if cp_start <= ln <= cp_end:
+                base_class_path = cp
+                break
+
+        full_path = ("/" + base_class_path.strip("/") + "/" + sub_path.strip("/")).replace("//", "/")
+        if full_path != "/" and full_path.endswith("/"):
+            full_path = full_path[:-1]
+
+        routes.append(_make_route(file_path, lines, ln, end, verb, full_path, handler, "high"))
+
+    return routes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUBY EXTRACTORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_sinatra(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Sinatra (Ruby) route definitions.
+
+    Handles ``get '/path' do ... end`` style declarations.
+    """
+    routes: list[dict] = []
+    _SINATRA_METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "options": "OPTIONS", "head": "HEAD",
+    }
+    for m in _SINATRA_VERB_RE.finditer(content):
+        verb = _SINATRA_METHOD_MAP.get(m.group(1).lower(), m.group(1).upper())
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        # Find matching 'end' by scanning forward
+        end = ln
+        for i in range(ln + 1, min(ln + 100, len(lines))):
+            stripped = lines[i].strip()
+            if stripped == "end":
+                end = i
+                break
+        routes.append(_make_route(file_path, lines, ln, end, verb, path, confidence="high"))
+    return routes
+
+
+def _extract_grape(content: str, file_path: str, lines: list[str]) -> list[dict]:
+    """Extract Grape (Ruby API framework) route definitions.
+
+    Handles ``resource :users do`` blocks with ``get``, ``post``, etc. inside,
+    and ``namespace :admin do`` prefixes.  Path parameters use ``:name`` syntax
+    which ``_normalize_path`` already handles for the ``:param`` form.
+    """
+    routes: list[dict] = []
+    _GRAPE_METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT",
+        "patch": "PATCH", "delete": "DELETE",
+    }
+
+    # Build a list of (prefix, block_start_line, block_end_line) from resource/namespace
+    resource_blocks: list[tuple[str, int, int]] = []
+    for m in _GRAPE_RESOURCE_RE.finditer(content):
+        # Group 1: :symbol, Group 2: 'string', Group 3: "string"
+        name = m.group(1) or m.group(2) or m.group(3) or ""
+        prefix = "/" + name.strip("/") if name else "/"
+        ln = content[: m.start()].count("\n")
+        # Find matching 'end'
+        depth = 0
+        end_ln = ln
+        for i in range(ln, min(ln + 300, len(lines))):
+            stripped = lines[i].strip()
+            if stripped.endswith(" do") or stripped == "do":
+                depth += 1
+            if stripped == "end":
+                depth -= 1
+                if depth <= 0:
+                    end_ln = i
+                    break
+        resource_blocks.append((prefix, ln, end_ln))
+
+    for m in _GRAPE_VERB_RE.finditer(content):
+        verb_raw  = m.group(1).lower()
+        # Sub-path: group 2 (:symbol), group 3 ('str'), group 4 ("str")
+        sub_raw   = m.group(2) or m.group(3) or m.group(4) or ""
+        sub_path  = ("/" + sub_raw.strip("/")) if sub_raw else ""
+        verb      = _GRAPE_METHOD_MAP.get(verb_raw, verb_raw.upper())
+        ln        = content[: m.start()].count("\n")
+        end       = ln + 5  # approximate
+
+        # Find which resource block contains this line
+        best_prefix = ""
+        for prefix, blk_start, blk_end in resource_blocks:
+            if blk_start < ln <= blk_end:
+                if len(prefix) >= len(best_prefix):
+                    best_prefix = prefix
+
+        full_path = (best_prefix.rstrip("/") + sub_path) or "/"
+        if not full_path.startswith("/"):
+            full_path = "/" + full_path
+
+        routes.append(_make_route(file_path, lines, ln, end, verb, full_path, confidence="high"))
 
     return routes
 
@@ -1138,6 +1601,11 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         routes.extend(_extract_fastify(content, file_path, lines))
         # Hono app.all()
         routes.extend(_extract_hono(content, file_path, lines))
+        # Koa router (koa-router / @koa/router)
+        if ("new Router" in content or "koa-router" in content
+                or "koa/router" in content or "router.get(" in content
+                or "router.post(" in content):
+            routes.extend(_extract_koa(content, file_path, lines))
         # NestJS — only if @Controller is present
         if "@Controller" in content:
             routes.extend(_extract_nestjs(content, file_path, lines))
@@ -1180,6 +1648,14 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         # Chi
         if "chi.NewRouter" in content or "chi.Router" in content:
             routes.extend(_extract_chi(content, file_path, lines))
+        # Fiber
+        if ("fiber.New" in content or "fiber.App" in content
+                or "app.Get(" in content or "app.Post(" in content
+                or ".Group(" in content and "fiber" in content):
+            routes.extend(_extract_fiber(content, file_path, lines))
+        # Beego
+        if "beego.Router" in content or "beego.NewNamespace" in content:
+            routes.extend(_extract_beego(content, file_path, lines))
 
     # ── Rust ─────────────────────────────────────────────────────────────────
     elif ext == ".rs":
@@ -1192,10 +1668,38 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
                              "#[put(", "#[patch(", "#[delete(")
         if any(ind in content for ind in _ACTIX_INDICATORS):
             routes.extend(_extract_actix(content, file_path, lines))
+        # Rocket — attribute macros, but not also matched by Actix
+        _ROCKET_INDICATORS = ("#[get(", "#[post(", "#[put(", "#[patch(", "#[delete(")
+        if any(ind in content for ind in _ROCKET_INDICATORS):
+            routes.extend(_extract_rocket(content, file_path, lines))
 
     # ── PHP ───────────────────────────────────────────────────────────────────
     elif ext == ".php":
         if "Route::" in content:
             routes.extend(_extract_laravel(content, file_path, lines))
+
+    # ── Kotlin ────────────────────────────────────────────────────────────────
+    elif ext == ".kt":
+        if ("routing {" in content or "install(Routing)" in content
+                or 'get("/' in content or 'post("/' in content):
+            routes.extend(_extract_ktor(content, file_path, lines))
+
+    # ── Java ─────────────────────────────────────────────────────────────────
+    elif ext == ".java":
+        _JAXRS_INDICATORS = ("@Path(", "@GET", "@POST", "@PUT", "@DELETE", "@PATCH")
+        if any(ind in content for ind in _JAXRS_INDICATORS):
+            routes.extend(_extract_jaxrs(content, file_path, lines))
+
+    # ── Ruby ─────────────────────────────────────────────────────────────────
+    elif ext == ".rb":
+        # Grape API framework (check first — Grape files also contain get/post)
+        if "Grape::API" in content or "resource :" in content or "namespace :" in content:
+            routes.extend(_extract_grape(content, file_path, lines))
+        # Sinatra-style: get '/path' do — paths must start with '/' to avoid
+        # matching Grape's get ':id' do style (which uses a bare symbol, not /path)
+        _SINATRA_INDICATORS = ("get '/", "post '/", "put '/", "delete '/",
+                               'get "/', 'post "/', 'put "/', 'delete "/')
+        if any(ind in content for ind in _SINATRA_INDICATORS):
+            routes.extend(_extract_sinatra(content, file_path, lines))
 
     return _dedup_routes(routes)

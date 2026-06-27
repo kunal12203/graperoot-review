@@ -293,42 +293,177 @@ def register_all_new_tools(
             return {"ok": False, "error": str(e)}
 
         nodes = graph.get("nodes", [])
-        models = []
 
-        _orm_map = {
-            ".rb": "ActiveRecord",
-            ".java": "JPA",
-            ".kt": "JPA",
-            ".prisma": "Prisma",
+        _EXT_ORM_MAP = {
+            ".rb":     "activerecord",
+            ".java":   "jpa",
+            ".kt":     "jpa",
+            ".prisma": "prisma",
         }
+
+        # Keywords in node metadata -> orm_type
+        _KEYWORD_ORM_MAP = [
+            ("typeorm",      "typeorm"),
+            ("sequelize",    "sequelize"),
+            ("mongoose",     "mongoose"),
+            ("gorm",         "gorm"),
+            ("drizzle",      "drizzle"),
+            ("sqlalchemy",   "sqlalchemy"),
+            ("prisma",       "prisma"),
+            ("django",       "django"),
+            ("jpa",          "jpa"),
+            ("activerecord", "activerecord"),
+        ]
+
+        # Content fingerprints for orm_type detection
+        import re as _re
+        _CONTENT_ORM_SIGS = [
+            (r"@Entity|@Column|@ManyToOne|@OneToMany|@JoinColumn|@Table\b",   "typeorm"),
+            (r"DataTypes\.|Model\.init\s*\(|sequelize\.define",               "sequelize"),
+            (r"new\s+Schema\s*\(|mongoose\.model\s*\(",                       "mongoose"),
+            (r"db\.Model\b|gorm\.Model\b",                                    "gorm"),
+            (r"pgTable\s*\(|mysqlTable\s*\(|drizzle\s*\(",                    "drizzle"),
+            (r"Column\s*\(|ForeignKey\s*\(|declarative_base|Base\s*=\s*declarative", "sqlalchemy"),
+            (r"models\.Model\b|from\s+django",                                "django"),
+            (r"@javax\.persistence\.|@jakarta\.persistence\.",                "jpa"),
+            (r"belongs_to\s+:|has_many\s+:|ActiveRecord::Base",               "activerecord"),
+        ]
+
+        def _detect_orm_type(file_path: str, node: dict) -> str:
+            """Detect ORM type from file extension, node keywords, or file content."""
+            suffix = Path(file_path).suffix.lower()
+            if suffix in _EXT_ORM_MAP:
+                return _EXT_ORM_MAP[suffix]
+
+            # Check node-level orm_type field first
+            node_orm = str(node.get("orm_type", "")).lower()
+            for kw, otype in _KEYWORD_ORM_MAP:
+                if kw in node_orm:
+                    return otype
+
+            # Check node keywords list
+            for kw_item in node.get("keywords", []):
+                for kw, otype in _KEYWORD_ORM_MAP:
+                    if kw in str(kw_item).lower():
+                        return otype
+
+            # Python files: check content
+            if suffix == ".py":
+                try:
+                    content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+                    for pattern, otype in _CONTENT_ORM_SIGS:
+                        if _re.search(pattern, content):
+                            return otype
+                    # Fallback: "models" in filename -> Django
+                    if "models" in Path(file_path).name:
+                        return "django"
+                except Exception:
+                    pass
+                return "sqlalchemy"
+
+            # TS/JS files: check content
+            if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+                try:
+                    content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+                    for pattern, otype in _CONTENT_ORM_SIGS:
+                        if _re.search(pattern, content):
+                            return otype
+                except Exception:
+                    pass
+
+            return "unknown"
+
+        # ------------------------------------------------------------------
+        # Step 1: collect models from info_graph.json
+        # ------------------------------------------------------------------
+        # model_name -> model dict  (for dedup)
+        models_by_name: dict[str, dict] = {}
 
         for node in nodes:
             if node.get("symbol_type") != "model":
                 continue
             file_path = node.get("file", "")
-            suffix = Path(file_path).suffix
+            name      = node.get("name", "")
+            if not name:
+                continue
+            orm_type = _detect_orm_type(file_path, node)
+            entry = {
+                "name":       name,
+                "file":       file_path,
+                "orm_type":   orm_type,
+                "line_start": node.get("line_start"),
+                "fields":     [],
+            }
+            models_by_name.setdefault(name, entry)
 
-            if suffix in _orm_map:
-                orm_type = _orm_map[suffix]
-            elif suffix == ".py":
-                fname = Path(file_path).name
-                if "models" in fname:
-                    orm_type = "Django"
-                else:
-                    orm_type = node.get("orm_type", "SQLAlchemy")
-            else:
-                orm_type = node.get("orm_type", "unknown")
+        # ------------------------------------------------------------------
+        # Step 2: supplement with graph_builder_orm.py if available
+        # ------------------------------------------------------------------
+        try:
+            import importlib.util as _ilu
+            import os as _os
 
-            models.append(
-                {
-                    "name": node.get("name", ""),
-                    "file": file_path,
-                    "orm_type": orm_type,
-                    "line": node.get("line_start"),
-                }
-            )
+            _orm_module_path = Path(get_project_root()) / "graph_builder_orm.py"
+            if not _orm_module_path.exists():
+                # Also check the directory containing this file
+                _orm_module_path = Path(__file__).parent / "graph_builder_orm.py"
 
-        return {"ok": True, "models": models, "total": len(models)}
+            if _orm_module_path.exists():
+                _spec = _ilu.spec_from_file_location("graph_builder_orm", str(_orm_module_path))
+                _orm_mod = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
+                _spec.loader.exec_module(_orm_mod)  # type: ignore[union-attr]
+
+                _extract_fn   = getattr(_orm_mod, "extract_orm_symbols", None)
+                _supports_fn  = getattr(_orm_mod, "supports_orm", None)
+
+                if _extract_fn and _supports_fn:
+                    _SKIP_DIRS = {
+                        ".git", "node_modules", "__pycache__", ".venv", "venv",
+                        "dist", "build", "out", "target", ".next", ".nuxt",
+                    }
+                    _SOURCE_EXTS = {
+                        ".py", ".ts", ".tsx", ".js", ".jsx",
+                        ".rb", ".java", ".kt", ".go", ".prisma",
+                    }
+                    _proj = str(get_project_root())
+                    for dirpath, dirnames, filenames in _os.walk(_proj):
+                        dirnames[:] = [
+                            d for d in dirnames
+                            if d not in _SKIP_DIRS and not d.startswith(".")
+                        ]
+                        for fname in filenames:
+                            fp = Path(dirpath) / fname
+                            if fp.suffix.lower() not in _SOURCE_EXTS:
+                                continue
+                            try:
+                                _content = fp.read_text(encoding="utf-8", errors="ignore")
+                                _ext = fp.suffix.lower()
+                                if not _supports_fn(_content, str(fp), _ext):
+                                    continue
+                                orm_symbols = _extract_fn(_content, str(fp), _ext)
+                                for sym in (orm_symbols or []):
+                                    sym_name = sym.get("name", "")
+                                    if not sym_name or sym_name in models_by_name:
+                                        continue
+                                    rel_fp = str(fp.relative_to(_proj))
+                                    node_stub: dict = {
+                                        "orm_type": sym.get("orm_type", ""),
+                                        "keywords": sym.get("keywords", []),
+                                    }
+                                    models_by_name[sym_name] = {
+                                        "name":       sym_name,
+                                        "file":       rel_fp,
+                                        "orm_type":   _detect_orm_type(str(fp), node_stub),
+                                        "line_start": sym.get("line_start"),
+                                        "fields":     [],
+                                    }
+                            except Exception:
+                                continue
+        except ImportError:
+            pass
+
+        models = list(models_by_name.values())
+        return {"ok": True, "total": len(models), "models": models}
 
     @mcp.tool()
     def graph_kustomize_overlays() -> dict[str, Any]:
@@ -563,6 +698,35 @@ def register_all_new_tools(
             return {"ok": False, "error": "security.py not found"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def graph_iac_security(severity_min: str = "low") -> dict[str, Any]:
+        """Scan Terraform, Kubernetes YAML, and Dockerfiles for security misconfigurations."""
+        try:
+            from security import scan_iac_misconfigs as _scan_iac_misconfigs  # type: ignore
+            all_findings = _scan_iac_misconfigs(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "security.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        min_level = _SEVERITY_ORDER.get(severity_min.lower(), 3)
+        filtered = [
+            f for f in all_findings
+            if _SEVERITY_ORDER.get(f.get("severity", "low").lower(), 3) <= min_level
+        ]
+
+        by_rule: dict[str, int] = {}
+        for f in filtered:
+            rid = f.get("rule_id", "unknown")
+            by_rule[rid] = by_rule.get(rid, 0) + 1
+
+        return {
+            "ok": True,
+            "total": len(filtered),
+            "findings": filtered,
+            "by_rule": by_rule,
+        }
 
     # ──────────────────────────────────────────────────────────────────────────
     # Phase 6 — Structural Health Tools
@@ -949,6 +1113,224 @@ def register_all_new_tools(
             return {"ok": False, "error": "observability.py not found"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    @mcp.tool()
+    def graph_sentry_coverage() -> dict[str, Any]:
+        """Show Sentry error tracking instrumentation across the codebase."""
+        try:
+            from observability import extract_sentry_instrumentation as _extract_sentry  # type: ignore
+        except ImportError:
+            return {"ok": False, "error": "observability.py not found"}
+
+        project_root = str(get_project_root())
+        source_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".kt", ".java"}
+        total_files_scanned = 0
+        files_with_sentry: list[str] = []
+        sentry_calls: list[dict] = []
+
+        try:
+            import os as _os
+            for dirpath, dirnames, filenames in _os.walk(project_root):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in {"node_modules", ".git", "__pycache__", ".venv", "venv",
+                                 "dist", "build", "target", ".tox"}
+                ]
+                for fname in filenames:
+                    _, ext = _os.path.splitext(fname.lower())
+                    if ext not in source_exts:
+                        continue
+                    fpath = _os.path.join(dirpath, fname)
+                    total_files_scanned += 1
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                            content = fh.read()
+                    except Exception:
+                        continue
+                    syms = _extract_sentry(content, fpath, ext)
+                    if syms:
+                        files_with_sentry.append(fpath)
+                        for s in syms:
+                            sentry_calls.append({
+                                "file": fpath,
+                                "line": s["line_start"],
+                                "kind": s["name"],
+                                "symbol_type": s["symbol_type"],
+                            })
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        coverage_pct = (
+            round(len(files_with_sentry) / total_files_scanned * 100, 1)
+            if total_files_scanned > 0 else 0.0
+        )
+        return {
+            "ok": True,
+            "total_files_scanned": total_files_scanned,
+            "files_with_sentry": len(files_with_sentry),
+            "sentry_calls": sentry_calls,
+            "coverage_pct": coverage_pct,
+        }
+
+    @mcp.tool()
+    def graph_datadog_coverage() -> dict[str, Any]:
+        """Show Datadog APM tracing instrumentation across the codebase."""
+        try:
+            from observability import extract_datadog_instrumentation as _extract_dd  # type: ignore
+        except ImportError:
+            return {"ok": False, "error": "observability.py not found"}
+
+        project_root = str(get_project_root())
+        source_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".kt", ".java"}
+        total_files_scanned = 0
+        files_with_datadog: list[str] = []
+        datadog_spans: list[dict] = []
+
+        try:
+            import os as _os
+            for dirpath, dirnames, filenames in _os.walk(project_root):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in {"node_modules", ".git", "__pycache__", ".venv", "venv",
+                                 "dist", "build", "target", ".tox"}
+                ]
+                for fname in filenames:
+                    _, ext = _os.path.splitext(fname.lower())
+                    if ext not in source_exts:
+                        continue
+                    fpath = _os.path.join(dirpath, fname)
+                    total_files_scanned += 1
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                            content = fh.read()
+                    except Exception:
+                        continue
+                    syms = _extract_dd(content, fpath, ext)
+                    if syms:
+                        files_with_datadog.append(fpath)
+                        for s in syms:
+                            operation = s["name"]
+                            # Surface any operation name from keywords
+                            kws = [k for k in s.get("keywords", [])
+                                   if k not in ("datadog", "dd", s["name"].split(":")[-1])]
+                            datadog_spans.append({
+                                "file": fpath,
+                                "line": s["line_start"],
+                                "operation": kws[0] if kws else operation,
+                                "kind": operation,
+                                "symbol_type": s["symbol_type"],
+                            })
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        coverage_pct = (
+            round(len(files_with_datadog) / total_files_scanned * 100, 1)
+            if total_files_scanned > 0 else 0.0
+        )
+        return {
+            "ok": True,
+            "total_files_scanned": total_files_scanned,
+            "files_with_datadog": len(files_with_datadog),
+            "datadog_spans": datadog_spans,
+            "coverage_pct": coverage_pct,
+        }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Phase 9 — Database Health Tools
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def graph_missing_pagination() -> dict[str, Any]:
+        """Find database query calls without pagination limits (N+1 / full-table-scan risk)."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        try:
+            from structural_bugs import find_missing_pagination as _find_missing_pagination  # type: ignore
+            findings = _find_missing_pagination(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        by_pattern: dict[str, int] = {}
+        for f in findings:
+            p = f.get("pattern", "unknown")
+            by_pattern[p] = by_pattern.get(p, 0) + 1
+
+        return {
+            "ok": True,
+            "total": len(findings),
+            "findings": findings,
+            "by_pattern": by_pattern,
+        }
+
+    @mcp.tool()
+    def graph_missing_indexes() -> dict[str, Any]:
+        """Detect foreign key fields that likely lack a database index."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        try:
+            from structural_bugs import find_missing_indexes as _find_missing_indexes  # type: ignore
+            findings = _find_missing_indexes(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        by_file: dict[str, int] = {}
+        for f in findings:
+            fp = f.get("file", "unknown")
+            by_file[fp] = by_file.get(fp, 0) + 1
+
+        return {
+            "ok": True,
+            "total": len(findings),
+            "findings": findings,
+            "by_file": by_file,
+        }
+
+    @mcp.tool()
+    def graph_n_plus_one() -> dict[str, Any]:
+        """Detect patterns that strongly suggest N+1 query risk (DB query inside a loop)."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        try:
+            from structural_bugs import find_n_plus_one_risk as _find_n_plus_one_risk  # type: ignore
+            findings = _find_n_plus_one_risk(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        by_file: dict[str, int] = {}
+        for f in findings:
+            fp = f.get("file", "unknown")
+            by_file[fp] = by_file.get(fp, 0) + 1
+
+        return {
+            "ok": True,
+            "total": len(findings),
+            "findings": findings,
+            "by_file": by_file,
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────

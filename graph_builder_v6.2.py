@@ -78,6 +78,18 @@ except ImportError:
     _ROUTES_AVAILABLE = False
     _ROUTE_EXTS: set = set()
 
+try:
+    from graph_builder_orm import (
+        extract_orm_symbols as _orm_extract_symbols,
+        parse_orm_imports as _orm_parse_imports,
+        supports_orm as _orm_supports,
+        ORM_EXTS as _ORM_EXTS,
+    )
+    _ORM_AVAILABLE = True
+except ImportError:
+    _ORM_AVAILABLE = False
+    _ORM_EXTS: set = set()
+
 # ── Tree-sitter setup ──────────────────────────────────────────────────────────
 try:
     import tree_sitter_typescript as _tsts
@@ -1016,6 +1028,9 @@ def parse_relations(path: Path, text: str, root: Path) -> list[dict]:
     # MQ edges for .py / .go (which fall through to regex fallback)
     if _SERVICE_GRAPH_AVAILABLE and ext in _SG_SOURCE_EXTS:
         edges.extend(_sg_extract_mq_edges(text, file_id, ext))
+    # ORM reference edges (TypeORM @ManyToOne, Sequelize belongsTo, Mongoose ref, etc.)
+    if _ORM_AVAILABLE and ext in _ORM_EXTS and _orm_supports(text, file_id, ext):
+        edges.extend(_orm_parse_imports(text, file_id, ext))
     return edges
 
 
@@ -1246,7 +1261,18 @@ def _extract_symbols_for_file(content: str, file_id: str, ext: str) -> list[dict
         return syms
     if _INFRA_AVAILABLE and _infra_is_infra(file_id):
         return _infra_extract_symbols(content, file_id)
+    # ORM model extraction (TypeORM, Sequelize, GORM, Drizzle, Mongoose, SQLAlchemy)
+    # runs as a supplementary pass — merges with symbols already found above
     return []
+
+
+def _extract_orm_symbols_if_applicable(content: str, file_id: str, ext: str) -> list[dict]:
+    """Returns ORM symbols for files that contain ORM patterns."""
+    if not _ORM_AVAILABLE or ext not in _ORM_EXTS:
+        return []
+    if not _orm_supports(content, file_id, ext):
+        return []
+    return _orm_extract_symbols(content, file_id, ext)
 
 
 def _append_symbol_nodes(nodes: list[Node], edges: list[dict], syms: list[dict], file_id: str, ext: str) -> None:
@@ -1313,6 +1339,7 @@ def scan(root: Path, existing_nodes: dict[str, dict] | None = None) -> dict:
                     _append_symbol_nodes(nodes, edges, _extract_symbols_for_file(content, file_id, ext), file_id, ext)
                 if _ROUTES_AVAILABLE and ext in _ROUTE_EXTS:
                     _append_symbol_nodes(nodes, edges, _routes_extract(content, file_id, ext), file_id, ext)
+                _append_symbol_nodes(nodes, edges, _extract_orm_symbols_if_applicable(content, file_id, ext), file_id, ext)
                 continue
 
         summary = _make_summary(content, file_id, ext)
@@ -1326,6 +1353,7 @@ def scan(root: Path, existing_nodes: dict[str, dict] | None = None) -> dict:
             _append_symbol_nodes(nodes, edges, _extract_symbols_for_file(content, file_id, ext), file_id, ext)
         if _ROUTES_AVAILABLE and ext in _ROUTE_EXTS:
             _append_symbol_nodes(nodes, edges, _routes_extract(content, file_id, ext), file_id, ext)
+        _append_symbol_nodes(nodes, edges, _extract_orm_symbols_if_applicable(content, file_id, ext), file_id, ext)
 
     unique_edges = dedupe_edges(edges)
     symbol_count = sum(1 for n in nodes if n.kind == "symbol")
