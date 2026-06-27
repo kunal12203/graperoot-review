@@ -2345,6 +2345,668 @@ def find_race_conditions(graph: dict, project_root: str) -> list[dict]:  # noqa:
 
 
 # ---------------------------------------------------------------------------
+# Phase 23 — Idempotency Gaps
+# ---------------------------------------------------------------------------
+
+# Consumer detection patterns
+_GO_CONSUMER_PARAM_RE = re.compile(
+    r"func\s+\w+\s*\([^)]*\*(?:kafka\.Message|sqs\.Message|amqp\.Delivery|ConsumerRecord|nats\.Msg)[^)]*\)",
+)
+_PY_CONSUMER_DECO_RE = re.compile(r"@(?:app|celery|shared_task)\.task|@shared_task")
+_PY_CONSUMER_PARAM_RE = re.compile(
+    r"def\s+\w+\s*\([^)]*\b(?:message|msg|record|event)\b[^)]*\).*:",
+)
+_JS_CONSUMER_RE = re.compile(
+    r"channel\.consume\s*\(|\.subscribe\s*\(|queue\.process\s*\(|\.on\s*\(\s*['\"]message['\"]",
+)
+
+# Insert patterns (flag when found without dedup)
+_INSERT_RE = re.compile(
+    r'db\.Exec\s*\(\s*["\']INSERT|cursor\.execute\s*\(\s*["\']INSERT|'
+    r'\.query\s*\(\s*["\']INSERT|repository\.save\s*\(|(?<!\w)\.save\s*\(',
+    re.IGNORECASE,
+)
+_ON_CONFLICT_RE = re.compile(r"ON CONFLICT", re.IGNORECASE)
+
+# Deduplication guard patterns (check within preceding 15 lines)
+_DEDUP_GUARD_RE = re.compile(
+    r"redis\.get\s*\(|cache\.has\s*\(|seen\.has\s*\(|processed|idempotency",
+    re.IGNORECASE,
+)
+
+# Payment / notification API patterns
+_PAYMENT_NOTIF_RE = re.compile(
+    r"stripe\.charges\.create\s*\(|stripe\.paymentIntents\.create\s*\(|"
+    r"Stripe\.Charge\.create\s*\(|client\.Charges\.New\s*\(|"
+    r"twilio\.messages\.create\s*\(|sg\.send\s*\(|"
+    r"transporter\.sendMail\s*\(|mailer\.Send\s*\(",
+    re.IGNORECASE,
+)
+_IDEM_KEY_RE = re.compile(
+    r"IdempotencyKey|idempotency_key|x-idempotency-key|Idempotency-Key",
+    re.IGNORECASE,
+)
+
+# Batch function patterns
+_BATCH_FUNC_RE = re.compile(
+    r"(?:def|func)\s+(?:batch_\w+|\w+Batch|\w+Cron|\w+Scheduled|send_all_\w+|process_all_\w+)\s*[(\[]|"
+    r"@(?:Scheduled|app\.task|shared_task)\s",
+    re.IGNORECASE,
+)
+_NO_PAGINATION_RE = re.compile(
+    r'\.find(?:All)?\s*\(\s*\)|SELECT\s+\*\s+FROM\s+\w+\s*(?:WHERE[^;]*)?;',
+    re.IGNORECASE,
+)
+_PAGINATION_CHECK_RE = re.compile(
+    r"\bLIMIT\b|\blimit\b|\bper_page\b|\bPageRequest\b|\boffset\b",
+    re.IGNORECASE,
+)
+_CHECKPOINT_RE = re.compile(
+    r"checkpoint|last_processed|offset|cursor",
+    re.IGNORECASE,
+)
+
+# Bull/BullMQ without jobId
+_BULL_ADD_RE = re.compile(r"queue\.add\s*\(")
+_JOB_ID_RE = re.compile(r"\{\s*jobId\s*:")
+
+
+def find_idempotency_gaps(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect MQ consumers and batch jobs that perform non-idempotent side effects
+    without deduplication.
+
+    Covers four patterns:
+    - IDEM-001: MQ consumer + INSERT without ON CONFLICT or dedup guard
+    - IDEM-002: MQ consumer + Stripe/Twilio/SendGrid without idempotency key
+    - IDEM-003: Batch job fetching all records + side effect without checkpoint
+    - IDEM-004: Bull/BullMQ queue.add() without jobId when job does payment/email
+
+    Returns
+    -------
+    list[dict] with type="idempotency_gap".
+    """
+    issues: list[dict] = []
+    root = Path(project_root)
+    _EXTS = {".go", ".py", ".js", ".ts", ".jsx", ".tsx", ".java"}
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext = fpath.suffix.lower()
+            if ext not in _EXTS:
+                continue
+            # Skip test files
+            rel = str(fpath.relative_to(root))
+            if _TEST_PAT.search(rel):
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            lines = content.splitlines()
+
+            # ── IDEM-001 / IDEM-002: consumer functions ──────────────────────
+            consumer_line_indices: list[int] = []
+
+            if ext == ".go":
+                for m in _GO_CONSUMER_PARAM_RE.finditer(content):
+                    consumer_line_indices.append(content[:m.start()].count("\n"))
+            elif ext == ".py":
+                for m in _PY_CONSUMER_DECO_RE.finditer(content):
+                    consumer_line_indices.append(content[:m.start()].count("\n"))
+                for m in _PY_CONSUMER_PARAM_RE.finditer(content):
+                    idx = content[:m.start()].count("\n")
+                    if idx not in consumer_line_indices:
+                        consumer_line_indices.append(idx)
+            elif ext in {".js", ".ts", ".jsx", ".tsx"}:
+                for m in _JS_CONSUMER_RE.finditer(content):
+                    consumer_line_indices.append(content[:m.start()].count("\n"))
+
+            for c_idx in consumer_line_indices:
+                # Look at next 30 lines for INSERT pattern (IDEM-001)
+                window30 = lines[c_idx: c_idx + 30]
+                window30_text = "\n".join(window30)
+                insert_m = _INSERT_RE.search(window30_text)
+                if insert_m:
+                    # Flag if no ON CONFLICT in the insert line/nearby
+                    has_conflict = bool(_ON_CONFLICT_RE.search(window30_text))
+                    if not has_conflict:
+                        # Also check preceding 15 lines for dedup guard
+                        pre_text = "\n".join(lines[max(0, c_idx - 15): c_idx])
+                        has_dedup = bool(_DEDUP_GUARD_RE.search(pre_text + window30_text))
+                        if not has_dedup:
+                            insert_line_no = c_idx + window30_text[:insert_m.start()].count("\n") + 1
+                            snippet = lines[insert_line_no - 1].strip()[:80] if insert_line_no <= len(lines) else insert_m.group(0)
+                            issues.append({
+                                "type": "idempotency_gap",
+                                "rule_id": "IDEM-001",
+                                "severity": "high",
+                                "file": rel,
+                                "line": insert_line_no,
+                                "message": (
+                                    f"MQ consumer performs INSERT without ON CONFLICT or "
+                                    f"deduplication guard — duplicate messages cause duplicate rows."
+                                ),
+                                "snippet": snippet,
+                                "fix": (
+                                    "Add ON CONFLICT DO NOTHING / ON CONFLICT DO UPDATE, or check "
+                                    "a deduplication key (Redis, DB unique constraint) before inserting."
+                                ),
+                            })
+
+                # Look at next 40 lines for payment/notification call (IDEM-002)
+                window40 = lines[c_idx: c_idx + 40]
+                window40_text = "\n".join(window40)
+                pay_m = _PAYMENT_NOTIF_RE.search(window40_text)
+                if pay_m:
+                    has_idem_key = bool(_IDEM_KEY_RE.search(window40_text))
+                    if not has_idem_key:
+                        pay_line_no = c_idx + window40_text[:pay_m.start()].count("\n") + 1
+                        snippet = lines[pay_line_no - 1].strip()[:80] if pay_line_no <= len(lines) else pay_m.group(0)
+                        issues.append({
+                            "type": "idempotency_gap",
+                            "rule_id": "IDEM-002",
+                            "severity": "critical",
+                            "file": rel,
+                            "line": pay_line_no,
+                            "message": (
+                                "MQ consumer calls Stripe/Twilio/SendGrid without an idempotency key — "
+                                "duplicate messages cause duplicate charges or duplicate emails."
+                            ),
+                            "snippet": snippet,
+                            "fix": (
+                                "Pass an idempotency_key / IdempotencyKey derived from the message ID "
+                                "to all payment and notification API calls."
+                            ),
+                        })
+
+            # ── IDEM-003: batch jobs without checkpoint ───────────────────────
+            for m in _BATCH_FUNC_RE.finditer(content):
+                b_idx = content[:m.start()].count("\n")
+                # Check next 60 lines for fetch-all + side-effect without checkpoint
+                window60 = lines[b_idx: b_idx + 60]
+                window60_text = "\n".join(window60)
+                if not _NO_PAGINATION_RE.search(window60_text):
+                    continue
+                if _PAGINATION_CHECK_RE.search(window60_text):
+                    continue
+                if not _PAYMENT_NOTIF_RE.search(window60_text) and not _INSERT_RE.search(window60_text):
+                    continue
+                if _CHECKPOINT_RE.search(window60_text):
+                    continue
+                fn_line_no = b_idx + 1
+                snippet = lines[fn_line_no - 1].strip()[:80] if fn_line_no <= len(lines) else m.group(0)
+                issues.append({
+                    "type": "idempotency_gap",
+                    "rule_id": "IDEM-003",
+                    "severity": "medium",
+                    "file": rel,
+                    "line": fn_line_no,
+                    "message": (
+                        "Batch job fetches all records without pagination and performs side effects "
+                        "without checkpoint tracking — a crash mid-run will re-process already-handled items."
+                    ),
+                    "snippet": snippet,
+                    "fix": (
+                        "Track a last_processed cursor/offset and paginate (LIMIT/OFFSET) so the "
+                        "job can resume safely after a failure."
+                    ),
+                })
+
+            # ── IDEM-004: Bull/BullMQ queue.add without jobId (JS/TS only) ───
+            if ext in {".js", ".ts", ".jsx", ".tsx"}:
+                for m in _BULL_ADD_RE.finditer(content):
+                    add_idx = content[:m.start()].count("\n")
+                    window50 = lines[add_idx: add_idx + 50]
+                    window50_text = "\n".join(window50)
+                    if not _PAYMENT_NOTIF_RE.search(window50_text) and not re.search(
+                        r"stripe|twilio|sendgrid|sendMail|sg\.send", window50_text, re.IGNORECASE
+                    ):
+                        continue
+                    if _JOB_ID_RE.search(window50_text[:200]):
+                        continue
+                    add_line_no = add_idx + 1
+                    snippet = lines[add_line_no - 1].strip()[:80] if add_line_no <= len(lines) else m.group(0)
+                    issues.append({
+                        "type": "idempotency_gap",
+                        "rule_id": "IDEM-004",
+                        "severity": "high",
+                        "file": rel,
+                        "line": add_line_no,
+                        "message": (
+                            "Bull/BullMQ queue.add() called without a jobId — duplicate jobs can be "
+                            "enqueued, leading to duplicate charges or duplicate emails."
+                        ),
+                        "snippet": snippet,
+                        "fix": (
+                            "Pass a stable jobId derived from a business key: "
+                            "queue.add(data, { jobId: `payment:${orderId}` })"
+                        ),
+                    })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# Phase 24 — Resource Leaks
+# ---------------------------------------------------------------------------
+
+# Go file-open patterns
+_GO_FILE_OPEN_RE = re.compile(r"\bos\.(?:Open|OpenFile|Create)\s*\(")
+_GO_DEFER_CLOSE_RE = re.compile(r"\bdefer\s+\w+\.Close\s*\(\s*\)")
+
+# Go HTTP response patterns
+_GO_HTTP_CALL_RE = re.compile(
+    r"\b(?:resp|res|r|response)\s*,\s*(?:err|_)\s*:=\s*http\.(?:Get|Post|Head)\s*\("
+)
+_GO_RESP_BODY_CLOSE_RE = re.compile(r"\bdefer\s+\w+\.Body\.Close\s*\(\s*\)")
+
+# Go SQL rows patterns
+_GO_ROWS_QUERY_RE = re.compile(
+    r"\b(?:rows|rs)\s*,\s*(?:err|_)\s*:=\s*\w+\.(?:Query|QueryContext)\s*\("
+)
+_GO_ROWS_CLOSE_RE = re.compile(r"\bdefer\s+rows\.Close\s*\(\s*\)")
+
+# Python bare open
+_PY_BARE_OPEN_RE = re.compile(
+    r"^(?!.*\bwith\b)\s*(?:f|file|fp|fh|handle)\s*=\s*open\s*\(",
+    re.MULTILINE,
+)
+_PY_WITH_OPEN_RE = re.compile(r"\bwith\s+open\s*\(")
+
+# Python DB connection without context manager
+_PY_DB_CONNECT_RE = re.compile(
+    r"(?:conn|connection|db|cnx|cursor)\s*=\s*(?:psycopg2|pymysql|MySQLdb|sqlite3)\.connect\s*\("
+)
+_PY_CONN_CLOSE_RE = re.compile(r"conn\.close\s*\(\s*\)|connection\.close\s*\(\s*\)")
+_PY_FINALLY_RE = re.compile(r"\bfinally\s*:")
+
+# Python test file patterns
+_PY_TEST_FILE_RE = re.compile(r"(?:^|/)(?:test_[^/]+|[^/]+_test)\.py$|/conftest\.py$")
+# Go test file pattern
+_GO_TEST_FILE_RE = re.compile(r"_test\.go$")
+
+
+def find_resource_leaks(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect resource leaks: unclosed file handles, HTTP response bodies, and DB rows.
+
+    Covers:
+    - LEAK-001 (Go): os.Open/OpenFile/Create without defer Close()
+    - LEAK-002 (Go): http.Get/Post/Head resp without defer Body.Close()
+    - LEAK-003 (Go): rows from .Query/.QueryContext without defer rows.Close()
+    - LEAK-004 (Python): bare open() not in a with block and no explicit .close()
+    - LEAK-005 (Python): psycopg2/pymysql connect() without conn.close() or finally
+
+    Returns
+    -------
+    list[dict] with type="resource_leak".
+    """
+    issues: list[dict] = []
+    root = Path(project_root)
+    _GO_EXTS = {".go"}
+    _PY_EXTS = {".py"}
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext = fpath.suffix.lower()
+            rel = str(fpath.relative_to(root))
+
+            # ── Go ──────────────────────────────────────────────────────────
+            if ext in _GO_EXTS:
+                if _GO_TEST_FILE_RE.search(rel):
+                    continue
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                lines = content.splitlines()
+
+                # LEAK-001: os.Open / os.OpenFile / os.Create without defer Close
+                for m in _GO_FILE_OPEN_RE.finditer(content):
+                    open_idx = content[:m.start()].count("\n")
+                    window = "\n".join(lines[open_idx: open_idx + 20])
+                    if not _GO_DEFER_CLOSE_RE.search(window):
+                        line_no = open_idx + 1
+                        snippet = lines[open_idx].strip()[:80]
+                        issues.append({
+                            "type": "resource_leak",
+                            "rule_id": "LEAK-001",
+                            "severity": "high",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                f"Go file opened with {m.group(0).split('(')[0].strip()} "
+                                "but no 'defer <var>.Close()' found within 20 lines — file descriptor leak."
+                            ),
+                            "snippet": snippet,
+                            "fix": "Add 'defer f.Close()' immediately after the error check.",
+                        })
+
+                # LEAK-002: http.Get/Post/Head without defer resp.Body.Close()
+                for m in _GO_HTTP_CALL_RE.finditer(content):
+                    http_idx = content[:m.start()].count("\n")
+                    window = "\n".join(lines[http_idx: http_idx + 20])
+                    if not _GO_RESP_BODY_CLOSE_RE.search(window):
+                        line_no = http_idx + 1
+                        snippet = lines[http_idx].strip()[:80]
+                        issues.append({
+                            "type": "resource_leak",
+                            "rule_id": "LEAK-002",
+                            "severity": "high",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "Go HTTP response body not closed — "
+                                "missing 'defer resp.Body.Close()' causes connection pool exhaustion."
+                            ),
+                            "snippet": snippet,
+                            "fix": "Add 'defer resp.Body.Close()' immediately after checking the error.",
+                        })
+
+                # LEAK-003: rows from .Query/.QueryContext without defer rows.Close()
+                for m in _GO_ROWS_QUERY_RE.finditer(content):
+                    rows_idx = content[:m.start()].count("\n")
+                    window = "\n".join(lines[rows_idx: rows_idx + 10])
+                    if not _GO_ROWS_CLOSE_RE.search(window):
+                        line_no = rows_idx + 1
+                        snippet = lines[rows_idx].strip()[:80]
+                        issues.append({
+                            "type": "resource_leak",
+                            "rule_id": "LEAK-003",
+                            "severity": "high",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "Go sql.Rows not closed — missing 'defer rows.Close()' "
+                                "holds the DB connection open until GC."
+                            ),
+                            "snippet": snippet,
+                            "fix": "Add 'defer rows.Close()' immediately after the nil error check.",
+                        })
+
+            # ── Python ──────────────────────────────────────────────────────
+            elif ext in _PY_EXTS:
+                if _PY_TEST_FILE_RE.search(rel):
+                    continue
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                lines = content.splitlines()
+
+                # LEAK-004: bare open() not wrapped in 'with'
+                for m in _PY_BARE_OPEN_RE.finditer(content):
+                    open_idx = content[:m.start()].count("\n")
+                    # Extract variable name
+                    var_match = re.match(r"\s*(\w+)\s*=\s*open\s*\(", lines[open_idx] if open_idx < len(lines) else "")
+                    var_name = var_match.group(1) if var_match else "f"
+                    window = "\n".join(lines[open_idx: open_idx + 20])
+                    close_re = re.compile(rf"\b{re.escape(var_name)}\.close\s*\(\s*\)")
+                    if not close_re.search(window):
+                        line_no = open_idx + 1
+                        snippet = lines[open_idx].strip()[:80] if open_idx < len(lines) else m.group(0)
+                        issues.append({
+                            "type": "resource_leak",
+                            "rule_id": "LEAK-004",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                f"Python file opened with bare open() (not 'with open(...)') "
+                                f"and no '{var_name}.close()' found — file handle may leak."
+                            ),
+                            "snippet": snippet,
+                            "fix": "Use 'with open(...) as f:' to ensure the file is always closed.",
+                        })
+
+                # LEAK-005: psycopg2/pymysql connect without close/finally
+                for m in _PY_DB_CONNECT_RE.finditer(content):
+                    conn_idx = content[:m.start()].count("\n")
+                    window = "\n".join(lines[conn_idx: conn_idx + 30])
+                    has_close = bool(_PY_CONN_CLOSE_RE.search(window))
+                    has_finally = bool(_PY_FINALLY_RE.search(window))
+                    # Also accept 'with psycopg2.connect' pattern on the same line
+                    if "with " in (lines[conn_idx] if conn_idx < len(lines) else ""):
+                        continue
+                    if not has_close and not has_finally:
+                        line_no = conn_idx + 1
+                        snippet = lines[conn_idx].strip()[:80] if conn_idx < len(lines) else m.group(0)
+                        issues.append({
+                            "type": "resource_leak",
+                            "rule_id": "LEAK-005",
+                            "severity": "high",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "DB connection opened without conn.close() or a finally block — "
+                                "connection pool exhaustion under load."
+                            ),
+                            "snippet": snippet,
+                            "fix": (
+                                "Use 'with psycopg2.connect(...) as conn:' or ensure "
+                                "conn.close() is called in a finally block."
+                            ),
+                        })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# Phase 25 — Migration Safety
+# ---------------------------------------------------------------------------
+
+# Migration file detection
+_MIGRATION_PATH_RE = re.compile(
+    r"(?:migration|migrate|schema|db/)|(?:_migration\.|_schema\.|V\d+__)",
+    re.IGNORECASE,
+)
+_MIGRATION_FNAME_RE = re.compile(
+    r"(?:_migration|_schema)\.[a-z]+$|^V\d+.*\.sql$|^[0-9]+_.*\.(?:sql|rb|py)$",
+    re.IGNORECASE,
+)
+
+# ALTER TABLE detection
+_ALTER_TABLE_RE = re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE)
+_ALTER_SAFE_RE = re.compile(
+    r"ALGORITHM\s*=|LOCK\s*=|--\s*safe|--\s*online",
+    re.IGNORECASE,
+)
+# Exclude patterns: RENAME TO and ADD INDEX (safe in MySQL 8+)
+_ALTER_RENAME_RE = re.compile(r"ALTER\s+TABLE\s+\w+\s+RENAME\s+TO\b", re.IGNORECASE)
+_ALTER_ADD_INDEX_RE = re.compile(r"ALTER\s+TABLE\s+\w+\s+ADD\s+INDEX\b", re.IGNORECASE)
+
+# ADD COLUMN with non-null DEFAULT on large tables
+_ADD_COL_DEFAULT_RE = re.compile(
+    r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+\w+[^;]+DEFAULT\s+(?!NULL\b)(\S+)",
+    re.IGNORECASE,
+)
+_LARGE_TABLE_RE = re.compile(
+    r"(?:events|logs|audit|history|usage|analytics|metrics|sessions|transactions|orders|payments)",
+    re.IGNORECASE,
+)
+
+# lock_wait_timeout before ALTER
+_LOCK_TIMEOUT_RE = re.compile(
+    r"SET\s+(?:lock_wait_timeout|innodb_lock_wait_timeout|statement_timeout)\s*=",
+    re.IGNORECASE,
+)
+
+# TRUNCATE / DROP TABLE in application code
+_TRUNCATE_DROP_APP_RE = re.compile(
+    r'db\.Exec\s*\(\s*["\']TRUNCATE|db\.Exec\s*\(\s*["\']DROP\s+TABLE|'
+    r'cursor\.execute\s*\(\s*["\']TRUNCATE|cursor\.execute\s*\(\s*["\']DROP\s+TABLE|'
+    r'\.query\s*\(\s*["\']TRUNCATE|\.query\s*\(\s*["\']DROP\s+TABLE',
+    re.IGNORECASE,
+)
+
+# Application code extensions (non-migration)
+_APP_CODE_EXTS = {".go", ".py", ".js", ".ts", ".java", ".rb", ".php"}
+# Migration-scannable extensions
+_MIGR_EXTS = {".sql", ".py", ".rb", ".java", ".go", ".ts", ".js"}
+
+
+def _is_migration_file(rel: str) -> bool:
+    """Return True if the file path looks like a migration file."""
+    return bool(_MIGRATION_PATH_RE.search(rel)) or bool(_MIGRATION_FNAME_RE.search(rel))
+
+
+def find_unsafe_migrations(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect unsafe database migration patterns.
+
+    Covers:
+    - MIGR-001: ALTER TABLE without ALGORITHM= or LOCK= (MySQL safety)
+    - MIGR-002: ALTER TABLE ADD COLUMN with non-NULL DEFAULT on large tables
+    - MIGR-003: ALTER TABLE not preceded by lock_wait_timeout setting
+    - MIGR-004: TRUNCATE or DROP TABLE in application (non-migration) code
+
+    Returns
+    -------
+    list[dict] with type="unsafe_migration".
+    """
+    issues: list[dict] = []
+    root = Path(project_root)
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext = fpath.suffix.lower()
+            rel = str(fpath.relative_to(root))
+            is_migration = _is_migration_file(rel)
+
+            # ── MIGR-004: TRUNCATE/DROP TABLE in application code ─────────────
+            if not is_migration and ext in _APP_CODE_EXTS:
+                if _TEST_PAT.search(rel):
+                    continue
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                for m in _TRUNCATE_DROP_APP_RE.finditer(content):
+                    line_no = content[:m.start()].count("\n") + 1
+                    lines = content.splitlines()
+                    snippet = lines[line_no - 1].strip()[:80] if line_no <= len(lines) else m.group(0)
+                    issues.append({
+                        "type": "unsafe_migration",
+                        "rule_id": "MIGR-004",
+                        "severity": "high",
+                        "file": rel,
+                        "line": line_no,
+                        "message": (
+                            "TRUNCATE or DROP TABLE found in application code (non-migration file) — "
+                            "this can silently destroy production data."
+                        ),
+                        "snippet": snippet,
+                        "fix": (
+                            "Move destructive DDL to a proper migration file with a rollback plan. "
+                            "Never call TRUNCATE/DROP from application request handlers."
+                        ),
+                    })
+                continue  # done with non-migration files for this path
+
+            # ── Migration files ──────────────────────────────────────────────
+            if not is_migration:
+                continue
+            if ext not in _MIGR_EXTS:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            lines = content.splitlines()
+
+            # Skip SQLite files for MIGR-001/003
+            is_sqlite = "sqlite" in rel.lower()
+
+            for i, line in enumerate(lines):
+                uline = line.upper()
+                if "ALTER" not in uline and "TABLE" not in uline:
+                    continue
+                if not _ALTER_TABLE_RE.search(line):
+                    continue
+
+                # Exclude RENAME TO and ADD INDEX (generally safe)
+                if _ALTER_RENAME_RE.search(line):
+                    continue
+                if _ALTER_ADD_INDEX_RE.search(line):
+                    continue
+
+                line_no = i + 1
+
+                # MIGR-001: missing ALGORITHM= / LOCK= (MySQL, non-SQLite)
+                if not is_sqlite:
+                    # Check same line plus next 2 lines
+                    context_lines = lines[i: i + 3]
+                    context_text = "\n".join(context_lines)
+                    if not _ALTER_SAFE_RE.search(context_text):
+                        snippet = line.strip()[:80]
+                        issues.append({
+                            "type": "unsafe_migration",
+                            "rule_id": "MIGR-001",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "ALTER TABLE without ALGORITHM= or LOCK= hint — "
+                                "may take a full table lock on MySQL, blocking writes."
+                            ),
+                            "snippet": snippet,
+                            "fix": (
+                                "Add ALGORITHM=INPLACE, LOCK=NONE (or LOCK=SHARED) where possible, "
+                                "or add a '-- safe' comment to suppress this warning."
+                            ),
+                        })
+
+                # MIGR-002: ADD COLUMN with non-NULL DEFAULT on large table
+                add_col_m = _ADD_COL_DEFAULT_RE.search(line)
+                if add_col_m:
+                    table_name = add_col_m.group(1)
+                    if _LARGE_TABLE_RE.search(table_name):
+                        snippet = line.strip()[:80]
+                        issues.append({
+                            "type": "unsafe_migration",
+                            "rule_id": "MIGR-002",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                f"ALTER TABLE {table_name} ADD COLUMN with a non-NULL DEFAULT on a "
+                                "potentially large table — triggers a full table rewrite on older MySQL."
+                            ),
+                            "snippet": snippet,
+                            "fix": (
+                                "Use a multi-step migration: (1) ADD COLUMN NULL, (2) backfill in batches, "
+                                "(3) ADD NOT NULL constraint. Or use pt-online-schema-change / gh-ost."
+                            ),
+                        })
+
+                # MIGR-003: no lock_wait_timeout before ALTER (SQL files only)
+                if ext == ".sql" and not is_sqlite:
+                    pre_text = "\n".join(lines[max(0, i - 10): i])
+                    if not _LOCK_TIMEOUT_RE.search(pre_text):
+                        snippet = line.strip()[:80]
+                        issues.append({
+                            "type": "unsafe_migration",
+                            "rule_id": "MIGR-003",
+                            "severity": "low",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                "ALTER TABLE not preceded by SET lock_wait_timeout / "
+                                "SET statement_timeout within 10 lines — "
+                                "long-running schema changes can hold locks indefinitely."
+                            ),
+                            "snippet": snippet,
+                            "fix": (
+                                "Prepend: SET lock_wait_timeout = 5; "
+                                "SET innodb_lock_wait_timeout = 5; before the ALTER TABLE."
+                            ),
+                        })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + health summary
 # ---------------------------------------------------------------------------
 
@@ -2377,6 +3039,9 @@ def run_all_checks(graph: dict, project_root: str) -> dict:
         ("missing_env_vars",       lambda: find_missing_env_vars(graph, project_root)),
         ("port_conflicts",         lambda: find_port_conflicts(graph, project_root)),
         ("race_conditions",        lambda: find_race_conditions(graph, project_root)),
+        ("idempotency_gaps",       lambda: find_idempotency_gaps(graph, project_root)),
+        ("resource_leaks",         lambda: find_resource_leaks(graph, project_root)),
+        ("unsafe_migrations",      lambda: find_unsafe_migrations(graph, project_root)),
     ]
 
     all_issues: list[dict] = []
@@ -2462,6 +3127,18 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     penalty += min(15, port_conflict_findings * 5)  # high severity, cap -15
     penalty += min(20, race_cond_findings    * 5)   # high severity, cap -20
 
+    # Checks 15-17 penalties
+    idem_findings      = [i for i in report["issues"] if i.get("type") == "idempotency_gap"]
+    idem_critical      = [i for i in idem_findings if i.get("severity") == "critical"]
+    idem_non_critical  = [i for i in idem_findings if i.get("severity") != "critical"]
+    leak_findings      = len([i for i in report["issues"] if i.get("type") == "resource_leak"])
+    migr_findings      = len([i for i in report["issues"] if i.get("type") == "unsafe_migration"])
+
+    penalty += min(15, len(idem_non_critical) * 3)  # -3 each, cap -15
+    penalty += min(24, len(idem_critical) * 8)       # -8 each (critical), cap -24
+    penalty += min(10, leak_findings * 2)             # -2 each, cap -10
+    penalty += min(12, migr_findings * 3)             # -3 each, cap -12
+
     score   = max(0, 100 - penalty)
 
     if score >= 90:
@@ -2475,8 +3152,8 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
     else:
         grade = "F"
 
-    # Total checks = 14 functional checks
-    total_checks  = 14
+    # Total checks = 17 functional checks
+    total_checks  = 17
     checks_failed = min(
         total_checks,
         (1 if n_critical else 0) + (1 if n_high else 0) +
@@ -2522,6 +3199,21 @@ def graph_port_conflicts_tool(project_root: str) -> dict:
 
 def graph_race_conditions_tool(project_root: str) -> dict:
     findings = find_race_conditions({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_idempotency_gaps_tool(project_root: str) -> dict:
+    findings = find_idempotency_gaps({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_resource_leaks_tool(project_root: str) -> dict:
+    findings = find_resource_leaks({}, project_root)
+    return {"ok": True, "total": len(findings), "findings": findings}
+
+
+def graph_unsafe_migrations_tool(project_root: str) -> dict:
+    findings = find_unsafe_migrations({}, project_root)
     return {"ok": True, "total": len(findings), "findings": findings}
 
 
@@ -2571,6 +3263,158 @@ def _test_new_structural():
     print("[PASS] find_race_conditions (Go)")
 
     print("\n=== All new structural tests PASSED ===")
+
+
+def _test_new_structural_2():
+    import tempfile, pathlib
+
+    tmpdir = tempfile.mkdtemp()
+    root = pathlib.Path(tmpdir)
+
+    # ── Idempotency: Go Kafka consumer with INSERT sans ON CONFLICT → flagged ──
+    (root / "consumer_bad.go").write_text(
+        'package main\n'
+        'import "github.com/confluentinc/confluent-kafka-go/kafka"\n'
+        '\n'
+        'func handleMessage(msg *kafka.Message) {\n'
+        '    db.Exec("INSERT INTO orders (id) VALUES (?)", msg.Value)\n'
+        '}\n'
+    )
+
+    # ── Idempotency: Go Kafka consumer with ON CONFLICT → NOT flagged ──────────
+    (root / "consumer_good.go").write_text(
+        'package main\n'
+        'import "github.com/confluentinc/confluent-kafka-go/kafka"\n'
+        '\n'
+        'func handleMessage(msg *kafka.Message) {\n'
+        '    db.Exec("INSERT INTO orders (id) VALUES (?) ON CONFLICT DO NOTHING", msg.Value)\n'
+        '}\n'
+    )
+
+    idem = find_idempotency_gaps({}, tmpdir)
+    bad_files = [f["file"] for f in idem]
+    assert any("consumer_bad.go" in f for f in bad_files), \
+        f"IDEM-001 should flag consumer_bad.go, got: {bad_files}"
+    assert not any("consumer_good.go" in f for f in bad_files), \
+        f"IDEM-001 should NOT flag consumer_good.go, got: {bad_files}"
+    print("[PASS] IDEM-001: INSERT without ON CONFLICT flagged; ON CONFLICT variant not flagged")
+
+    # ── Resource Leak: Go os.Open without defer → flagged ─────────────────────
+    (root / "io_bad.go").write_text(
+        'package main\n'
+        'import "os"\n'
+        '\n'
+        'func readFile() {\n'
+        '    f, err := os.Open("data.txt")\n'
+        '    if err != nil { return }\n'
+        '    // do something with f\n'
+        '    _ = f\n'
+        '}\n'
+    )
+
+    # ── Resource Leak: Go os.Open with defer → NOT flagged ────────────────────
+    (root / "io_good.go").write_text(
+        'package main\n'
+        'import "os"\n'
+        '\n'
+        'func readFile() {\n'
+        '    f, err := os.Open("data.txt")\n'
+        '    if err != nil { return }\n'
+        '    defer f.Close()\n'
+        '    _ = f\n'
+        '}\n'
+    )
+
+    leaks = find_resource_leaks({}, tmpdir)
+    leak_files = [f["file"] for f in leaks]
+    assert any("io_bad.go" in f for f in leak_files), \
+        f"LEAK-001 should flag io_bad.go, got: {leak_files}"
+    assert not any("io_good.go" in f for f in leak_files), \
+        f"LEAK-001 should NOT flag io_good.go, got: {leak_files}"
+    print("[PASS] LEAK-001: os.Open without defer flagged; with defer not flagged")
+
+    # ── Resource Leak: Python bare open without close → flagged ───────────────
+    (root / "io_bad.py").write_text(
+        'def read_config():\n'
+        '    f = open("config.txt", "r")\n'
+        '    data = f.read()\n'
+        '    return data\n'
+    )
+
+    # ── Resource Leak: Python with open → NOT flagged ─────────────────────────
+    (root / "io_good.py").write_text(
+        'def read_config():\n'
+        '    with open("config.txt", "r") as f:\n'
+        '        data = f.read()\n'
+        '    return data\n'
+    )
+
+    leaks2 = find_resource_leaks({}, tmpdir)
+    leak_files2 = [f["file"] for f in leaks2]
+    assert any("io_bad.py" in f for f in leak_files2), \
+        f"LEAK-004 should flag io_bad.py, got: {leak_files2}"
+    assert not any("io_good.py" in f for f in leak_files2), \
+        f"LEAK-004 should NOT flag io_good.py, got: {leak_files2}"
+    print("[PASS] LEAK-004: bare open() flagged; with open() not flagged")
+
+    # ── Migration: SQL with ALTER TABLE ADD COLUMN → flagged for MIGR-001 ─────
+    migr_dir = root / "db" / "migrations"
+    migr_dir.mkdir(parents=True)
+    (migr_dir / "V001__add_col.sql").write_text(
+        "ALTER TABLE users ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT '';\n"
+    )
+
+    # ── Migration: same with ALGORITHM=INPLACE → NOT flagged for MIGR-001 ─────
+    (migr_dir / "V002__add_col_safe.sql").write_text(
+        "ALTER TABLE users ADD COLUMN phone VARCHAR(20) DEFAULT NULL, ALGORITHM=INPLACE, LOCK=NONE;\n"
+    )
+
+    migr = find_unsafe_migrations({}, tmpdir)
+    migr_files = [f["file"] for f in migr]
+    migr001_files = [f["file"] for f in migr if f.get("rule_id") == "MIGR-001"]
+    assert any("V001__add_col.sql" in f for f in migr001_files), \
+        f"MIGR-001 should flag V001__add_col.sql, got: {migr001_files}"
+    assert not any("V002__add_col_safe.sql" in f for f in migr001_files), \
+        f"MIGR-001 should NOT flag V002__add_col_safe.sql, got: {migr001_files}"
+    print("[PASS] MIGR-001: ALTER TABLE without ALGORITHM flagged; ALGORITHM=INPLACE not flagged")
+
+    # ── Migration: MIGR-003 missing lock_wait_timeout ─────────────────────────
+    migr003_files = [f["file"] for f in migr if f.get("rule_id") == "MIGR-003"]
+    assert any("V001__add_col.sql" in f for f in migr003_files), \
+        f"MIGR-003 should flag V001__add_col.sql for missing lock_wait_timeout, got: {migr003_files}"
+    print("[PASS] MIGR-003: missing lock_wait_timeout before ALTER flagged")
+
+    # ── Migration: MIGR-004 TRUNCATE in application code ─────────────────────
+    (root / "admin.py").write_text(
+        'import db\n'
+        'def reset_table():\n'
+        '    cursor.execute("TRUNCATE TABLE sessions")\n'
+    )
+    migr_app = find_unsafe_migrations({}, tmpdir)
+    migr004_files = [f["file"] for f in migr_app if f.get("rule_id") == "MIGR-004"]
+    assert any("admin.py" in f for f in migr004_files), \
+        f"MIGR-004 should flag admin.py, got: {migr004_files}"
+    print("[PASS] MIGR-004: TRUNCATE in application code flagged")
+
+    # ── Verify total_checks updated to 17 in get_health_summary ──────────────
+    summary = get_health_summary({}, tmpdir)
+    assert summary["checks_passed"] + summary["checks_failed"] == 17, \
+        f"Expected total_checks=17, got {summary['checks_passed'] + summary['checks_failed']}"
+    print("[PASS] get_health_summary: total_checks == 17")
+
+    # ── Verify MCP stubs return correct shape ─────────────────────────────────
+    result = graph_idempotency_gaps_tool(tmpdir)
+    assert "ok" in result and "total" in result and "findings" in result, \
+        f"graph_idempotency_gaps_tool bad shape: {result}"
+    result2 = graph_resource_leaks_tool(tmpdir)
+    assert "ok" in result2 and "total" in result2 and "findings" in result2, \
+        f"graph_resource_leaks_tool bad shape: {result2}"
+    result3 = graph_unsafe_migrations_tool(tmpdir)
+    assert "ok" in result3 and "total" in result3 and "findings" in result3, \
+        f"graph_unsafe_migrations_tool bad shape: {result3}"
+    print("[PASS] MCP export stubs return correct shape")
+
+    print("\n=== All _test_new_structural_2 tests PASSED ===")
 
 
 # ---------------------------------------------------------------------------

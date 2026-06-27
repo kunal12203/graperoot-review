@@ -36,7 +36,7 @@ from typing import Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-ORM_EXTS: set[str] = {".ts", ".js", ".go", ".py", ".cs", ".kt", ".kts"}
+ORM_EXTS: set[str] = {".ts", ".js", ".go", ".py", ".cs", ".kt", ".kts", ".rs", ".java", ".rb"}
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -1728,6 +1728,370 @@ def _extract_objection(content: str, file_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 16. Diesel ORM (Rust)
+# ---------------------------------------------------------------------------
+
+_DIESEL_TABLE_MACRO_RE = re.compile(
+    r"table!\s*\{[\s\n]*(\w+)\s*\(",
+    re.MULTILINE,
+)
+_DIESEL_DERIVE_RE = re.compile(
+    r"#\[derive\([^)]*(?:Queryable|Insertable)[^)]*\)\]"
+)
+_DIESEL_STRUCT_RE = re.compile(
+    r"(?:pub\s+)?struct\s+(\w+)\s*\{"
+)
+_DIESEL_USE_CASE_FN_RE = re.compile(
+    r"fn\s+(\w+)\s*\([^)]*\)\s*->\s*Result",
+)
+_DIESEL_USE_CASE_BODY_KEYWORDS = re.compile(
+    r"\.get_results\(|\.first\(|\.insert_into\(|\.update\("
+)
+_DIESEL_BELONGS_TO_RE = re.compile(
+    r"#\[belongs_to\s*\(\s*(\w+)"
+)
+
+
+def _extract_diesel(content: str, file_path: str, ext: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # table! { tablename (...) } → model
+    for m in _DIESEL_TABLE_MACRO_RE.finditer(content):
+        table_name = m.group(1)
+        if table_name in seen:
+            continue
+        seen.add(table_name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                table_name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["diesel", "table"],
+            )
+        )
+
+    # #[derive(Queryable)] / #[derive(Insertable)] on a struct → model
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _DIESEL_DERIVE_RE.search(line):
+            # look ahead for the struct definition
+            for j in range(i + 1, min(i + 6, len(lines))):
+                m_struct = _DIESEL_STRUCT_RE.search(lines[j])
+                if m_struct:
+                    struct_name = m_struct.group(1)
+                    if struct_name not in seen:
+                        seen.add(struct_name)
+                        end = _find_block_end(lines, j)
+                        symbols.append(
+                            _make_symbol(
+                                file_path,
+                                struct_name,
+                                "model",
+                                i,  # start at the derive line
+                                end,
+                                lines,
+                                confidence="high",
+                                exported=True,
+                                extra_kw=["diesel", "model"],
+                            )
+                        )
+                    break
+        i += 1
+
+    # fn_name() -> Result<...> with Diesel query methods → use_case
+    for m in _DIESEL_USE_CASE_FN_RE.finditer(content):
+        fn_name = m.group(1)
+        if fn_name in seen:
+            continue
+        fn_start = m.start()
+        # scan the function body (next ~50 lines from fn start)
+        fn_ln = _line_of(content, fn_start)
+        end = _find_block_end(lines, fn_ln)
+        body = "\n".join(lines[fn_ln : end + 1])
+        if not _DIESEL_USE_CASE_BODY_KEYWORDS.search(body):
+            continue
+        seen.add(fn_name)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                fn_name,
+                "use_case",
+                fn_ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["diesel", "query"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 17. Spring Data JPA / Hibernate (Java)
+# ---------------------------------------------------------------------------
+
+_JPA_ENTITY_RE = re.compile(r"@Entity\b")
+_JPA_TABLE_RE = re.compile(
+    r'@Table\s*\(\s*name\s*=\s*"([^"]+)"'
+)
+_JPA_CLASS_RE = re.compile(
+    r"(?:public\s+)?(?:abstract\s+)?class\s+(\w+)\b"
+)
+_JPA_REPOSITORY_RE = re.compile(
+    r"(?:public\s+)?interface\s+(\w+)\s+extends\s+"
+    r"(?:JpaRepository|CrudRepository|PagingAndSortingRepository|JpaSpecificationExecutor)"
+    r"[<\s]"
+)
+_JPA_MANY_TO_ONE_RE = re.compile(
+    r"@ManyToOne\b[^;]*?(?:private|protected|public)\s+(\w+)\s+\w+"
+)
+_JPA_ONE_TO_MANY_RE = re.compile(
+    r"@OneToMany\b[^;]*?(?:private|protected|public)\s+\w+<(\w+)>"
+)
+_JPA_MANY_TO_MANY_RE = re.compile(
+    r"@ManyToMany\b[^;]*?(?:private|protected|public)\s+\w+<(\w+)>"
+)
+_JPA_ONE_TO_ONE_RE = re.compile(
+    r"@OneToOne\b[^;]*?(?:private|protected|public)\s+(\w+)\s+\w+"
+)
+_JPA_RELATIONSHIP_ANNOTATION_RE = re.compile(
+    r"@(OneToMany|ManyToOne|ManyToMany|OneToOne)\b"
+)
+
+
+def _extract_spring_data_jpa(content: str, file_path: str, ext: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    # @Entity classes → model
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _JPA_ENTITY_RE.search(line):
+            # Find the class name within the next few lines
+            # Also check for @Table(name=...) between @Entity and class
+            table_name = ""
+            class_name: Optional[str] = None
+            entity_line = i
+            for j in range(i, min(i + 10, len(lines))):
+                tbl_m = _JPA_TABLE_RE.search(lines[j])
+                if tbl_m:
+                    table_name = tbl_m.group(1)
+                cls_m = _JPA_CLASS_RE.search(lines[j])
+                if cls_m and j >= i:
+                    class_name = cls_m.group(1)
+                    i = j
+                    break
+            if class_name and class_name not in seen:
+                seen.add(class_name)
+                end = _find_block_end(lines, i)
+                body = "\n".join(lines[entity_line : end + 1])
+
+                extra = ["jpa", "entity", "hibernate"]
+                if table_name:
+                    extra.append(table_name.lower())
+
+                # Relationship annotations → hook symbols
+                for rel_m in _JPA_RELATIONSHIP_ANNOTATION_RE.finditer(body):
+                    rel_type = rel_m.group(1)
+                    hook_name = f"{class_name}.{rel_type}"
+                    if hook_name not in seen:
+                        seen.add(hook_name)
+                        rel_ln = entity_line + body[: rel_m.start()].count("\n")
+                        symbols.append(
+                            _make_symbol(
+                                file_path,
+                                hook_name,
+                                "hook",
+                                rel_ln,
+                                rel_ln,
+                                lines,
+                                confidence="high",
+                                exported=False,
+                                extra_kw=["jpa", rel_type.lower()],
+                            )
+                        )
+
+                # The entity model symbol itself
+                sym = _make_symbol(
+                    file_path,
+                    class_name,
+                    "model",
+                    entity_line,
+                    end,
+                    lines,
+                    confidence="high",
+                    exported=True,
+                    extra_kw=extra,
+                )
+                if table_name:
+                    sym["table_name"] = table_name
+                symbols.append(sym)
+        i += 1
+
+    # @Repository interfaces → use_case
+    for m in _JPA_REPOSITORY_RE.finditer(content):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        ln = _line_of(content, m.start())
+        end = _find_block_end(lines, ln)
+        symbols.append(
+            _make_symbol(
+                file_path,
+                name,
+                "use_case",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["jpa", "repository", "spring"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# 18. Ruby ActiveRecord (Rails)
+# ---------------------------------------------------------------------------
+
+_AR_MODEL_RE = re.compile(
+    r"^class\s+(\w+)\s*<\s*(?:ApplicationRecord|ActiveRecord::Base)\s*$",
+    re.MULTILINE,
+)
+_AR_HAS_MANY_RE = re.compile(r"^\s*has_many\s+:(\w+)", re.MULTILINE)
+_AR_HAS_ONE_RE = re.compile(r"^\s*has_one\s+:(\w+)", re.MULTILINE)
+_AR_BELONGS_TO_RE = re.compile(r"^\s*belongs_to\s+:(\w+)", re.MULTILINE)
+_AR_SCOPE_RE = re.compile(r"^\s*scope\s+:(\w+),", re.MULTILINE)
+
+
+def _singularize_capitalize(name: str) -> str:
+    """Basic singularize + CamelCase for a snake_case Rails association name.
+
+    Examples: line_items → LineItem, users → User, categories → Category
+    """
+    # Singularize the last segment (handles plural forms)
+    if name.endswith("ies"):
+        singular = name[:-3] + "y"   # categories → category
+    elif name.endswith("ses") or name.endswith("xes") or name.endswith("zes"):
+        singular = name[:-2]         # addresses → address
+    elif name.endswith("s") and not name.endswith("ss"):
+        singular = name[:-1]         # users → user, line_items → line_item
+    else:
+        singular = name
+
+    # Convert snake_case → CamelCase
+    return "".join(part.capitalize() for part in singular.split("_"))
+
+
+def _extract_activerecord(content: str, file_path: str, ext: str) -> list[dict]:
+    lines = content.splitlines()
+    symbols: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _AR_MODEL_RE.finditer(content):
+        class_name = m.group(1)
+        if class_name in seen:
+            continue
+        seen.add(class_name)
+        ln = _line_of(content, m.start())
+
+        # Find body end: scan for 'end' at root indent level
+        end = ln
+        depth = 0
+        for j in range(ln + 1, min(ln + 300, len(lines))):
+            stripped = lines[j].strip()
+            if re.match(r"^(class|module|def|do)\b", stripped):
+                depth += 1
+            if stripped == "end":
+                if depth == 0:
+                    end = j
+                    break
+                depth -= 1
+            end = j
+
+        body = "\n".join(lines[ln : end + 1])
+
+        # has_many, has_one, belongs_to → hook symbols
+        for rel_pattern, rel_label in (
+            (_AR_HAS_MANY_RE, "has_many"),
+            (_AR_HAS_ONE_RE, "has_one"),
+            (_AR_BELONGS_TO_RE, "belongs_to"),
+        ):
+            for rel_m in rel_pattern.finditer(body):
+                assoc_name = rel_m.group(1)
+                hook_name = f"{class_name}.{rel_label}_{assoc_name}"
+                if hook_name not in seen:
+                    seen.add(hook_name)
+                    rel_ln = ln + body[: rel_m.start()].count("\n")
+                    symbols.append(
+                        _make_symbol(
+                            file_path,
+                            hook_name,
+                            "hook",
+                            rel_ln,
+                            rel_ln,
+                            lines,
+                            confidence="high",
+                            exported=False,
+                            extra_kw=["activerecord", rel_label, assoc_name],
+                        )
+                    )
+
+        # scope :name, → use_case
+        for scope_m in _AR_SCOPE_RE.finditer(body):
+            scope_name = f"{class_name}.scope_{scope_m.group(1)}"
+            if scope_name not in seen:
+                seen.add(scope_name)
+                scope_ln = ln + body[: scope_m.start()].count("\n")
+                symbols.append(
+                    _make_symbol(
+                        file_path,
+                        scope_name,
+                        "use_case",
+                        scope_ln,
+                        scope_ln,
+                        lines,
+                        confidence="high",
+                        exported=False,
+                        extra_kw=["activerecord", "scope", scope_m.group(1)],
+                    )
+                )
+
+        symbols.append(
+            _make_symbol(
+                file_path,
+                class_name,
+                "model",
+                ln,
+                end,
+                lines,
+                confidence="high",
+                exported=True,
+                extra_kw=["activerecord", "model", "rails"],
+            )
+        )
+
+    return symbols
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1836,6 +2200,46 @@ def supports_orm(content: str, file_path: str, ext: str) -> bool:
             "SchemaUtils",
         )
         for token in _quick_kt:
+            if token in c_top:
+                return True
+        return False
+
+    if ext == ".rs":
+        _quick_rs = (
+            "extern crate diesel",
+            "use diesel::",
+            "diesel::table!",
+            "#[derive(Queryable)]",
+            "#[derive(Insertable)]",
+        )
+        for token in _quick_rs:
+            if token in c_top:
+                return True
+        # Also check for multi-derive on same line
+        if "Queryable" in c_top or "Insertable" in c_top:
+            if "diesel" in c_top:
+                return True
+        return False
+
+    if ext == ".java":
+        _quick_java = (
+            "import javax.persistence.",
+            "import jakarta.persistence.",
+            "import org.springframework.data.jpa.",
+            "@Entity",
+            "@Repository",
+        )
+        for token in _quick_java:
+            if token in c_top:
+                return True
+        return False
+
+    if ext == ".rb":
+        _quick_rb = (
+            "< ApplicationRecord",
+            "< ActiveRecord::Base",
+        )
+        for token in _quick_rb:
             if token in c_top:
                 return True
         return False
@@ -1968,6 +2372,33 @@ def extract_orm_symbols(content: str, file_path: str, ext: str) -> list[dict]:
             or "org.jetbrains.exposed" in content
         ):
             symbols.extend(_extract_exposed(content, file_path))
+
+    elif ext == ".rs":
+        # Diesel ORM
+        if (
+            "extern crate diesel" in content
+            or "use diesel::" in content
+            or "diesel::table!" in content
+            or "Queryable" in content
+            or "Insertable" in content
+        ):
+            symbols.extend(_extract_diesel(content, file_path, ext))
+
+    elif ext == ".java":
+        # Spring Data JPA / Hibernate
+        if (
+            "import javax.persistence." in content
+            or "import jakarta.persistence." in content
+            or "import org.springframework.data.jpa." in content
+            or "@Entity" in content
+            or "@Repository" in content
+        ):
+            symbols.extend(_extract_spring_data_jpa(content, file_path, ext))
+
+    elif ext == ".rb":
+        # ActiveRecord (Rails)
+        if "< ApplicationRecord" in content or "< ActiveRecord::Base" in content:
+            symbols.extend(_extract_activerecord(content, file_path, ext))
 
     # Deduplicate by id (in case two extractors overlap on a generic file)
     seen_ids: set[str] = set()
@@ -2161,7 +2592,176 @@ def parse_orm_imports(content: str, file_id: str, ext: str) -> list[dict]:
                     }
                 )
 
+    elif ext == ".rs":
+        # Diesel: #[belongs_to(ParentStruct)] → use edge
+        for m in _DIESEL_BELONGS_TO_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "use",
+                    "orm": "diesel",
+                }
+            )
+
+    elif ext == ".java":
+        # JPA: @ManyToOne field type → use edge
+        for m in _JPA_MANY_TO_ONE_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "use",
+                    "orm": "jpa",
+                }
+            )
+        # JPA: @OneToMany / @ManyToMany collection element type
+        for pattern in (_JPA_ONE_TO_MANY_RE, _JPA_MANY_TO_MANY_RE):
+            for m in pattern.finditer(content):
+                edges.append(
+                    {
+                        "source": file_id,
+                        "target_name": m.group(1),
+                        "edge_type": "use",
+                        "orm": "jpa",
+                    }
+                )
+        # JPA: @OneToOne field type
+        for m in _JPA_ONE_TO_ONE_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": m.group(1),
+                    "edge_type": "use",
+                    "orm": "jpa",
+                }
+            )
+
+    elif ext == ".rb":
+        # ActiveRecord: belongs_to :foo → use edge to Foo
+        for m in _AR_BELONGS_TO_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": _singularize_capitalize(m.group(1)),
+                    "edge_type": "use",
+                    "orm": "activerecord",
+                }
+            )
+        # ActiveRecord: has_many :bars → use edge to Bar
+        for m in _AR_HAS_MANY_RE.finditer(content):
+            edges.append(
+                {
+                    "source": file_id,
+                    "target_name": _singularize_capitalize(m.group(1)),
+                    "edge_type": "use",
+                    "orm": "activerecord",
+                }
+            )
+
     return edges
+
+
+# ---------------------------------------------------------------------------
+# Phase-26 ORM tests: Diesel, Spring Data JPA, ActiveRecord
+# ---------------------------------------------------------------------------
+
+
+def _test_phase26_orm() -> None:
+    # ── Diesel (Rust) ─────────────────────────────────────────────────────────
+    rs_code = '''
+use diesel::prelude::*;
+table! {
+    users (id) {
+        id -> Integer,
+        name -> Text,
+    }
+}
+#[derive(Queryable)]
+pub struct User {
+    pub id: i32,
+    pub name: String,
+}
+'''
+    assert supports_orm(rs_code, "models.rs", ".rs"), "Diesel not detected"
+    syms = extract_orm_symbols(rs_code, "models.rs", ".rs")
+    names = [s["name"] for s in syms]
+    assert "users" in names or "User" in names, f"Diesel symbols: {names}"
+    # Check table! macro produces a model
+    assert any(s["symbol_type"] == "model" for s in syms), f"Diesel model symbol missing: {syms}"
+
+    # belongs_to edge from parse_orm_imports
+    rs_with_belongs = '''
+use diesel::prelude::*;
+#[belongs_to(User)]
+#[derive(Queryable, Identifiable, Associations)]
+pub struct Post {
+    pub id: i32,
+    pub user_id: i32,
+}
+'''
+    edges = parse_orm_imports(rs_with_belongs, "models.rs", ".rs")
+    target_names = [e["target_name"] for e in edges]
+    assert "User" in target_names, f"Diesel belongs_to edge missing: {edges}"
+
+    # ── Spring Data JPA (Java) ────────────────────────────────────────────────
+    java_code = '''
+import javax.persistence.*;
+@Entity
+@Table(name = "products")
+public class Product {
+    @Id
+    @GeneratedValue
+    private Long id;
+
+    @ManyToOne
+    private Category category;
+}
+'''
+    assert supports_orm(java_code, "Product.java", ".java"), "JPA not detected"
+    syms2 = extract_orm_symbols(java_code, "Product.java", ".java")
+    names2 = [s["name"] for s in syms2]
+    assert "Product" in names2, f"JPA symbols: {names2}"
+    # @ManyToOne → hook symbol
+    assert any(s["symbol_type"] == "hook" for s in syms2), f"JPA hook missing: {syms2}"
+    # table_name extra field populated
+    product_sym = next(s for s in syms2 if s["name"] == "Product")
+    assert product_sym.get("table_name") == "products", f"JPA table_name: {product_sym}"
+
+    # @Repository
+    java_repo = '''
+import org.springframework.data.jpa.repository.JpaRepository;
+public interface ProductRepository extends JpaRepository<Product, Long> {}
+'''
+    syms_repo = extract_orm_symbols(java_repo, "ProductRepository.java", ".java")
+    repo_names = [s["name"] for s in syms_repo]
+    assert "ProductRepository" in repo_names, f"JPA Repository: {repo_names}"
+    assert any(s["symbol_type"] == "use_case" for s in syms_repo), f"JPA use_case: {syms_repo}"
+
+    # ── ActiveRecord (Ruby) ───────────────────────────────────────────────────
+    rb_code = '''
+class Order < ApplicationRecord
+  belongs_to :user
+  has_many :line_items
+  scope :recent, -> { order(created_at: :desc).limit(10) }
+end
+'''
+    assert supports_orm(rb_code, "order.rb", ".rb"), "ActiveRecord not detected"
+    syms3 = extract_orm_symbols(rb_code, "order.rb", ".rb")
+    names3 = [s["name"] for s in syms3]
+    assert "Order" in names3, f"ActiveRecord symbols: {names3}"
+    # belongs_to, has_many → hook symbols
+    assert any(s["symbol_type"] == "hook" for s in syms3), f"AR hook missing: {syms3}"
+    # scope → use_case
+    assert any(s["symbol_type"] == "use_case" for s in syms3), f"AR scope missing: {syms3}"
+
+    # AR edges
+    ar_edges = parse_orm_imports(rb_code, "order.rb", ".rb")
+    ar_targets = [e["target_name"] for e in ar_edges]
+    assert "User" in ar_targets, f"AR belongs_to edge: {ar_targets}"
+    assert "LineItem" in ar_targets, f"AR has_many edge: {ar_targets}"
+
+    print("PASS  _test_phase26_orm (Diesel + JPA + ActiveRecord)")
 
 
 # ---------------------------------------------------------------------------

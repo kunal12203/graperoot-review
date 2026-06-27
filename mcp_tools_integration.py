@@ -1515,6 +1515,141 @@ def register_all_new_tools(
             by_lang[lang] = by_lang.get(lang, 0) + 1
         return {"ok": True, "total": len(findings), "by_language": by_lang, "findings": findings}
 
+    # ── Resilience checks ─────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def graph_http_timeouts() -> dict[str, Any]:
+        """Find HTTP calls (Go/Python/JS) missing explicit timeout configuration."""
+        try:
+            from resilience_checks import find_http_calls_without_timeout as _check  # type: ignore
+            findings = _check({}, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "resilience_checks.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_file: dict[str, int] = {}
+        for f in findings:
+            by_file[f.get("file", "?")] = by_file.get(f.get("file", "?"), 0) + 1
+        return {"ok": True, "total": len(findings), "by_file": by_file, "findings": findings}
+
+    @mcp.tool()
+    def graph_retry_backoff() -> dict[str, Any]:
+        """Find retry loops using fixed sleep instead of exponential backoff."""
+        try:
+            from resilience_checks import find_retries_without_backoff as _check  # type: ignore
+            findings = _check({}, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "resilience_checks.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "total": len(findings), "findings": findings}
+
+    @mcp.tool()
+    def graph_feature_flag_fallbacks() -> dict[str, Any]:
+        """Find LaunchDarkly/Unleash/Statsig feature flag calls without fallback defaults."""
+        try:
+            from resilience_checks import find_feature_flags_without_fallback as _check  # type: ignore
+            findings = _check({}, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "resilience_checks.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "total": len(findings), "findings": findings}
+
+    @mcp.tool()
+    def graph_circuit_breakers() -> dict[str, Any]:
+        """Find files making 3+ external HTTP calls without a circuit breaker library."""
+        try:
+            from resilience_checks import find_missing_circuit_breakers as _check  # type: ignore
+            findings = _check({}, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "resilience_checks.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "total": len(findings), "findings": findings}
+
+    @mcp.tool()
+    def graph_resilience_summary() -> dict[str, Any]:
+        """Full resilience report: timeouts, backoff, feature flags, circuit breakers with score."""
+        try:
+            from resilience_checks import get_resilience_summary as _get_summary  # type: ignore
+            return _get_summary(str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "resilience_checks.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── Idempotency, resource leaks, migration safety ─────────────────────────
+
+    @mcp.tool()
+    def graph_idempotency_gaps() -> dict[str, Any]:
+        """Find MQ consumers and batch jobs with non-idempotent side effects (no dedup/checkpoint)."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_idempotency_gaps as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_severity: dict[str, int] = {}
+        for f in findings:
+            s = f.get("severity", "?")
+            by_severity[s] = by_severity.get(s, 0) + 1
+        return {"ok": True, "total": len(findings), "by_severity": by_severity, "findings": findings}
+
+    @mcp.tool()
+    def graph_resource_leaks() -> dict[str, Any]:
+        """Find unclosed file handles, HTTP response bodies, and DB connections."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_resource_leaks as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_rule: dict[str, int] = {}
+        for f in findings:
+            r = f.get("rule_id", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+
+    @mcp.tool()
+    def graph_unsafe_migrations() -> dict[str, Any]:
+        """Find ALTER TABLE without online DDL markers, missing lock timeouts, DROP in app code."""
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_unsafe_migrations as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_rule: dict[str, int] = {}
+        for f in findings:
+            r = f.get("rule_id", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers (module-level, not tools)

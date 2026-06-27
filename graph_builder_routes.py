@@ -72,6 +72,12 @@ ROUTE_EXTS: set[str] = {
     ".graphql", ".gql",
     # Scala (Play Framework)
     ".scala",
+    # C# (ASP.NET Core)
+    ".cs",
+    # Groovy (Grails)
+    ".groovy",
+    # Elixir (Plug.Router)
+    ".ex", ".exs",
 }
 
 
@@ -1666,6 +1672,165 @@ _BUFFALO_RESOURCE_VERBS = [
     ("DELETE", "/{id}"),
 ]
 
+# ── Spring Boot / Spring MVC (Java) ───────────────────────────────────────────
+
+# Class-level @RequestMapping("/prefix") — grab the path value
+_SPRING_CLASS_MAPPING_RE = re.compile(
+    r"""@RequestMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']""",
+    re.MULTILINE,
+)
+# Method-level verb mappings: @GetMapping("path") or @GetMapping
+_SPRING_METHOD_MAPPING_RE = re.compile(
+    r"""@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*
+    (?:\(\s*(?:value\s*=\s*)?["']([^"']*?)["']\s*\))?""",
+    re.MULTILINE | re.VERBOSE,
+)
+# @RequestMapping(method = RequestMethod.GET, value = "/path")
+_SPRING_REQUEST_MAPPING_RE = re.compile(
+    r"""@RequestMapping\s*\([^)]*?method\s*=\s*RequestMethod\.(\w+)[^)]*?
+    (?:value\s*=\s*["']([^"']+)["'])?[^)]*\)""",
+    re.MULTILINE | re.VERBOSE,
+)
+# Guard: class-level @RestController or @Controller annotation
+_SPRING_CONTROLLER_RE = re.compile(
+    r"""@(?:RestController|Controller)\b""",
+    re.MULTILINE,
+)
+
+_SPRING_MAPPING_VERB = {
+    "GetMapping":    "GET",
+    "PostMapping":   "POST",
+    "PutMapping":    "PUT",
+    "DeleteMapping": "DELETE",
+    "PatchMapping":  "PATCH",
+}
+
+# ── ASP.NET Core (C#) ─────────────────────────────────────────────────────────
+
+# Class-level [Route("api/[controller]")] or [Route("prefix")]
+_ASPNET_CLASS_ROUTE_RE = re.compile(
+    r"""\[Route\s*\(\s*["']([^"']+)["']\s*\)\]""",
+    re.MULTILINE,
+)
+# [HttpGet], [HttpPost], etc. — optional route param: [HttpGet("path")]
+_ASPNET_HTTP_VERB_RE = re.compile(
+    r"""\[Http(Get|Post|Put|Delete|Patch)\s*(?:\(\s*["']([^"']*?)["']\s*\))?\]""",
+    re.MULTILINE,
+)
+# Guard: class has Controller in name or inherits ControllerBase / ApiController
+_ASPNET_CONTROLLER_CLASS_RE = re.compile(
+    r"""class\s+(\w+)\s*(?::\s*(?:ControllerBase|ApiController|Controller\b))?""",
+    re.MULTILINE,
+)
+# Minimal API: app.MapGet("/path", ...) app.MapPost(...)
+_ASPNET_MAP_VERB_RE = re.compile(
+    r"""app\.Map(Get|Post|Put|Delete|Patch)\s*\(\s*["']([^"']+)["']""",
+    re.MULTILINE,
+)
+
+# ── Yii2 (PHP) ────────────────────────────────────────────────────────────────
+
+# 'GET /path' => 'controller/action'
+_YII_RULE_SHORTHAND_RE = re.compile(
+    r"""['"](?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(?P<path>/[^'"]+)['"]\s*=>""",
+    re.MULTILINE,
+)
+# 'pattern' => 'controller/action', 'verb' => 'POST'
+_YII_RULE_PATTERN_RE = re.compile(
+    r"""['"](pattern)['"]\s*=>\s*['"](?P<path>[^'"]+)['"]\s*,
+    [^}]*?['"]verb['"]\s*=>\s*['"](?P<method>[A-Z]+)['"]""",
+    re.MULTILINE | re.VERBOSE,
+)
+
+# ── CakePHP (PHP) ─────────────────────────────────────────────────────────────
+
+# $routes->get('/path', ...) / $builder->get('/path', ...)
+_CAKE_VERB_RE = re.compile(
+    r"""(?:\$routes|\$builder|\$router)\s*->\s*
+    (get|post|put|delete|patch|options|head)\s*\(
+    \s*['"]([^'"]+)['"]""",
+    re.MULTILINE | re.VERBOSE,
+)
+# Router::connect('/path', ...)
+_CAKE_CONNECT_RE = re.compile(
+    r"""Router\s*::\s*connect\s*\(\s*['"]([^'"]+)['"]""",
+    re.MULTILINE,
+)
+# $builder->resources('Controller') — standard REST expansion
+_CAKE_RESOURCES_RE = re.compile(
+    r"""(?:\$routes|\$builder)\s*->\s*resources\s*\(\s*['"]([^'"]+)['"]""",
+    re.MULTILINE,
+)
+
+_CAKE_RESOURCE_VERBS = [
+    ("GET",    ""),
+    ("GET",    "/:id"),
+    ("POST",   ""),
+    ("PUT",    "/:id"),
+    ("PATCH",  "/:id"),
+    ("DELETE", "/:id"),
+]
+
+# ── Hanami (Ruby) ─────────────────────────────────────────────────────────────
+
+# get '/path', to: 'controller#action'
+_HANAMI_VERB_RE = re.compile(
+    r"""^[ \t]*(get|post|put|patch|delete|options|head)\s+
+    ['"]([^'"]+)['"]\s*(?:,\s*to:\s*['"][^'"]*['"])?""",
+    re.MULTILINE | re.VERBOSE,
+)
+# root to: 'home#index'
+_HANAMI_ROOT_RE = re.compile(
+    r"""^[ \t]*root\s+to:""",
+    re.MULTILINE,
+)
+# resources :name — expand to 7 REST routes
+_HANAMI_RESOURCES_RE = re.compile(
+    r"""^[ \t]*resources?\s+:(\w+)""",
+    re.MULTILINE,
+)
+# namespace :api do ... end
+_HANAMI_NAMESPACE_RE = re.compile(
+    r"""^[ \t]*namespace\s+:(\w+)\s+do\b""",
+    re.MULTILINE,
+)
+
+_HANAMI_RESOURCE_VERBS = [
+    ("GET",    ""),
+    ("GET",    "/new"),
+    ("POST",   ""),
+    ("GET",    "/:id"),
+    ("GET",    "/:id/edit"),
+    ("PATCH",  "/:id"),
+    ("DELETE", "/:id"),
+]
+
+# ── Grails (Groovy) ───────────────────────────────────────────────────────────
+
+# "GET" "/path" — explicit method in UrlMappings
+_GRAILS_EXPLICIT_METHOD_RE = re.compile(
+    r'''"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)"\s*"(/[^"]*)"''',
+    re.MULTILINE,
+)
+# "/path"(controller: 'name', action: 'action')
+_GRAILS_PATH_CALL_RE = re.compile(
+    r'''"(/[^"$*?]+?)"\s*\(''',
+    re.MULTILINE,
+)
+
+# ── Elixir Plug.Router ────────────────────────────────────────────────────────
+
+# get "/path" do / post "/path" do
+_PLUG_VERB_RE = re.compile(
+    r"""^[ \t]*(get|post|put|patch|delete|options|head)\s+"([^"]+)"\s+do\b""",
+    re.MULTILINE,
+)
+# match "/path", via: :get do
+_PLUG_MATCH_VIA_RE = re.compile(
+    r"""^[ \t]*match\s+"([^"]+)"\s*,\s*via:\s*:(\w+)\s+do\b""",
+    re.MULTILINE,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # NEW FRAMEWORK EXTRACTORS
@@ -2168,6 +2333,437 @@ def _extract_buffalo(content: str, file_path: str) -> list[dict]:
     return routes
 
 
+# ── Spring Boot / Spring MVC ──────────────────────────────────────────────────
+
+def _extract_spring_boot(content: str, file_path: str) -> list[dict]:
+    """Extract Spring Boot / Spring MVC annotated routes from Java source.
+
+    Handles:
+    - @GetMapping, @PostMapping, @PutMapping, @DeleteMapping, @PatchMapping
+    - Class-level @RequestMapping prefix combined with method-level mappings
+    - @RequestMapping(method = RequestMethod.GET, value = "/path")
+    Guard: class must have @RestController or @Controller.
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    if not _SPRING_CONTROLLER_RE.search(content):
+        return routes
+
+    # Collect class-level @RequestMapping prefixes.
+    # Strategy: find the annotation, then find the nearest class boundary.
+    class_prefix_ranges: list[tuple[str, int, int]] = []
+    for m in _SPRING_CLASS_MAPPING_RE.finditer(content):
+        prefix = m.group(1)
+        ann_ln = content[: m.start()].count("\n")
+        # Find the class opening brace after this annotation
+        class_start = ann_ln
+        class_end   = _find_block_end_brace(lines, ann_ln, limit=1000)
+        class_prefix_ranges.append((prefix, class_start, class_end))
+
+    def _get_class_prefix(method_ln: int) -> str:
+        best = ""
+        for prefix, cs, ce in class_prefix_ranges:
+            if cs <= method_ln <= ce:
+                if len(prefix) >= len(best):
+                    best = prefix
+        return best
+
+    # @GetMapping / @PostMapping / etc.
+    for m in _SPRING_METHOD_MAPPING_RE.finditer(content):
+        annotation = m.group(1)
+        sub_path   = m.group(2) or ""
+        verb       = _SPRING_MAPPING_VERB.get(annotation, "ANY")
+        ln         = content[: m.start()].count("\n")
+        end        = _find_block_end_brace(lines, ln, limit=60)
+
+        # Find handler method name after the annotation
+        handler = ""
+        for i in range(ln, min(ln + 10, len(lines))):
+            hm = re.search(r"""(?:public|private|protected)\s+\S+\s+(\w+)\s*\(""", lines[i])
+            if hm:
+                handler = hm.group(1)
+                break
+
+        prefix    = _get_class_prefix(ln)
+        full_path = ("/" + prefix.strip("/") + "/" + sub_path.strip("/")).replace("//", "/")
+        if len(full_path) > 1 and full_path.endswith("/"):
+            full_path = full_path[:-1]
+        if not full_path:
+            full_path = "/"
+
+        routes.append(_make_route(file_path, lines, ln, end, verb, full_path, handler, "high"))
+
+    # @RequestMapping(method = RequestMethod.GET, ...) on a method
+    for m in _SPRING_REQUEST_MAPPING_RE.finditer(content):
+        verb_str  = m.group(1).upper()
+        sub_path  = m.group(2) or ""
+        ln        = content[: m.start()].count("\n")
+        end       = _find_block_end_brace(lines, ln, limit=60)
+
+        # Skip class-level @RequestMapping (which sets the prefix, handled above)
+        # If the annotation line is directly before a 'class' keyword, it's class-level
+        text_after = content[m.end(): m.end() + 200]
+        if re.match(r'\s*(?:public\s+|abstract\s+|final\s+)?class\s+', text_after):
+            continue
+
+        handler = ""
+        for i in range(ln, min(ln + 10, len(lines))):
+            hm = re.search(r"""(?:public|private|protected)\s+\S+\s+(\w+)\s*\(""", lines[i])
+            if hm:
+                handler = hm.group(1)
+                break
+
+        prefix    = _get_class_prefix(ln)
+        full_path = ("/" + prefix.strip("/") + "/" + sub_path.strip("/")).replace("//", "/")
+        if len(full_path) > 1 and full_path.endswith("/"):
+            full_path = full_path[:-1]
+        if not full_path:
+            full_path = "/"
+
+        routes.append(_make_route(file_path, lines, ln, end, verb_str, full_path, handler, "high"))
+
+    return _dedup_routes(routes)
+
+
+# ── ASP.NET Core ──────────────────────────────────────────────────────────────
+
+def _extract_aspnet_core(content: str, file_path: str) -> list[dict]:
+    """Extract ASP.NET Core controller-based and minimal API routes from C# source.
+
+    Handles:
+    - [HttpGet], [HttpPost], etc. with optional route parameter
+    - Class-level [Route("api/[controller]")] — [controller] -> lowercased class name
+    - Minimal API: app.MapGet("/path", ...) etc.
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    _ASPNET_VERB_MAP = {
+        "Get":    "GET",
+        "Post":   "POST",
+        "Put":    "PUT",
+        "Delete": "DELETE",
+        "Patch":  "PATCH",
+    }
+
+    # ── Controller-based routes ───────────────────────────────────────────────
+    # Find controller classes and their [Route] prefix + line ranges
+    class_blocks: list[tuple[str, str, int, int]] = []  # (class_name, route_prefix, start, end)
+    for cm in _ASPNET_CONTROLLER_CLASS_RE.finditer(content):
+        cls_name = cm.group(1)
+        # Only treat as a controller if name contains Controller or inherits ControllerBase
+        inherits_controller = cm.group(0) and (
+            "Controller" in cls_name
+            or "ControllerBase" in cm.group(0)
+            or "ApiController" in cm.group(0)
+        )
+        if not inherits_controller:
+            continue
+        cls_ln  = content[: cm.start()].count("\n")
+        cls_end = _find_block_end_brace(lines, cls_ln, limit=2000)
+
+        # Look for [Route(...)] in the annotations preceding this class
+        prefix = ""
+        for rm in _ASPNET_CLASS_ROUTE_RE.finditer(content[:cm.start()]):
+            r_ln = content[: rm.start()].count("\n")
+            if r_ln >= cls_ln - 10:  # within ~10 lines before class
+                prefix = rm.group(1)
+
+        # Replace [controller] placeholder with lowercased class name (minus "Controller" suffix)
+        ctrl_segment = cls_name
+        if ctrl_segment.endswith("Controller"):
+            ctrl_segment = ctrl_segment[:-len("Controller")]
+        ctrl_segment = ctrl_segment.lower()
+        prefix = prefix.replace("[controller]", ctrl_segment)
+
+        class_blocks.append((cls_name, prefix, cls_ln, cls_end))
+
+    def _get_aspnet_prefix(method_ln: int) -> str:
+        best = ""
+        for _cls, pfx, cs, ce in class_blocks:
+            if cs <= method_ln <= ce:
+                if len(pfx) >= len(best):
+                    best = pfx
+        return best
+
+    for m in _ASPNET_HTTP_VERB_RE.finditer(content):
+        verb_raw = m.group(1)
+        sub_path = m.group(2) or ""
+        verb     = _ASPNET_VERB_MAP.get(verb_raw, verb_raw.upper())
+        ln       = content[: m.start()].count("\n")
+        end      = _find_block_end_brace(lines, ln, limit=60)
+
+        # Find handler method name after the attribute
+        handler = ""
+        for i in range(ln, min(ln + 10, len(lines))):
+            hm = re.search(r"""(?:public|private|protected|internal)\s+\S+\s+(\w+)\s*\(""", lines[i])
+            if hm:
+                handler = hm.group(1)
+                break
+
+        prefix    = _get_aspnet_prefix(ln)
+        full_path = ("/" + prefix.strip("/") + "/" + sub_path.strip("/")).replace("//", "/")
+        if len(full_path) > 1 and full_path.endswith("/"):
+            full_path = full_path[:-1]
+        if not full_path:
+            full_path = "/"
+
+        routes.append(_make_route(file_path, lines, ln, end, verb, full_path, handler, "high"))
+
+    # ── Minimal API: app.MapGet("/path", ...) ────────────────────────────────
+    for m in _ASPNET_MAP_VERB_RE.finditer(content):
+        verb = _ASPNET_VERB_MAP.get(m.group(1), m.group(1).upper())
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    return _dedup_routes(routes)
+
+
+# ── Yii2 Framework ────────────────────────────────────────────────────────────
+
+def _extract_yii(content: str, file_path: str) -> list[dict]:
+    """Extract Yii2 URL rule definitions from PHP source.
+
+    Handles:
+    - 'GET /path' => 'controller/action' shorthand
+    - 'pattern' => ..., 'verb' => 'POST' verbose form
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    for m in _YII_RULE_SHORTHAND_RE.finditer(content):
+        verb = m.group("method").upper()
+        path = m.group("path")
+        ln   = content[: m.start()].count("\n")
+        if not path.startswith("/"):
+            path = "/" + path
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    for m in _YII_RULE_PATTERN_RE.finditer(content):
+        path = m.group("path")
+        verb = m.group("method").upper()
+        ln   = content[: m.start()].count("\n")
+        if not path.startswith("/"):
+            path = "/" + path
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    return _dedup_routes(routes)
+
+
+# ── CakePHP ───────────────────────────────────────────────────────────────────
+
+def _extract_cakephp(content: str, file_path: str) -> list[dict]:
+    """Extract CakePHP route definitions from PHP source.
+
+    Handles:
+    - $routes->get('/path', ...) and $builder->get(...) etc.
+    - Router::connect('/path', ...)
+    - $builder->resources('Controller') — expand to standard REST routes
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+    _CAKE_METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "delete": "DELETE",
+        "patch": "PATCH", "options": "OPTIONS", "head": "HEAD",
+    }
+
+    for m in _CAKE_VERB_RE.finditer(content):
+        verb = _CAKE_METHOD_MAP.get(m.group(1).lower(), m.group(1).upper())
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        if not path.startswith("/"):
+            path = "/" + path
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    for m in _CAKE_CONNECT_RE.finditer(content):
+        path = m.group(1)
+        ln   = content[: m.start()].count("\n")
+        if not path.startswith("/"):
+            path = "/" + path
+        routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, confidence="medium"))
+
+    for m in _CAKE_RESOURCES_RE.finditer(content):
+        resource  = m.group(1)
+        ln        = content[: m.start()].count("\n")
+        base_path = "/" + resource.lower().rstrip("/")
+        for verb, suffix in _CAKE_RESOURCE_VERBS:
+            routes.append(_make_route(
+                file_path, lines, ln, ln, verb,
+                base_path + suffix, resource, "high",
+            ))
+
+    return _dedup_routes(routes)
+
+
+# ── Hanami ────────────────────────────────────────────────────────────────────
+
+def _extract_hanami(content: str, file_path: str) -> list[dict]:
+    """Extract Hanami (Ruby) route definitions.
+
+    Handles:
+    - get '/path', to: 'controller#action'
+    - root to: 'home#index' -> GET /
+    - resources :name -> 7 standard REST routes
+    - namespace :api do ... end -> prefix routes with /api
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+    _HANAMI_METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "options": "OPTIONS", "head": "HEAD",
+    }
+
+    # Collect namespace blocks: namespace :api do ... end
+    namespace_blocks: list[tuple[str, int, int]] = []  # (prefix, start_ln, end_ln)
+    for nm in _HANAMI_NAMESPACE_RE.finditer(content):
+        ns_name = nm.group(1)
+        ns_ln   = content[: nm.start()].count("\n")
+        # Find matching 'end'
+        depth   = 0
+        end_ln  = ns_ln
+        for i in range(ns_ln, min(ns_ln + 500, len(lines))):
+            stripped = lines[i].strip()
+            if re.search(r'\bdo\b', stripped):
+                depth += 1
+            if stripped == "end":
+                depth -= 1
+                if depth <= 0:
+                    end_ln = i
+                    break
+        namespace_blocks.append(("/" + ns_name, ns_ln, end_ln))
+
+    def _get_ns_prefix(method_ln: int) -> str:
+        best = ""
+        for pfx, ns_start, ns_end in namespace_blocks:
+            if ns_start < method_ln <= ns_end:
+                if len(pfx) >= len(best):
+                    best = pfx
+        return best
+
+    # root to: 'home#index'
+    for m in _HANAMI_ROOT_RE.finditer(content):
+        ln     = content[: m.start()].count("\n")
+        prefix = _get_ns_prefix(ln)
+        path   = prefix or "/"
+        routes.append(_make_route(file_path, lines, ln, ln, "GET", path, confidence="high"))
+
+    # get '/path', to: ...
+    for m in _HANAMI_VERB_RE.finditer(content):
+        verb    = _HANAMI_METHOD_MAP.get(m.group(1).lower(), m.group(1).upper())
+        path    = m.group(2)
+        ln      = content[: m.start()].count("\n")
+        prefix  = _get_ns_prefix(ln)
+        if not path.startswith("/"):
+            path = "/" + path
+        full_path = (prefix.rstrip("/") + "/" + path.lstrip("/")).replace("//", "/") if prefix else path
+        routes.append(_make_route(file_path, lines, ln, ln, verb, full_path, confidence="high"))
+
+    # resources :name -> expand to 7 REST routes
+    for m in _HANAMI_RESOURCES_RE.finditer(content):
+        resource  = m.group(1)
+        ln        = content[: m.start()].count("\n")
+        prefix    = _get_ns_prefix(ln)
+        base_path = (prefix.rstrip("/") + "/" + resource.lower()) if prefix else ("/" + resource.lower())
+        for verb, suffix in _HANAMI_RESOURCE_VERBS:
+            routes.append(_make_route(
+                file_path, lines, ln, ln, verb,
+                base_path + suffix, resource, "high",
+            ))
+
+    return _dedup_routes(routes)
+
+
+# ── Grails ────────────────────────────────────────────────────────────────────
+
+def _extract_grails(content: str, file_path: str) -> list[dict]:
+    """Extract Grails (Groovy) URL mappings.
+
+    Guard: file path contains UrlMappings or grails-app/controllers.
+    Handles:
+    - "GET" "/path"
+    - "/path"(controller: 'name', action: 'index')
+    Skips generic catch-alls like "/$controller/$action?/$id?"
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+
+    # Explicit method + path
+    for m in _GRAILS_EXPLICIT_METHOD_RE.finditer(content):
+        verb = m.group(1).upper()
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        # Skip generic catch-all patterns
+        if "$controller" in path or "$action" in path:
+            continue
+        routes.append(_make_route(file_path, lines, ln, ln, verb, path, confidence="high"))
+
+    # "/path"(controller: ...) — implicit ANY (method not specified)
+    for m in _GRAILS_PATH_CALL_RE.finditer(content):
+        path = m.group(1)
+        ln   = content[: m.start()].count("\n")
+        if "$controller" in path or "$action" in path:
+            continue
+        # Skip if already captured by the explicit method pattern above
+        # (check if a prior route on same line already added it)
+        already = any(r["line_start"] == ln and r["route_path"] == _normalize_path(path)
+                      for r in routes)
+        if not already:
+            routes.append(_make_route(file_path, lines, ln, ln, "ANY", path, confidence="medium"))
+
+    return _dedup_routes(routes)
+
+
+# ── Elixir Plug.Router ────────────────────────────────────────────────────────
+
+def _extract_plug_router(content: str, file_path: str) -> list[dict]:
+    """Extract Elixir Plug.Router route definitions.
+
+    Guard: file must contain 'use Plug.Router'.
+    Handles:
+    - get "/path" do
+    - post "/path" do
+    - match "/path", via: :get do
+    """
+    lines  = content.splitlines()
+    routes: list[dict] = []
+    _PLUG_METHOD_MAP = {
+        "get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+        "delete": "DELETE", "options": "OPTIONS", "head": "HEAD",
+    }
+
+    # Guard: only Plug.Router files
+    if "use Plug.Router" not in content:
+        return routes
+
+    for m in _PLUG_VERB_RE.finditer(content):
+        verb = _PLUG_METHOD_MAP.get(m.group(1).lower(), m.group(1).upper())
+        path = m.group(2)
+        ln   = content[: m.start()].count("\n")
+        # Find matching 'end'
+        end_ln = ln
+        for i in range(ln + 1, min(ln + 50, len(lines))):
+            if lines[i].strip() == "end":
+                end_ln = i
+                break
+        routes.append(_make_route(file_path, lines, ln, end_ln, verb, path, confidence="high"))
+
+    for m in _PLUG_MATCH_VIA_RE.finditer(content):
+        path     = m.group(1)
+        via_verb = m.group(2).lower()
+        verb     = _PLUG_METHOD_MAP.get(via_verb, via_verb.upper())
+        ln       = content[: m.start()].count("\n")
+        end_ln   = ln
+        for i in range(ln + 1, min(ln + 50, len(lines))):
+            if lines[i].strip() == "end":
+                end_ln = i
+                break
+        routes.append(_make_route(file_path, lines, ln, end_ln, verb, path, confidence="high"))
+
+    return _dedup_routes(routes)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FILE-BASED ROUTE DETECTION (Next.js / Remix / SvelteKit / Nuxt)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2464,6 +3060,14 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
             routes.extend(_extract_laravel(content, file_path, lines))
         if "#[Route(" in content or "@Route(" in content or "Symfony" in content:
             routes.extend(_extract_symfony(content, file_path))
+        # Yii2
+        if "UrlRule" in content or ("GET /" in content and "=>" in content):
+            routes.extend(_extract_yii(content, file_path))
+        # CakePHP
+        if ("->resources(" in content or "->get(" in content or "->post(" in content
+                or "->put(" in content or "->delete(" in content
+                or "Router::connect(" in content):
+            routes.extend(_extract_cakephp(content, file_path))
 
     # ── Kotlin ────────────────────────────────────────────────────────────────
     elif ext == ".kt":
@@ -2476,6 +3080,20 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
         _JAXRS_INDICATORS = ("@Path(", "@GET", "@POST", "@PUT", "@DELETE", "@PATCH")
         if any(ind in content for ind in _JAXRS_INDICATORS):
             routes.extend(_extract_jaxrs(content, file_path, lines))
+        # Spring Boot / Spring MVC
+        _SPRING_INDICATORS = ("@GetMapping", "@PostMapping", "@PutMapping",
+                              "@DeleteMapping", "@PatchMapping", "@RequestMapping",
+                              "@RestController", "@Controller")
+        if any(ind in content for ind in _SPRING_INDICATORS):
+            routes.extend(_extract_spring_boot(content, file_path))
+
+    # ── C# (ASP.NET Core) ─────────────────────────────────────────────────────
+    elif ext == ".cs":
+        _ASPNET_INDICATORS = ("[HttpGet", "[HttpPost", "[HttpPut", "[HttpDelete",
+                              "[HttpPatch", "app.MapGet(", "app.MapPost(",
+                              "ControllerBase", "ApiController")
+        if any(ind in content for ind in _ASPNET_INDICATORS):
+            routes.extend(_extract_aspnet_core(content, file_path))
 
     # ── Ruby ─────────────────────────────────────────────────────────────────
     elif ext == ".rb":
@@ -2488,6 +3106,28 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
                                'get "/', 'post "/', 'put "/', 'delete "/')
         if any(ind in content for ind in _SINATRA_INDICATORS):
             routes.extend(_extract_sinatra(content, file_path, lines))
+        # Hanami
+        _HANAMI_INDICATORS = ("to:", "resources :", "resources:", "namespace :",
+                              "root to:")
+        if any(ind in content for ind in _HANAMI_INDICATORS):
+            routes.extend(_extract_hanami(content, file_path))
+
+    # ── Groovy (Grails) ───────────────────────────────────────────────────────
+    elif ext == ".groovy":
+        _GRAILS_INDICATORS = ("UrlMappings", "urlMappings", "grails-app/controllers",
+                              "grails_app/controllers")
+        _grails_guard = (
+            any(ind in content for ind in _GRAILS_INDICATORS)
+            or "UrlMappings" in file_path
+            or "grails-app/controllers" in file_path
+        )
+        if _grails_guard:
+            routes.extend(_extract_grails(content, file_path))
+
+    # ── Elixir (.ex / .exs) ───────────────────────────────────────────────────
+    elif ext in (".ex", ".exs"):
+        if "use Plug.Router" in content:
+            routes.extend(_extract_plug_router(content, file_path))
 
     # ── GraphQL SDL ───────────────────────────────────────────────────────────
     elif ext in (".graphql", ".gql"):
@@ -2509,6 +3149,157 @@ def extract_routes_for_file(content: str, file_path: str, ext: str) -> list[dict
 # ═══════════════════════════════════════════════════════════════════════════════
 # TESTS FOR NEW EXTRACTORS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _test_phase26_routes() -> None:
+    """Tests for the Phase 2.6 framework route extractors."""
+
+    # ── Spring Boot ───────────────────────────────────────────────────────────
+    java_code = '''
+@RestController
+@RequestMapping("/api/users")
+public class UserController {
+    @GetMapping
+    public List<User> list() { return null; }
+
+    @PostMapping
+    public User create() { return null; }
+
+    @GetMapping("/{id}")
+    public User get(@PathVariable Long id) { return null; }
+}
+'''
+    r = _extract_spring_boot(java_code, "UserController.java")
+    assert len(r) == 3, f"Spring Boot: expected 3 got {len(r)}: {[x['name'] for x in r]}"
+    assert any(x["route_method"] == "GET" and x["route_path"] == "/api/users" for x in r), \
+        f"Spring Boot GET /api/users missing: {[x['name'] for x in r]}"
+    assert any(x["route_method"] == "POST" and x["route_path"] == "/api/users" for x in r), \
+        f"Spring Boot POST /api/users missing: {[x['name'] for x in r]}"
+    assert any(x["route_method"] == "GET" and ":id" in x["route_path"] for x in r), \
+        f"Spring Boot GET /{id} missing: {[x['name'] for x in r]}"
+    print("[PASS] Spring Boot")
+
+    # ── ASP.NET Core ──────────────────────────────────────────────────────────
+    cs_code = '''
+[ApiController]
+[Route("api/[controller]")]
+public class ProductsController : ControllerBase {
+    [HttpGet]
+    public IActionResult Get() { return Ok(); }
+
+    [HttpPost("{id}")]
+    public IActionResult Create(int id) { return Ok(); }
+}
+'''
+    r2 = _extract_aspnet_core(cs_code, "ProductsController.cs")
+    assert len(r2) >= 2, f"ASP.NET Core: expected >=2 got {len(r2)}: {[x['name'] for x in r2]}"
+    assert any(x["route_method"] == "GET" for x in r2), \
+        f"ASP.NET Core GET missing: {[x['name'] for x in r2]}"
+    assert any(x["route_method"] == "POST" for x in r2), \
+        f"ASP.NET Core POST missing: {[x['name'] for x in r2]}"
+    print("[PASS] ASP.NET Core")
+
+    # ── ASP.NET Core minimal API ───────────────────────────────────────────────
+    cs_minimal = 'app.MapGet("/hello", () => "world");\napp.MapPost("/items", (Item i) => i);\n'
+    r2b = _extract_aspnet_core(cs_minimal, "Program.cs")
+    assert len(r2b) >= 2, f"ASP.NET Minimal API: {[x['name'] for x in r2b]}"
+    assert any(x["route_path"] == "/hello" for x in r2b), \
+        f"ASP.NET Minimal /hello missing: {[x['name'] for x in r2b]}"
+    print("[PASS] ASP.NET Core minimal API")
+
+    # ── Yii2 ──────────────────────────────────────────────────────────────────
+    yii_code = """
+'rules' => [
+    'GET /users' => 'user/index',
+    'POST /users' => 'user/create',
+    'GET /users/<id>' => 'user/view',
+],
+"""
+    r_yii = _extract_yii(yii_code, "config/web.php")
+    assert len(r_yii) >= 2, f"Yii2: expected >=2 got {len(r_yii)}: {[x['name'] for x in r_yii]}"
+    assert any(x["route_method"] == "GET" and "/users" in x["route_path"] for x in r_yii), \
+        f"Yii2 GET /users missing: {[x['name'] for x in r_yii]}"
+    print("[PASS] Yii2")
+
+    # ── CakePHP ───────────────────────────────────────────────────────────────
+    cake_code = """
+$routes->get('/articles', ['controller' => 'Articles', 'action' => 'index']);
+$routes->post('/articles', ['controller' => 'Articles', 'action' => 'add']);
+Router::connect('/pages/*', ['controller' => 'Pages', 'action' => 'display']);
+$builder->resources('Comments');
+"""
+    r_cake = _extract_cakephp(cake_code, "config/routes.php")
+    assert len(r_cake) >= 4, f"CakePHP: expected >=4 got {len(r_cake)}: {[x['name'] for x in r_cake]}"
+    assert any(x["route_method"] == "GET" and "/articles" in x["route_path"] for x in r_cake), \
+        f"CakePHP GET /articles missing: {[x['name'] for x in r_cake]}"
+    assert any(x["route_method"] == "POST" for x in r_cake), \
+        f"CakePHP POST missing: {[x['name'] for x in r_cake]}"
+    print("[PASS] CakePHP")
+
+    # ── Hanami ────────────────────────────────────────────────────────────────
+    rb_code = "get '/users', to: 'users#index'\npost '/users', to: 'users#create'\n"
+    r3 = _extract_hanami(rb_code, "routes.rb")
+    assert len(r3) == 2, f"Hanami: expected 2 got {len(r3)}: {[x['name'] for x in r3]}"
+    assert any(x["route_method"] == "GET" and x["route_path"] == "/users" for x in r3), \
+        f"Hanami GET /users missing: {[x['name'] for x in r3]}"
+    assert any(x["route_method"] == "POST" and x["route_path"] == "/users" for x in r3), \
+        f"Hanami POST /users missing: {[x['name'] for x in r3]}"
+    print("[PASS] Hanami")
+
+    # ── Hanami resources ──────────────────────────────────────────────────────
+    rb_resources = "resources :posts\n"
+    r3b = _extract_hanami(rb_resources, "routes.rb")
+    assert len(r3b) == 7, f"Hanami resources: expected 7 got {len(r3b)}: {[x['name'] for x in r3b]}"
+    print("[PASS] Hanami resources")
+
+    # ── Grails ────────────────────────────────────────────────────────────────
+    groovy_code = '''\
+class UrlMappings {
+    static mappings = {
+        "GET" "/api/users" { controller = "user"; action = "index" }
+        "/api/users/$id"(controller: "user", action: "show")
+        "/$controller/$action?/$id?"()
+    }
+}
+'''
+    r_grails = _extract_grails(groovy_code, "grails-app/controllers/UrlMappings.groovy")
+    assert len(r_grails) >= 1, f"Grails: expected >=1 got {len(r_grails)}: {[x['name'] for x in r_grails]}"
+    assert any(x["route_method"] == "GET" and "/api/users" in x["route_path"] for x in r_grails), \
+        f"Grails GET /api/users missing: {[x['name'] for x in r_grails]}"
+    # catch-all must be skipped
+    assert not any("controller" in x["route_path"] for x in r_grails), \
+        f"Grails catch-all should be skipped: {[x['name'] for x in r_grails]}"
+    print("[PASS] Grails")
+
+    # ── Plug.Router ───────────────────────────────────────────────────────────
+    ex_code = (
+        "use Plug.Router\n"
+        "plug :match\n"
+        "plug :dispatch\n"
+        'get "/hello" do\n'
+        '  send_resp(conn, 200, "ok")\n'
+        "end\n"
+        'post "/items" do\n'
+        "  send_resp(conn, 201, \"created\")\n"
+        "end\n"
+    )
+    r4 = _extract_plug_router(ex_code, "router.ex")
+    assert len(r4) == 2, f"Plug.Router: expected 2 got {len(r4)}: {[x['name'] for x in r4]}"
+    assert r4[0]["route_path"] == "/hello", \
+        f"Plug.Router path: expected /hello got {r4[0]['route_path']}"
+    assert any(x["route_method"] == "GET" for x in r4), \
+        f"Plug.Router GET missing: {[x['name'] for x in r4]}"
+    assert any(x["route_method"] == "POST" for x in r4), \
+        f"Plug.Router POST missing: {[x['name'] for x in r4]}"
+    print("[PASS] Plug.Router")
+
+    # ── Plug.Router guard (no use Plug.Router) ────────────────────────────────
+    ex_code_no_guard = 'get "/hello" do\n  :ok\nend\n'
+    r4b = _extract_plug_router(ex_code_no_guard, "not_a_plug_router.ex")
+    assert len(r4b) == 0, f"Plug.Router guard: should return [] got {[x['name'] for x in r4b]}"
+    print("[PASS] Plug.Router guard")
+
+    print("\n=== All Phase 2.6 route extractor tests PASSED ===")
+
 
 def _test_new_extractors() -> None:
     # ── Starlette ────────────────────────────────────────────────────────────
