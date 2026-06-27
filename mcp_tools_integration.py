@@ -5,6 +5,139 @@ from pathlib import Path
 from typing import Any
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL GRAPH — navigable edges between tools
+# Agents receive these with every response so they ALWAYS know what to try next.
+# This replaces the "flat list of 67 tools" problem.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_TOOL_GRAPH: dict[str, dict] = {
+    # ── Fallback edges: "if this tool returned 0 findings, try THESE next" ──
+    "fallback": {
+        "graph_connection_pool_misconfigs": {
+            "try_next": ["graph_config_misconfigs"],
+            "reason": "Pool config may be in PgBouncer .ini or Spring YAML, not in code",
+        },
+        "graph_scan_secrets": {
+            "try_next": ["graph_log_secret_leakage"],
+            "reason": "Secrets may not be hardcoded — they may be interpolated into log calls",
+        },
+        "graph_health_checks": {
+            "try_next": ["graph_config_misconfigs"],
+            "reason": "Health endpoint exists but may return static 200 without checking DB",
+        },
+        "graph_idempotency_gaps": {
+            "try_next": ["graph_config_misconfigs"],
+            "reason": "enable.auto.commit=true in kafka.properties causes same symptom (data loss on crash)",
+        },
+        "graph_race_conditions": {
+            "try_next": ["graph_goroutine_leaks"],
+            "reason": "Race-like symptoms may actually be goroutine/context leaks (cancel never called)",
+        },
+        "graph_http_timeouts": {
+            "try_next": ["graph_cache_stampede", "graph_circuit_breakers"],
+            "reason": "Timeout may be hit due to thundering herd on cold cache, or missing circuit breaker",
+        },
+        "graph_resource_leaks": {
+            "try_next": ["graph_goroutine_leaks"],
+            "reason": "Resource exhaustion in Go often means goroutine leak, not just unclosed file handle",
+        },
+        "graph_missing_indexes": {
+            "try_next": ["graph_n_plus_one", "graph_cache_stampede"],
+            "reason": "Slow queries may be N+1 pattern or cache miss amplification, not just missing index",
+        },
+    },
+    # ── Co-occur edges: "if you called X, also call Y" ──────────────────────
+    "co_occur": {
+        "graph_connection_pool_misconfigs": ["graph_goroutine_leaks", "graph_config_misconfigs"],
+        "graph_cache_stampede": ["graph_missing_pagination", "graph_n_plus_one"],
+        "graph_http_timeouts": ["graph_circuit_breakers", "graph_retry_backoff"],
+        "graph_unsafe_migrations": ["graph_missing_indexes"],
+        "graph_log_secret_leakage": ["graph_scan_secrets"],
+        "graph_goroutine_leaks": ["graph_resource_leaks", "graph_http_timeouts"],
+        "graph_config_misconfigs": ["graph_connection_pool_misconfigs", "graph_idempotency_gaps"],
+    },
+    # ── Symptom router: natural language → tool(s) ───────────────────────────
+    "symptoms": {
+        "OOM|out of memory|memory leak|SIGKILL|oom-killed": [
+            "graph_goroutine_leaks", "graph_resource_leaks",
+        ],
+        "connection refused|too many connections|pool exhausted|connection timeout|pgbouncer|hikari|connection exhaustion": [
+            "graph_connection_pool_misconfigs", "graph_config_misconfigs", "graph_health_checks",
+        ],
+        "messages lost|data loss|events dropped|kafka|consumer crash": [
+            "graph_config_misconfigs", "graph_idempotency_gaps",
+        ],
+        "slow|latency|p99|timeout|hanging": [
+            "graph_http_timeouts", "graph_cache_stampede", "graph_n_plus_one", "graph_missing_indexes",
+        ],
+        "secret|api key|token|credential|password.*log": [
+            "graph_log_secret_leakage", "graph_scan_secrets",
+        ],
+        "health check|readiness|liveness|pod restart|CrashLoopBackOff": [
+            "graph_health_checks", "graph_goroutine_leaks", "graph_resource_leaks",
+        ],
+        "thundering herd|cache miss|cache cold|stampede|redis restart|cache restart|db overload": [
+            "graph_cache_stampede",
+        ],
+        "migration|ALTER TABLE|deploy broke|lock|DDL": [
+            "graph_unsafe_migrations", "graph_config_misconfigs",
+        ],
+        "cascading|circuit breaker|all services down|one service slow": [
+            "graph_http_timeouts", "graph_circuit_breakers", "graph_cache_stampede",
+        ],
+        "rebalance|consumer group|kafka poll|session timeout": [
+            "graph_config_misconfigs",
+        ],
+        "goroutine|context cancel|defer|waitgroup": [
+            "graph_goroutine_leaks",
+        ],
+        "race condition|concurrent|mutex|shared state": [
+            "graph_race_conditions", "graph_goroutine_leaks",
+        ],
+    },
+}
+
+
+def _get_navigation_hints(tool_name: str, findings_count: int) -> dict[str, Any]:
+    """Return navigation hints for a tool response — agents use this to decide what to call next."""
+    hints: dict[str, Any] = {}
+
+    if findings_count == 0:
+        # Fallback: "this returned empty, try these"
+        fallback = _TOOL_GRAPH["fallback"].get(tool_name)
+        if fallback:
+            hints["try_next"] = fallback["try_next"]
+            hints["reason"] = fallback["reason"]
+        else:
+            hints["try_next"] = ["graph_production_readiness"]
+            hints["reason"] = "No findings — run the master audit for a full picture"
+    else:
+        # Co-occur: "you found stuff, also check these related tools"
+        co = _TOOL_GRAPH["co_occur"].get(tool_name, [])
+        if co:
+            hints["also_check"] = co
+            hints["reason"] = "Related checks that often fire together"
+
+    return hints
+
+
+def _route_symptom(description: str) -> list[str]:
+    """Given a natural-language symptom description, return the best tool(s) to call."""
+    import re
+    description_lower = description.lower()
+    matches: list[tuple[int, list[str]]] = []
+    for pattern, tools in _TOOL_GRAPH["symptoms"].items():
+        keywords = pattern.split("|")
+        score = sum(1 for kw in keywords if kw.lower() in description_lower)
+        if score > 0:
+            matches.append((score, tools))
+    matches.sort(key=lambda x: -x[0])
+    if matches:
+        return matches[0][1]
+    return ["graph_production_readiness"]
+
+
 def register_all_new_tools(
     mcp,
     get_dg_data_dir,        # callable() -> Path — returns DG_DATA_DIR
@@ -598,12 +731,14 @@ def register_all_new_tools(
             sev = f.get("severity", "unknown")
             by_severity[sev] = by_severity.get(sev, 0) + 1
 
-        return {
+        result = {
             "ok": True,
             "total": len(filtered),
             "findings": filtered[:50],  # cap output to 50 for readability
             "by_severity": by_severity,
         }
+        result["_next"] = _get_navigation_hints("graph_scan_secrets", len(filtered))
+        return result
 
     @mcp.tool()
     def graph_sast_findings(language: str = "auto") -> dict[str, Any]:
@@ -1294,12 +1429,14 @@ def register_all_new_tools(
             fp = f.get("file", "unknown")
             by_file[fp] = by_file.get(fp, 0) + 1
 
-        return {
+        result = {
             "ok": True,
             "total": len(findings),
             "findings": findings,
             "by_file": by_file,
         }
+        result["_next"] = _get_navigation_hints("graph_missing_indexes", len(findings))
+        return result
 
     @mcp.tool()
     def graph_n_plus_one() -> dict[str, Any]:
@@ -1513,7 +1650,9 @@ def register_all_new_tools(
         for f in findings:
             lang = f.get("language", "unknown")
             by_lang[lang] = by_lang.get(lang, 0) + 1
-        return {"ok": True, "total": len(findings), "by_language": by_lang, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_language": by_lang, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_race_conditions", len(findings))
+        return result
 
     # ── Resilience checks ─────────────────────────────────────────────────────
 
@@ -1530,7 +1669,9 @@ def register_all_new_tools(
         by_file: dict[str, int] = {}
         for f in findings:
             by_file[f.get("file", "?")] = by_file.get(f.get("file", "?"), 0) + 1
-        return {"ok": True, "total": len(findings), "by_file": by_file, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_file": by_file, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_http_timeouts", len(findings))
+        return result
 
     @mcp.tool()
     def graph_retry_backoff() -> dict[str, Any]:
@@ -1602,7 +1743,9 @@ def register_all_new_tools(
         for f in findings:
             s = f.get("severity", "?")
             by_severity[s] = by_severity.get(s, 0) + 1
-        return {"ok": True, "total": len(findings), "by_severity": by_severity, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_severity": by_severity, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_idempotency_gaps", len(findings))
+        return result
 
     @mcp.tool()
     def graph_resource_leaks() -> dict[str, Any]:
@@ -1625,7 +1768,9 @@ def register_all_new_tools(
         for f in findings:
             r = f.get("rule_id", "?")
             by_rule[r] = by_rule.get(r, 0) + 1
-        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_resource_leaks", len(findings))
+        return result
 
     @mcp.tool()
     def graph_connection_pool_misconfigs() -> dict[str, Any]:
@@ -1648,7 +1793,9 @@ def register_all_new_tools(
         for f in findings:
             r = f.get("rule_id", "?")
             by_rule[r] = by_rule.get(r, 0) + 1
-        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_connection_pool_misconfigs", len(findings))
+        return result
 
     @mcp.tool()
     def graph_health_checks() -> dict[str, Any]:
@@ -1667,7 +1814,9 @@ def register_all_new_tools(
             return {"ok": False, "error": "structural_bugs.py not found"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
-        return {"ok": True, "total": len(findings), "findings": findings}
+        result = {"ok": True, "total": len(findings), "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_health_checks", len(findings))
+        return result
 
     @mcp.tool()
     def graph_unsafe_migrations() -> dict[str, Any]:
@@ -1690,7 +1839,9 @@ def register_all_new_tools(
         for f in findings:
             r = f.get("rule_id", "?")
             by_rule[r] = by_rule.get(r, 0) + 1
-        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_unsafe_migrations", len(findings))
+        return result
 
     @mcp.tool()
     def graph_goroutine_leaks() -> dict[str, Any]:
@@ -1723,7 +1874,9 @@ def register_all_new_tools(
         for f in findings:
             r = f.get("rule_id", "?")
             by_rule[r] = by_rule.get(r, 0) + 1
-        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_goroutine_leaks", len(findings))
+        return result
 
     @mcp.tool()
     def graph_cache_stampede() -> dict[str, Any]:
@@ -1756,7 +1909,9 @@ def register_all_new_tools(
         for f in findings:
             r = f.get("rule_id", "?")
             by_rule[r] = by_rule.get(r, 0) + 1
-        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_cache_stampede", len(findings))
+        return result
 
     @mcp.tool()
     def graph_config_misconfigs() -> dict[str, Any]:
@@ -1790,7 +1945,9 @@ def register_all_new_tools(
         for f in findings:
             r = f.get("rule_id", "?")
             by_rule[r] = by_rule.get(r, 0) + 1
-        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result = {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+        result["_next"] = _get_navigation_hints("graph_config_misconfigs", len(findings))
+        return result
 
     @mcp.tool()
     def graph_log_secret_leakage() -> dict[str, Any]:
@@ -1818,7 +1975,7 @@ def register_all_new_tools(
         for f in findings:
             r = f.get("rule_id", "?")
             by_rule[r] = by_rule.get(r, 0) + 1
-        return {
+        result = {
             "ok": True,
             "total": len(findings),
             "by_rule": by_rule,
@@ -1828,6 +1985,8 @@ def register_all_new_tools(
                 "Rotate any exposed keys immediately."
             ),
         }
+        result["_next"] = _get_navigation_hints("graph_log_secret_leakage", len(findings))
+        return result
 
     # ══════════════════════════════════════════════════════════════════════════
     # DISCOVERY + COMPOSITE TOOLS
@@ -1943,23 +2102,76 @@ def register_all_new_tools(
     }
 
     @mcp.tool()
-    def graph_help(category: str = "") -> dict[str, Any]:
+    @mcp.tool()
+    def graph_route(symptom: str = "") -> dict[str, Any]:
+        """Describe your problem in natural language and get the exact tools to call.
+
+        This is a SYMPTOM ROUTER — pass what you're seeing ("OOM every 6h",
+        "messages dropped", "API key in Datadog logs", "cache restart killed DB")
+        and it returns the 1-3 tools to call, in order, plus what to try if the
+        first returns empty.
+
+        Without arguments: returns the full tool graph (categories + edges).
+        With a symptom: returns prioritized tools matching that symptom.
         """
-        Discover which GrapeRoot tools to use. Call this FIRST when you don't
-        know which tool to use.
+        if symptom:
+            tools = _route_symptom(symptom)
+            result: dict[str, Any] = {
+                "ok": True,
+                "symptom": symptom,
+                "call_these": tools,
+                "if_empty": {},
+            }
+            for t in tools:
+                fb = _TOOL_GRAPH["fallback"].get(t)
+                if fb:
+                    result["if_empty"][t] = fb
+            co_related: list[str] = []
+            for t in tools:
+                co_related.extend(_TOOL_GRAPH["co_occur"].get(t, []))
+            if co_related:
+                result["also_check"] = list(set(co_related) - set(tools))
+            return result
 
-        Without arguments: returns all categories with descriptions.
-        With a category name (e.g. 'security', 'ops', 'resilience', 'routes',
-        'models', 'code_quality', 'observability', 'infra', 'impact'):
-        returns the tools in that category with descriptions.
+        return {
+            "ok": True,
+            "tip": "Pass a symptom description to get routed to the right tools. Or use graph_production_readiness() for a full audit.",
+            "categories": {
+                name: {
+                    "description": data["description"],
+                    "tool_count": len(data["tools"]),
+                    "composite": data.get("composite"),
+                }
+                for name, data in _TOOL_CATALOGUE.items()
+            },
+            "composite_tools": {
+                "graph_production_readiness": "Run ALL audits → top-10 action punch list",
+                "graph_security_audit": "Run full security audit → prioritized findings",
+                "graph_resilience_audit": "Run full resilience audit → prioritized findings",
+                "graph_ops_audit": "Run full ops health audit → prioritized findings",
+                "graph_code_quality_audit": "Run full code quality audit → prioritized findings",
+            },
+            "symptom_examples": [
+                "OOM every 6h",
+                "messages silently dropped",
+                "API key visible in logs",
+                "connection refused at peak",
+                "cache restart killed DB",
+                "ALTER TABLE locked prod",
+            ],
+        }
 
-        Composite tools run an entire category in one call — look for
-        'composite' in the category response.
+    @mcp.tool()
+    def graph_help(category: str = "") -> dict[str, Any]:
+        """List tools in a category. Call graph_route(symptom) instead if you
+        have a specific problem to solve.
+
+        Categories: security, resilience, ops, code_quality, observability, infra, impact, routes, models.
         """
         if not category:
             return {
                 "ok": True,
-                "tip": "Pass a category name to see its tools. Use composite tools to run a whole category at once.",
+                "tip": "Use graph_route('your symptom') for intent-based routing. Or pass a category name here.",
                 "categories": {
                     name: {
                         "description": data["description"],
@@ -1967,13 +2179,6 @@ def register_all_new_tools(
                         "composite": data.get("composite"),
                     }
                     for name, data in _TOOL_CATALOGUE.items()
-                },
-                "composite_tools": {
-                    "graph_security_audit": "Run full security audit → prioritized findings",
-                    "graph_resilience_audit": "Run full resilience audit → prioritized findings",
-                    "graph_ops_audit": "Run full ops health audit → prioritized findings",
-                    "graph_code_quality_audit": "Run full code quality audit → prioritized findings",
-                    "graph_production_readiness": "Run ALL audits → top-10 action punch list",
                 },
             }
         cat = _TOOL_CATALOGUE.get(category.lower())
