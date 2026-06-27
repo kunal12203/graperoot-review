@@ -1692,6 +1692,466 @@ def register_all_new_tools(
             by_rule[r] = by_rule.get(r, 0) + 1
         return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # DISCOVERY + COMPOSITE TOOLS
+    # These are the entry points — call these first, not individual tools.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Tool catalogue — structured so AI can navigate by intent
+    _TOOL_CATALOGUE: dict[str, dict] = {
+        "routes": {
+            "description": "Find, list, and trace HTTP routes and API endpoints",
+            "tools": {
+                "graph_find_route": "Find which handler serves GET /payments or POST /users",
+                "graph_list_routes": "List all routes, optionally filtered by prefix or method",
+                "graph_trace_event": "Follow a Kafka/SQS/Redis event through the whole system",
+                "graph_who_publishes": "Who publishes to a given topic or queue?",
+            },
+        },
+        "models": {
+            "description": "Database models, ORM relationships, and schema analysis",
+            "tools": {
+                "graph_db_models": "List all ORM models/entities and their relationships",
+                "graph_tf_resources": "List Terraform/IaC resources by type",
+                "graph_cdk_stacks": "List AWS CDK stacks (v1 and v2)",
+                "graph_cfn_resources": "List CloudFormation resources, filter by type",
+                "graph_pulumi_resources": "List Pulumi resources",
+            },
+        },
+        "security": {
+            "description": "Security audit: secrets, SAST, vulnerabilities, licenses, IaC misconfigs",
+            "tools": {
+                "graph_scan_secrets": "Scan for hardcoded secrets and credentials",
+                "graph_sast_findings": "Static analysis security findings by language",
+                "graph_scan_vulnerabilities": "OSV vulnerability scan of dependencies",
+                "graph_license_audit": "License compliance audit",
+                "graph_iac_security": "IaC misconfiguration scan (Terraform, K8s, CDK)",
+                "graph_idempotency_gaps": "MQ consumers/batch jobs missing idempotency guards",
+                "graph_unsafe_migrations": "DB migrations missing online DDL or lock timeouts",
+            },
+            "composite": "graph_security_audit",
+        },
+        "resilience": {
+            "description": "Production resilience: timeouts, retries, circuit breakers, feature flags",
+            "tools": {
+                "graph_http_timeouts": "HTTP calls missing explicit timeout configuration",
+                "graph_retry_backoff": "Retry loops using fixed sleep instead of exponential backoff",
+                "graph_feature_flag_fallbacks": "Feature flag calls without fallback defaults",
+                "graph_circuit_breakers": "Files with 3+ external calls and no circuit breaker",
+                "graph_resilience_summary": "Full resilience score across all 4 checks",
+            },
+            "composite": "graph_resilience_audit",
+        },
+        "ops": {
+            "description": "Operational health: connection pools, health endpoints, port conflicts, race conditions",
+            "tools": {
+                "graph_connection_pool_misconfigs": "DB pools without max size or hardcoded connection strings",
+                "graph_health_checks": "Missing /health endpoints and K8s readinessProbe",
+                "graph_port_conflicts": "Same port bound in multiple files",
+                "graph_race_conditions": "Heuristic race condition detection (Go/Python/JS)",
+                "graph_unused_env_vars": "Env vars declared in .env but never used",
+                "graph_missing_env_vars": "Env vars used in code but missing from .env",
+            },
+            "composite": "graph_ops_audit",
+        },
+        "code_quality": {
+            "description": "Code quality: dead code, N+1 queries, missing pagination, resource leaks",
+            "tools": {
+                "graph_n_plus_one": "N+1 query risk patterns (DB query inside loop)",
+                "graph_missing_pagination": "Query endpoints without pagination",
+                "graph_missing_indexes": "Foreign keys and filter fields without DB indexes",
+                "graph_resource_leaks": "Unclosed file handles, HTTP bodies, DB connections",
+                "graph_debt_score": "Technical debt score by file",
+                "graph_dead_exports": "Exported symbols never imported anywhere (use graph_system_health)",
+            },
+            "composite": "graph_code_quality_audit",
+        },
+        "observability": {
+            "description": "Observability coverage: tracing, metrics, logging, alerting",
+            "tools": {
+                "graph_observability_summary": "Full observability coverage score",
+                "graph_otel_topology": "OpenTelemetry trace topology",
+                "graph_prometheus_alerts": "Prometheus alert rules",
+                "graph_sentry_coverage": "Sentry error tracking coverage",
+                "graph_datadog_coverage": "Datadog APM and metrics coverage",
+                "graph_apm_coverage": "APM coverage: New Relic, Dynatrace, Honeycomb, Jaeger, Zipkin",
+                "graph_newrelic_coverage": "New Relic instrumentation coverage",
+            },
+        },
+        "infra": {
+            "description": "Infrastructure: CI/CD, IaC, Kubernetes, kustomize overlays",
+            "tools": {
+                "graph_ci_topology": "CI/CD pipeline topology (all 12 systems)",
+                "graph_ci_extended_summary": "Extended CI/CD: Travis, Drone, Bitbucket, ArgoCD, Tekton, Flux, TeamCity",
+                "graph_iac_extended_summary": "Full IaC summary: CDK, CFN, Pulumi, Bicep",
+                "graph_kustomize_overlays": "Kustomize overlay structure",
+                "graph_lang_extended_summary": "Language breakdown: Elixir, Swift, Dart, Groovy",
+            },
+        },
+        "impact": {
+            "description": "Change impact, ownership, and cross-service analysis",
+            "tools": {
+                "graph_pr_impact": "What breaks if these files change? (provide list of changed files)",
+                "graph_who_owns": "CODEOWNERS-aware file ownership",
+                "graph_explain_path": "Plain-English explanation of how two components connect",
+                "graph_test_coverage": "Test coverage by scope",
+                "graph_diff": "What changed across all services since a given commit",
+                "graph_version_audit": "Dependency version conflicts",
+            },
+        },
+    }
+
+    @mcp.tool()
+    def graph_help(category: str = "") -> dict[str, Any]:
+        """
+        Discover which GrapeRoot tools to use. Call this FIRST when you don't
+        know which tool to use.
+
+        Without arguments: returns all categories with descriptions.
+        With a category name (e.g. 'security', 'ops', 'resilience', 'routes',
+        'models', 'code_quality', 'observability', 'infra', 'impact'):
+        returns the tools in that category with descriptions.
+
+        Composite tools run an entire category in one call — look for
+        'composite' in the category response.
+        """
+        if not category:
+            return {
+                "ok": True,
+                "tip": "Pass a category name to see its tools. Use composite tools to run a whole category at once.",
+                "categories": {
+                    name: {
+                        "description": data["description"],
+                        "tool_count": len(data["tools"]),
+                        "composite": data.get("composite"),
+                    }
+                    for name, data in _TOOL_CATALOGUE.items()
+                },
+                "composite_tools": {
+                    "graph_security_audit": "Run full security audit → prioritized findings",
+                    "graph_resilience_audit": "Run full resilience audit → prioritized findings",
+                    "graph_ops_audit": "Run full ops health audit → prioritized findings",
+                    "graph_code_quality_audit": "Run full code quality audit → prioritized findings",
+                    "graph_production_readiness": "Run ALL audits → top-10 action punch list",
+                },
+            }
+        cat = _TOOL_CATALOGUE.get(category.lower())
+        if not cat:
+            available = ", ".join(_TOOL_CATALOGUE.keys())
+            return {"ok": False, "error": f"Unknown category '{category}'. Available: {available}"}
+        return {
+            "ok": True,
+            "category": category,
+            "description": cat["description"],
+            "composite": cat.get("composite"),
+            "tools": cat["tools"],
+        }
+
+    def _make_punch_list(all_findings: list[dict], top_n: int = 10) -> list[dict]:
+        """Sort findings by severity and return the top N as an actionable list."""
+        _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        sorted_findings = sorted(
+            all_findings,
+            key=lambda f: (_SEV_RANK.get(f.get("severity", "low"), 4), f.get("file", ""))
+        )
+        punch = []
+        for i, f in enumerate(sorted_findings[:top_n], 1):
+            punch.append({
+                "rank": i,
+                "severity": f.get("severity", "?"),
+                "rule_id": f.get("rule_id", f.get("check", "?")),
+                "file": f.get("file", "?"),
+                "line": f.get("line", 0),
+                "action": f.get("message", f.get("description", "See finding details")),
+            })
+        return punch
+
+    def _load_graph(get_dg_data_dir: Any) -> dict:
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        if graph_json.exists():
+            try:
+                return json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    @mcp.tool()
+    def graph_security_audit() -> dict[str, Any]:
+        """
+        Run the full security audit in one call. Covers: secrets, SAST, OSV
+        vulnerabilities, license compliance, IaC misconfigs, and idempotency
+        gaps. Returns a prioritized top-10 punch list.
+        """
+        graph = _load_graph(get_dg_data_dir)
+        root = str(get_project_root())
+        all_findings: list[dict] = []
+
+        def _run(fn_import: str, module: str, *args: Any) -> list[dict]:
+            try:
+                mod = __import__(module)
+                fn = getattr(mod, fn_import)
+                return fn(*args) or []
+            except Exception:
+                return []
+
+        # Secrets
+        try:
+            from security import scan_secrets as _scan_secrets  # type: ignore
+            results = _scan_secrets(root, severity_min="medium")
+            all_findings += [dict(f, rule_id=f.get("rule", "SEC"), severity=f.get("severity", "high")) for f in results]
+        except Exception:
+            pass
+
+        # SAST
+        try:
+            from security import run_sast as _run_sast  # type: ignore
+            results = _run_sast(root)
+            all_findings += [dict(f, rule_id=f.get("rule", "SAST"), severity=f.get("severity", "medium")) for f in results]
+        except Exception:
+            pass
+
+        # IaC security
+        try:
+            from security import scan_iac_misconfigs as _scan_iac  # type: ignore
+            results = _scan_iac(root)
+            all_findings += [dict(f, rule_id=f.get("rule", "IAC"), severity=f.get("severity", "medium")) for f in results]
+        except Exception:
+            pass
+
+        # Idempotency gaps
+        try:
+            from structural_bugs import find_idempotency_gaps as _idem  # type: ignore
+            all_findings += _idem(graph, root)
+        except Exception:
+            pass
+
+        # Unsafe migrations
+        try:
+            from structural_bugs import find_unsafe_migrations as _migr  # type: ignore
+            all_findings += _migr(graph, root)
+        except Exception:
+            pass
+
+        punch = _make_punch_list(all_findings)
+        return {
+            "ok": True,
+            "total_findings": len(all_findings),
+            "categories_run": ["secrets", "sast", "iac_misconfigs", "idempotency", "migrations"],
+            "top10_action_list": punch,
+            "all_findings": all_findings,
+        }
+
+    @mcp.tool()
+    def graph_resilience_audit() -> dict[str, Any]:
+        """
+        Run the full resilience audit in one call. Covers: HTTP calls without
+        timeout, retry loops without exponential backoff, feature flag calls
+        without fallback, and files missing circuit breakers. Returns a
+        prioritized top-10 punch list with a resilience score.
+        """
+        root = str(get_project_root())
+        all_findings: list[dict] = []
+        scores: dict[str, int] = {}
+
+        try:
+            from resilience_checks import get_resilience_summary as _res  # type: ignore
+            summary = _res(root)
+            all_findings = summary.get("findings", [])
+            scores["resilience_score"] = summary.get("resilience_score", 100)
+        except Exception:
+            pass
+
+        punch = _make_punch_list(all_findings)
+        return {
+            "ok": True,
+            "total_findings": len(all_findings),
+            "resilience_score": scores.get("resilience_score", 100),
+            "categories_run": ["http_timeouts", "retry_backoff", "feature_flag_fallbacks", "circuit_breakers"],
+            "top10_action_list": punch,
+            "all_findings": all_findings,
+        }
+
+    @mcp.tool()
+    def graph_ops_audit() -> dict[str, Any]:
+        """
+        Run the full operational health audit in one call. Covers: connection
+        pool misconfigs, missing health endpoints, port conflicts, race
+        conditions, unused/missing env vars. Returns a prioritized top-10
+        punch list.
+        """
+        graph = _load_graph(get_dg_data_dir)
+        root = str(get_project_root())
+        all_findings: list[dict] = []
+
+        checks = [
+            ("find_connection_pool_misconfigs", "structural_bugs"),
+            ("find_missing_health_checks", "structural_bugs"),
+            ("find_port_conflicts", "structural_bugs"),
+            ("find_race_conditions", "structural_bugs"),
+            ("find_unused_env_vars", "structural_bugs"),
+            ("find_missing_env_vars", "structural_bugs"),
+        ]
+        for fn_name, mod_name in checks:
+            try:
+                import importlib
+                mod = importlib.import_module(mod_name)
+                fn = getattr(mod, fn_name)
+                all_findings += fn(graph, root) or []
+            except Exception:
+                pass
+
+        punch = _make_punch_list(all_findings)
+        return {
+            "ok": True,
+            "total_findings": len(all_findings),
+            "categories_run": ["pool_misconfigs", "health_checks", "port_conflicts", "race_conditions", "env_vars"],
+            "top10_action_list": punch,
+            "all_findings": all_findings,
+        }
+
+    @mcp.tool()
+    def graph_code_quality_audit() -> dict[str, Any]:
+        """
+        Run the full code quality audit in one call. Covers: N+1 query risk,
+        missing pagination, missing indexes, resource leaks (unclosed handles),
+        and structural bugs. Returns a prioritized top-10 punch list.
+        """
+        graph = _load_graph(get_dg_data_dir)
+        root = str(get_project_root())
+        all_findings: list[dict] = []
+
+        checks = [
+            ("find_n_plus_one_risk", "structural_bugs"),
+            ("find_missing_pagination", "structural_bugs"),
+            ("find_missing_indexes", "structural_bugs"),
+            ("find_resource_leaks", "structural_bugs"),
+            ("find_bean_collisions", "structural_bugs"),
+            ("find_missing_config_siblings", "structural_bugs"),
+        ]
+        for fn_name, mod_name in checks:
+            try:
+                import importlib
+                mod = importlib.import_module(mod_name)
+                fn = getattr(mod, fn_name)
+                all_findings += fn(graph, root) or []
+            except Exception:
+                pass
+
+        punch = _make_punch_list(all_findings)
+        return {
+            "ok": True,
+            "total_findings": len(all_findings),
+            "categories_run": ["n_plus_one", "pagination", "indexes", "resource_leaks", "structural"],
+            "top10_action_list": punch,
+            "all_findings": all_findings,
+        }
+
+    @mcp.tool()
+    def graph_production_readiness() -> dict[str, Any]:
+        """
+        THE master audit tool. Runs security + resilience + ops + code quality
+        in one call and returns a single prioritized top-10 punch list of the
+        most critical issues to fix before going to production.
+
+        Use this when you want a full picture without knowing which specific
+        tool to call. Each item in the punch list tells you exactly what to fix
+        and where.
+        """
+        graph = _load_graph(get_dg_data_dir)
+        root = str(get_project_root())
+        all_findings: list[dict] = []
+        categories_run: list[str] = []
+        scores: dict[str, Any] = {}
+
+        import importlib
+
+        # Security
+        for fn_name, mod_name, cat in [
+            ("find_idempotency_gaps", "structural_bugs", "idempotency"),
+            ("find_unsafe_migrations", "structural_bugs", "migrations"),
+            ("find_resource_leaks", "structural_bugs", "resource_leaks"),
+        ]:
+            try:
+                fn = getattr(importlib.import_module(mod_name), fn_name)
+                findings = fn(graph, root) or []
+                all_findings += findings
+                categories_run.append(cat)
+            except Exception:
+                pass
+
+        try:
+            from security import scan_secrets as _ss  # type: ignore
+            results = _ss(root, severity_min="high")
+            all_findings += [dict(f, rule_id="SEC-SECRET", severity="critical") for f in (results or [])]
+            categories_run.append("secrets")
+        except Exception:
+            pass
+
+        # Resilience
+        try:
+            from resilience_checks import get_resilience_summary as _res  # type: ignore
+            summary = _res(root)
+            all_findings += summary.get("findings", [])
+            scores["resilience_score"] = summary.get("resilience_score", 100)
+            categories_run.append("resilience")
+        except Exception:
+            pass
+
+        # Ops
+        for fn_name, cat in [
+            ("find_connection_pool_misconfigs", "pool_misconfigs"),
+            ("find_missing_health_checks", "health_checks"),
+            ("find_port_conflicts", "port_conflicts"),
+            ("find_race_conditions", "race_conditions"),
+        ]:
+            try:
+                fn = getattr(importlib.import_module("structural_bugs"), fn_name)
+                findings = fn(graph, root) or []
+                all_findings += findings
+                categories_run.append(cat)
+            except Exception:
+                pass
+
+        # Code quality
+        for fn_name, cat in [
+            ("find_n_plus_one_risk", "n_plus_one"),
+            ("find_missing_pagination", "pagination"),
+            ("find_missing_indexes", "indexes"),
+        ]:
+            try:
+                fn = getattr(importlib.import_module("structural_bugs"), fn_name)
+                findings = fn(graph, root) or []
+                all_findings += findings
+                categories_run.append(cat)
+            except Exception:
+                pass
+
+        # Health summary score
+        try:
+            from structural_bugs import get_health_summary as _hs  # type: ignore
+            hs = _hs(graph, root)
+            scores["health_score"] = hs.get("health_score", 100)
+        except Exception:
+            pass
+
+        punch = _make_punch_list(all_findings, top_n=10)
+
+        # Severity breakdown
+        sev_counts: dict[str, int] = {}
+        for f in all_findings:
+            s = f.get("severity", "low")
+            sev_counts[s] = sev_counts.get(s, 0) + 1
+
+        return {
+            "ok": True,
+            "total_findings": len(all_findings),
+            "severity_breakdown": sev_counts,
+            "scores": scores,
+            "categories_run": categories_run,
+            "top10_action_list": punch,
+            "tip": "Fix critical/high items first. Use graph_help('category') to deep-dive any area.",
+        }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers (module-level, not tools)
