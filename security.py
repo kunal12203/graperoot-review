@@ -680,6 +680,184 @@ def scan_sast(project_root: str, language: str = "auto") -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 5A-2b  Log Secret Leakage Scanner
+# Real incident: Cloudflare parser bug leaked HTTP cookies, auth tokens, and POST
+# bodies from memory into HTTP responses — some cached by search engines.
+# Static equivalent: API keys / tokens interpolated directly into log calls.
+# Rule IDs: LOG-001, LOG-002, LOG-003
+# ---------------------------------------------------------------------------
+
+# Variable names that strongly suggest a secret value
+_SECRET_VAR_NAMES = re.compile(
+    r"(?i)\b(?:api_?key|secret|token|password|passwd|auth|credential|"
+    r"private_?key|access_?key|signing_?key|client_?secret|bearer|"
+    r"api_?secret|stripe_?key|twilio_?key|sendgrid_?key|aws_?secret)\b"
+)
+
+# Python log calls: logging.info/debug/warning/error/critical and logger.* variants
+# Pattern: log call that contains an f-string or % format with a secret var
+_PY_LOG_CALL_RE = re.compile(
+    r"(?:logging|logger|log)\s*\.\s*(?:debug|info|warning|error|critical|exception)\s*\("
+)
+_PY_FSTRING_RE  = re.compile(r'f["\'].*\{([^}]+)\}')
+_PY_PERCENT_RE  = re.compile(r'%\s*(?:\(([^)]+)\)|[a-zA-Z_][a-zA-Z0-9_]*)')
+
+# JavaScript / TypeScript: console.log/debug/info/warn/error
+_JS_LOG_CALL_RE = re.compile(
+    r"console\s*\.\s*(?:log|debug|info|warn|error)\s*\("
+)
+_JS_TEMPLATE_RE = re.compile(r'`[^`]*\$\{([^}]+)\}')
+
+# Go: log.Printf / log.Println / logrus.WithField / zap.String etc
+_GO_LOG_CALL_RE = re.compile(
+    r'(?:log|logger|logrus|zap|sugar|slog)\s*\.\s*'
+    r'(?:Printf|Println|Print|Infof?|Debugf?|Warnf?|Errorf?|Fatalf?|WithField)\s*\('
+)
+_GO_FMT_VERB_RE = re.compile(r'%[sdvq]')
+
+# Java / Kotlin: log.info/debug/warn/error, SLF4J, Logback
+_JAVA_LOG_CALL_RE = re.compile(
+    r'(?:log|logger|LOG)\s*\.\s*(?:debug|info|warn|error|trace)\s*\('
+)
+
+_LOG_SCAN_EXTS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".java", ".kt"}
+
+
+def scan_log_secret_leakage(project_root: str) -> list[dict]:
+    """Detect secret variable values interpolated into log statements.
+
+    This catches the pattern that the Cloudflare incident class represents:
+    sensitive values (tokens, API keys, passwords) passed directly to a log
+    call via f-strings, template literals, or format verbs — shipping secrets
+    to stdout, Datadog, Splunk, or any log aggregator.
+
+    Rule IDs:
+        LOG-001  Python log call with f-string containing secret-named variable
+        LOG-002  JS/TS console.log with template literal containing secret-named var
+        LOG-003  Go log call with format verb and secret-named argument
+        LOG-004  Java/Kotlin log call with secret-named variable in message
+
+    Returns list of finding dicts compatible with scan_sast() output.
+    """
+    root = Path(project_root).resolve()
+    findings: list[dict] = []
+
+    for filepath in _iter_text_files(root):
+        ext = filepath.suffix.lower()
+        if ext not in _LOG_SCAN_EXTS:
+            continue
+
+        rel_path = _rel(filepath, root)
+
+        # Skip test files — they often log fake keys intentionally
+        rel_lower = rel_path.lower()
+        if any(s in rel_lower for s in (".test.", ".spec.", "test/", "tests/", "_test.")):
+            continue
+
+        lines = _read_lines(filepath)
+
+        for lineno, line in enumerate(lines, start=1):
+            stripped = line.strip()
+
+            # ── LOG-001: Python ─────────────────────────────────────────────
+            if ext == ".py" and _PY_LOG_CALL_RE.search(line):
+                # Check for f-string with secret var name
+                fm = _PY_FSTRING_RE.search(line)
+                if fm and _SECRET_VAR_NAMES.search(fm.group(1)):
+                    findings.append({
+                        "file": rel_path,
+                        "line": lineno,
+                        "rule": "LOG-001",
+                        "rule_id": "LOG-001",
+                        "title": "Secret variable interpolated into Python log call",
+                        "severity": "high",
+                        "context": stripped[:120],
+                        "cwe": "CWE-532",
+                        "fix": (
+                            "Never interpolate secret values into log messages. "
+                            "Log the operation name and a masked/truncated identifier "
+                            "instead: logging.info('Calling Stripe', key_prefix=key[:4])"
+                        ),
+                    })
+                    continue
+                # Check % formatting with secret var
+                pm = _PY_PERCENT_RE.search(line)
+                if pm and _SECRET_VAR_NAMES.search(pm.group(1) or ""):
+                    findings.append({
+                        "file": rel_path,
+                        "line": lineno,
+                        "rule": "LOG-001",
+                        "rule_id": "LOG-001",
+                        "title": "Secret variable interpolated into Python log call (% format)",
+                        "severity": "high",
+                        "context": stripped[:120],
+                        "cwe": "CWE-532",
+                        "fix": (
+                            "Use a structured logger with a redact list, or mask the "
+                            "value before logging: logging.debug('token=%s', token[:4] + '***')"
+                        ),
+                    })
+
+            # ── LOG-002: JavaScript / TypeScript ────────────────────────────
+            elif ext in {".js", ".ts", ".jsx", ".tsx"} and _JS_LOG_CALL_RE.search(line):
+                tm = _JS_TEMPLATE_RE.search(line)
+                if tm and _SECRET_VAR_NAMES.search(tm.group(1)):
+                    findings.append({
+                        "file": rel_path,
+                        "line": lineno,
+                        "rule": "LOG-002",
+                        "rule_id": "LOG-002",
+                        "title": "Secret variable in JS/TS console.log template literal",
+                        "severity": "high",
+                        "context": stripped[:120],
+                        "cwe": "CWE-532",
+                        "fix": (
+                            "Do not embed secret values in template literals passed to "
+                            "console.log. Log the variable name and a masked prefix only."
+                        ),
+                    })
+
+            # ── LOG-003: Go ──────────────────────────────────────────────────
+            elif ext == ".go" and _GO_LOG_CALL_RE.search(line):
+                if _GO_FMT_VERB_RE.search(line) and _SECRET_VAR_NAMES.search(line):
+                    findings.append({
+                        "file": rel_path,
+                        "line": lineno,
+                        "rule": "LOG-003",
+                        "rule_id": "LOG-003",
+                        "title": "Secret argument passed to Go log format call",
+                        "severity": "high",
+                        "context": stripped[:120],
+                        "cwe": "CWE-532",
+                        "fix": (
+                            "Replace the secret argument with a masked version: "
+                            "log.Printf(\"token=%s...\", token[:4])"
+                        ),
+                    })
+
+            # ── LOG-004: Java / Kotlin ───────────────────────────────────────
+            elif ext in {".java", ".kt"} and _JAVA_LOG_CALL_RE.search(line):
+                if _SECRET_VAR_NAMES.search(line):
+                    findings.append({
+                        "file": rel_path,
+                        "line": lineno,
+                        "rule": "LOG-004",
+                        "rule_id": "LOG-004",
+                        "title": "Secret variable referenced in Java/Kotlin log call",
+                        "severity": "high",
+                        "context": stripped[:120],
+                        "cwe": "CWE-532",
+                        "fix": (
+                            "Use a custom converter or masking utility. With Logback, "
+                            "register a MessageConverter that redacts fields matching "
+                            "secret name patterns."
+                        ),
+                    })
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # 5A-3  IaC Misconfiguration Scanner
 # ---------------------------------------------------------------------------
 
@@ -1895,6 +2073,7 @@ def run_all_scanners(project_root: str) -> dict:
     """Run every scanner and return a combined report dict."""
     secrets = scan_secrets(project_root)
     sast = scan_sast(project_root)
+    log_leaks = scan_log_secret_leakage(project_root)
     vulns = scan_vulnerabilities(project_root)
     licenses = scan_licenses(project_root)
     env_parity = scan_env_parity(project_root)
@@ -1912,6 +2091,10 @@ def run_all_scanners(project_root: str) -> dict:
         "sast": {
             "count": len(sast),
             "findings": sast,
+        },
+        "log_secret_leakage": {
+            "count": len(log_leaks),
+            "findings": log_leaks,
         },
         "vulnerabilities": vulns,
         "licenses": licenses,

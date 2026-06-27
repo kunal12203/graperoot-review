@@ -1692,6 +1692,143 @@ def register_all_new_tools(
             by_rule[r] = by_rule.get(r, 0) + 1
         return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
 
+    @mcp.tool()
+    def graph_goroutine_leaks() -> dict[str, Any]:
+        """Detect Go goroutine/context leaks: cancel() not deferred, goroutines
+        in loops without WaitGroup, and channels never closed.
+
+        Rule IDs: GLEAK-001 (cancel not deferred), GLEAK-002 (goroutine in loop),
+        GLEAK-003 (channel never closed).
+
+        Grounded in real on-call incidents:
+          - Go services OOM'd every 6-8h from accumulating goroutines
+          - DynamoDB outage: latent race between two goroutines on shared DNS state
+          - go.dev/blog/context: defer cancel() is the canonical fix
+        """
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_goroutine_leaks as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_rule: dict[str, int] = {}
+        for f in findings:
+            r = f.get("rule_id", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+
+    @mcp.tool()
+    def graph_cache_stampede() -> dict[str, Any]:
+        """Detect thundering-herd / cache stampede risks: cache GET without
+        singleflight/mutex protection, TTL=0, and SET with no expiry.
+
+        Rule IDs: STMP-001 (no stampede guard), STMP-002 (TTL≤0),
+        STMP-003 (set without TTL).
+
+        Grounded in real on-call incidents:
+          - Instagram 2012: thundering herd after cache flush
+          - Reddit K8s: cold-start pod storm saturated DB
+          - Every Redis restart: all pods miss simultaneously → DB overload
+        """
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_cache_stampede_risks as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_rule: dict[str, int] = {}
+        for f in findings:
+            r = f.get("rule_id", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+
+    @mcp.tool()
+    def graph_config_misconfigs() -> dict[str, Any]:
+        """Parse PgBouncer .ini, Kafka .properties, and Spring HikariCP YAML for
+        dangerous defaults that cause connection exhaustion or data loss.
+
+        Rule IDs: CFG-001 (PgBouncer pool_mode=session),
+        CFG-002 (max_client_conn >> pool_size), CFG-003 (Kafka auto.commit=true),
+        CFG-004 (max.poll.records too high), CFG-005 (HikariCP default pool).
+
+        Grounded in real on-call incidents:
+          - CircleCI: connection queue saturated at peak Wednesday-afternoon load
+          - Kafka consumers: auto-commit before processing = silent message loss
+          - HikariCP default pool of 10 too small for Spring MVC apps
+        """
+        graph_json = get_dg_data_dir() / "info_graph.json"
+        graph: dict = {}
+        if graph_json.exists():
+            try:
+                graph = json.loads(graph_json.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        try:
+            from structural_bugs import find_config_file_misconfigs as _check  # type: ignore
+            findings = _check(graph, str(get_project_root()))
+        except ImportError:
+            return {"ok": False, "error": "structural_bugs.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_rule: dict[str, int] = {}
+        for f in findings:
+            r = f.get("rule_id", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        return {"ok": True, "total": len(findings), "by_rule": by_rule, "findings": findings}
+
+    @mcp.tool()
+    def graph_log_secret_leakage() -> dict[str, Any]:
+        """Detect secret variable values interpolated into log statements across
+        Python, JS/TS, Go, and Java/Kotlin.
+
+        Rule IDs: LOG-001 (Python f-string/%), LOG-002 (JS template literal),
+        LOG-003 (Go format verb + secret arg), LOG-004 (Java/Kotlin log call).
+
+        Grounded in real on-call incidents:
+          - Cloudflare parser bug 2017: auth tokens, cookies, POST bodies leaked
+            from memory into HTTP responses, some cached by search engines
+          - Common pattern: logging.info(f'Calling Stripe key={api_key}') ships
+            secrets to Datadog/Splunk where they persist for months
+        """
+        root = str(get_project_root())
+        try:
+            from security import scan_log_secret_leakage as _scan  # type: ignore
+            findings = _scan(root)
+        except ImportError:
+            return {"ok": False, "error": "security.py not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        by_rule: dict[str, int] = {}
+        for f in findings:
+            r = f.get("rule_id", "?")
+            by_rule[r] = by_rule.get(r, 0) + 1
+        return {
+            "ok": True,
+            "total": len(findings),
+            "by_rule": by_rule,
+            "findings": findings,
+            "note": (
+                "CWE-532: Insertion of Sensitive Information into Log File. "
+                "Rotate any exposed keys immediately."
+            ),
+        }
+
     # ══════════════════════════════════════════════════════════════════════════
     # DISCOVERY + COMPOSITE TOOLS
     # These are the entry points — call these first, not individual tools.
@@ -1723,6 +1860,7 @@ def register_all_new_tools(
             "tools": {
                 "graph_scan_secrets": "Scan for hardcoded secrets and credentials",
                 "graph_sast_findings": "Static analysis security findings by language",
+                "graph_log_secret_leakage": "Secret vars (tokens/keys) interpolated into log calls — CWE-532",
                 "graph_scan_vulnerabilities": "OSV vulnerability scan of dependencies",
                 "graph_license_audit": "License compliance audit",
                 "graph_iac_security": "IaC misconfiguration scan (Terraform, K8s, CDK)",
@@ -1746,7 +1884,10 @@ def register_all_new_tools(
             "description": "Operational health: connection pools, health endpoints, port conflicts, race conditions",
             "tools": {
                 "graph_connection_pool_misconfigs": "DB pools without max size or hardcoded connection strings",
+                "graph_config_misconfigs": "PgBouncer/Kafka/HikariCP config file dangerous defaults",
                 "graph_health_checks": "Missing /health endpoints and K8s readinessProbe",
+                "graph_goroutine_leaks": "Go context.WithCancel cancel not deferred, goroutines in loops",
+                "graph_cache_stampede": "Cache GET without singleflight/mutex, TTL=0, SET without expiry",
                 "graph_port_conflicts": "Same port bound in multiple files",
                 "graph_race_conditions": "Heuristic race condition detection (Go/Python/JS)",
                 "graph_unused_env_vars": "Env vars declared in .env but never used",
@@ -1932,11 +2073,19 @@ def register_all_new_tools(
         except Exception:
             pass
 
+        # Log secret leakage (CWE-532)
+        try:
+            from security import scan_log_secret_leakage as _log_secrets  # type: ignore
+            results = _log_secrets(root)
+            all_findings += [dict(f, rule_id=f.get("rule_id", "LOG"), severity=f.get("severity", "high")) for f in results]
+        except Exception:
+            pass
+
         punch = _make_punch_list(all_findings)
         return {
             "ok": True,
             "total_findings": len(all_findings),
-            "categories_run": ["secrets", "sast", "iac_misconfigs", "idempotency", "migrations"],
+            "categories_run": ["secrets", "sast", "log_leakage", "iac_misconfigs", "idempotency", "migrations"],
             "top10_action_list": punch,
             "all_findings": all_findings,
         }
@@ -1985,7 +2134,10 @@ def register_all_new_tools(
 
         checks = [
             ("find_connection_pool_misconfigs", "structural_bugs"),
+            ("find_config_file_misconfigs", "structural_bugs"),
             ("find_missing_health_checks", "structural_bugs"),
+            ("find_goroutine_leaks", "structural_bugs"),
+            ("find_cache_stampede_risks", "structural_bugs"),
             ("find_port_conflicts", "structural_bugs"),
             ("find_race_conditions", "structural_bugs"),
             ("find_unused_env_vars", "structural_bugs"),
@@ -2004,7 +2156,11 @@ def register_all_new_tools(
         return {
             "ok": True,
             "total_findings": len(all_findings),
-            "categories_run": ["pool_misconfigs", "health_checks", "port_conflicts", "race_conditions", "env_vars"],
+            "categories_run": [
+                "pool_misconfigs", "config_files", "health_checks",
+                "goroutine_leaks", "cache_stampede",
+                "port_conflicts", "race_conditions", "env_vars",
+            ],
             "top10_action_list": punch,
             "all_findings": all_findings,
         }

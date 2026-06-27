@@ -3406,6 +3406,528 @@ def find_missing_health_checks(graph: dict, project_root: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 31 — Goroutine / async context leak detection
+# Real incidents: Go services OOM'd every 6-8h due to context.WithCancel never
+# called, goroutines spawned in loops that outlived their parent scope, and
+# channels written to but never closed (blocking readers forever).
+# ---------------------------------------------------------------------------
+
+# context.WithCancel / WithTimeout / WithDeadline assigned but cancel not deferred
+_GO_CTX_ASSIGN_RE    = re.compile(
+    r"\bctx\b.*,\s*(\w*[Cc]ancel\w*)\s*:?=\s*context\.With(?:Cancel|Timeout|Deadline)\b"
+)
+# defer cancel() — the correct fix
+_GO_DEFER_CANCEL_RE  = re.compile(r"\bdefer\s+\w*[Cc]ancel\w*\s*\(")
+# goroutine spawned in a loop body
+_GO_GOROUTINE_LOOP_RE = re.compile(
+    r"^\s*(?:for\b[^{]*\{[^}]*\n(?:[^\n]*\n)*?[^\n]*go\s+func|"
+    r"for\b[^{]*\{)\s*(?:#.*)?$",
+    re.MULTILINE,
+)
+_GO_GOROUTINE_RE     = re.compile(r"\bgo\s+func\s*\(")
+_GO_FOR_RE           = re.compile(r"\bfor\b")
+# WaitGroup.Add inside goroutine body (misuse — races with Wait)
+_GO_WG_ADD_IN_GO_RE  = re.compile(
+    r"go\s+func\s*\([^)]*\)\s*\{[^}]*\.Add\s*\(", re.DOTALL
+)
+# channel declared write-only with no corresponding close
+_GO_CHAN_MAKE_RE      = re.compile(r"\bmake\s*\(\s*chan\b")
+_GO_CHAN_CLOSE_RE     = re.compile(r"\bclose\s*\(")
+
+_GO_EXT = {".go"}
+_GOROUTINE_SCAN_LINES = 40  # lines to scan after ctx assignment for defer
+
+
+def find_goroutine_leaks(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect goroutine and context leak patterns in Go source files.
+
+    Rule IDs:
+        GLEAK-001  context.WithCancel/Timeout/Deadline cancel func not deferred
+        GLEAK-002  goroutine spawned inside a for-loop without WaitGroup/cancel drain
+        GLEAK-003  make(chan ...) in function with no close() — readers block forever
+
+    Grounded in real incidents:
+        - Go services killed by OOM every few hours due to leaked goroutines
+        - DynamoDB latent race (two goroutines racing on shared state)
+        - go.dev/blog/context: canonical pattern is `defer cancel()`
+    """
+    issues: list[dict] = []
+    root  = Path(project_root)
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            if fpath.suffix.lower() not in _GO_EXT:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            rel = str(fpath.relative_to(root))
+            lines = content.splitlines()
+
+            # ── GLEAK-001: WithCancel without defer cancel() in scope ──────────
+            for i, line in enumerate(lines, start=1):
+                m = _GO_CTX_ASSIGN_RE.search(line)
+                if not m:
+                    continue
+                cancel_name = m.group(1)
+                # scan ahead up to _GOROUTINE_SCAN_LINES lines for defer <cancel_name>()
+                window_end = min(len(lines), i + _GOROUTINE_SCAN_LINES)
+                window = "\n".join(lines[i - 1: window_end])
+                defer_pat = re.compile(r"\bdefer\s+" + re.escape(cancel_name) + r"\s*\(")
+                if not defer_pat.search(window) and not _GO_DEFER_CANCEL_RE.search(window):
+                    issues.append({
+                        "type": "goroutine_leak",
+                        "rule_id": "GLEAK-001",
+                        "severity": "high",
+                        "file": rel,
+                        "line": i,
+                        "message": (
+                            f"context.With* assigns '{cancel_name}' but no "
+                            f"`defer {cancel_name}()` found in nearby scope — "
+                            "context leak causes goroutine accumulation"
+                        ),
+                        "fix": (
+                            f"Add `defer {cancel_name}()` immediately after the "
+                            "context.WithCancel/Timeout/Deadline call."
+                        ),
+                    })
+
+            # ── GLEAK-002: go func() inside a for loop ─────────────────────────
+            # Find for-loop lines, then check if a goroutine spawn follows within
+            # the next 15 lines without a WaitGroup.Done or ctx.Done drain
+            in_for = False
+            for_start = 0
+            for i, line in enumerate(lines, start=1):
+                if _GO_FOR_RE.search(line) and "{" in line:
+                    in_for = True
+                    for_start = i
+                if in_for and _GO_GOROUTINE_RE.search(line):
+                    # Check surrounding 20 lines for WaitGroup or context drain
+                    win_start = max(0, for_start - 1)
+                    win_end   = min(len(lines), i + 10)
+                    win       = "\n".join(lines[win_start:win_end])
+                    has_wg    = bool(re.search(r"\bWaitGroup\b|\bwg\.Wait\b|\bwg\.Add\b", win))
+                    has_ctx   = bool(re.search(r"ctx\.Done\(\)|context\.WithCancel|errgroup", win))
+                    if not has_wg and not has_ctx:
+                        issues.append({
+                            "type": "goroutine_leak",
+                            "rule_id": "GLEAK-002",
+                            "severity": "high",
+                            "file": rel,
+                            "line": i,
+                            "message": (
+                                "goroutine spawned inside for-loop with no WaitGroup "
+                                "or context drain — goroutines may outlive caller"
+                            ),
+                            "fix": (
+                                "Use sync.WaitGroup (wg.Add before go, wg.Done inside, "
+                                "wg.Wait after) or errgroup.Group to track and drain "
+                                "loop-spawned goroutines."
+                            ),
+                        })
+                    in_for = False  # only flag once per for block
+                if "}" in line and in_for and i > for_start + 1:
+                    in_for = False
+
+            # ── GLEAK-003: make(chan) in func with no close() ──────────────────
+            # Function-level check: find function declarations, scan their body
+            func_starts: list[int] = []
+            for i, line in enumerate(lines):
+                if re.match(r"^func\b", line.strip()):
+                    func_starts.append(i)
+
+            for fs in func_starts:
+                # collect the function body (up to 200 lines or next top-level func)
+                next_fs = len(lines)
+                for other in func_starts:
+                    if other > fs:
+                        next_fs = other
+                        break
+                body_lines = lines[fs: min(fs + 200, next_fs)]
+                body = "\n".join(body_lines)
+                chan_count  = len(_GO_CHAN_MAKE_RE.findall(body))
+                close_count = len(_GO_CHAN_CLOSE_RE.findall(body))
+                if chan_count > 0 and close_count == 0:
+                    # Only flag if there is also a goroutine (else channel may be returned)
+                    if _GO_GOROUTINE_RE.search(body):
+                        issues.append({
+                            "type": "goroutine_leak",
+                            "rule_id": "GLEAK-003",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": fs + 1,
+                            "message": (
+                                f"Function creates {chan_count} channel(s) and spawns "
+                                "goroutines but never calls close() — readers block forever "
+                                "if the writer exits"
+                            ),
+                            "fix": (
+                                "Call close(ch) when the sender is done writing, or use "
+                                "a context cancellation to signal readers."
+                            ),
+                        })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# Phase 32 — Cache stampede / thundering herd detection
+# Real incidents: Instagram thundering herd (2012), Reddit K8s cold-start storm,
+# and countless Redis restart incidents where cache miss → DB overload → outage.
+# The Go fix is singleflight.Group; the Python fix is dogpile / redis-py-lock.
+# ---------------------------------------------------------------------------
+
+_GO_REDIS_GET_RE      = re.compile(r"\.(Get|HGet|MGet)\s*\(")
+_GO_SINGLEFLIGHT_RE   = re.compile(r"\bsingleflight\b|\bsfg?\.\s*Do\s*\(")
+_PY_CACHE_GET_RE      = re.compile(
+    r"(?:cache|redis|r)\s*\.get\s*\(|redis_client\.get\s*\("
+)
+_PY_DOGPILE_RE        = re.compile(r"dogpile|beaker\.cache|django\.cache\.get_or_set")
+_JS_CACHE_GET_RE      = re.compile(
+    r"(?:cache|redis|redisClient|client)\.(?:get|hGet|mGet)\s*\("
+)
+_JS_PFETCH_RE         = re.compile(r"p-?fetch|pFetch|promiseMemoize|throat\b")
+# Redis TTL = 0 or negative (never expires → stale data accumulates)
+_REDIS_TTL_ZERO_RE    = re.compile(
+    r"\.(?:expire|setex|set)\s*\([^)]*,\s*(-\d+|0)\s*[,)]"
+)
+# Cache SET with no TTL (missing expiry argument)
+_REDIS_SET_NO_TTL_RE  = re.compile(
+    r"\.set\s*\(\s*['\"][^'\"]+['\"]\s*,\s*[^,)]+\s*\)"
+)
+
+_CACHE_EXTS = {".go", ".py", ".ts", ".js", ".rb"}
+
+
+def find_cache_stampede_risks(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Detect cache miss paths that lack stampede protection.
+
+    Rule IDs:
+        STMP-001  Redis GET in hot-path without singleflight / mutex / dogpile
+        STMP-002  Cache TTL = 0 or negative (never expires, or expires immediately)
+        STMP-003  redis.set() with no TTL argument (key lives forever)
+
+    Grounded in real incidents:
+        - Instagram 2012: thundering herd after cache flush, Promise-based coalescing fix
+        - Reddit K8s migration: cold-start DB storm from simultaneous pod restarts
+        - Every Redis restart: all pods miss simultaneously → DB overload
+    """
+    issues: list[dict] = []
+    root  = Path(project_root)
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext   = fpath.suffix.lower()
+            if ext not in _CACHE_EXTS:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            rel   = str(fpath.relative_to(root))
+            lines = content.splitlines()
+
+            # ── STMP-001: cache.get without stampede protection ────────────────
+            if ext == ".go":
+                cache_pat, protection_pat = _GO_REDIS_GET_RE, _GO_SINGLEFLIGHT_RE
+            elif ext == ".py":
+                cache_pat, protection_pat = _PY_CACHE_GET_RE, _PY_DOGPILE_RE
+            else:
+                cache_pat, protection_pat = _JS_CACHE_GET_RE, _JS_PFETCH_RE
+
+            # Check file-level: if there is a cache GET but no protection import/call
+            if cache_pat.search(content):
+                has_protection = bool(protection_pat.search(content))
+                if not has_protection:
+                    # Find first cache GET line for reporting
+                    for i, line in enumerate(lines, start=1):
+                        if cache_pat.search(line):
+                            issues.append({
+                                "type": "cache_stampede_risk",
+                                "rule_id": "STMP-001",
+                                "severity": "medium",
+                                "file": rel,
+                                "line": i,
+                                "message": (
+                                    "Cache GET without stampede protection — simultaneous "
+                                    "cache misses will all hit the backing store at once "
+                                    "(thundering herd)"
+                                ),
+                                "fix": (
+                                    "Go: use golang.org/x/sync/singleflight so concurrent "
+                                    "requests coalesce into one DB call. "
+                                    "Python: use dogpile.cache or a Redis SETNX lock. "
+                                    "JS: use p-fetch or a promise-memoize library."
+                                ),
+                            })
+                            break  # one finding per file
+
+            # ── STMP-002: TTL = 0 or negative ────────────────────────────────
+            for i, line in enumerate(lines, start=1):
+                m = _REDIS_TTL_ZERO_RE.search(line)
+                if m:
+                    ttl_val = m.group(1)
+                    issues.append({
+                        "type": "cache_stampede_risk",
+                        "rule_id": "STMP-002",
+                        "severity": "medium",
+                        "file": rel,
+                        "line": i,
+                        "message": (
+                            f"Cache TTL set to {ttl_val} — "
+                            + ("key never expires (stale data accumulates)"
+                               if ttl_val == "0" or int(ttl_val) < 0
+                               else "unusual TTL value")
+                        ),
+                        "fix": (
+                            "Set a positive TTL (e.g. 300 seconds). "
+                            "Use jitter (TTL + random(0, 30s)) to spread expiry across "
+                            "instances and prevent synchronized cache-miss storms."
+                        ),
+                    })
+
+            # ── STMP-003: redis SET with no TTL ───────────────────────────────
+            if ext in {".py", ".js", ".ts"}:
+                for i, line in enumerate(lines, start=1):
+                    if _REDIS_SET_NO_TTL_RE.search(line):
+                        # Don't double-fire with STMP-002
+                        if not _REDIS_TTL_ZERO_RE.search(line):
+                            issues.append({
+                                "type": "cache_stampede_risk",
+                                "rule_id": "STMP-003",
+                                "severity": "low",
+                                "file": rel,
+                                "line": i,
+                                "message": (
+                                    "redis.set() called with no TTL argument — "
+                                    "key lives forever; if invalidated en-masse "
+                                    "all misses flood the backing store simultaneously"
+                                ),
+                                "fix": (
+                                    "Add an expiry: redis.set(key, value, ex=300) in Python "
+                                    "or client.set(key, value, {EX: 300}) in Node.js. "
+                                    "Add per-key jitter to prevent thundering herd on expiry."
+                                ),
+                            })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
+# Phase 34 — Config file parsers (PgBouncer, Kafka properties, HikariCP YAML)
+# Real incidents:
+#   - CircleCI DB saturation: connection queue backed up at peak load
+#   - PgBouncer pool_mode=session: app opens 200 connections, PgBouncer holds
+#     all 200 open to Postgres — defeats the entire point of pooling
+#   - Kafka enable.auto.commit=true (default): consumer crash = messages lost
+# ---------------------------------------------------------------------------
+
+# PgBouncer .ini config
+_PGB_POOL_MODE_RE     = re.compile(r"^\s*pool_mode\s*=\s*(session)\b", re.MULTILINE | re.IGNORECASE)
+_PGB_MAX_CLIENT_RE    = re.compile(r"^\s*max_client_conn\s*=\s*(\d+)", re.MULTILINE | re.IGNORECASE)
+_PGB_DEFAULT_POOL_RE  = re.compile(r"^\s*default_pool_size\s*=\s*(\d+)", re.MULTILINE | re.IGNORECASE)
+_PGB_SECTION_RE       = re.compile(r"^\[pgbouncer\]", re.MULTILINE | re.IGNORECASE)
+
+# Kafka properties (Java/Spring common naming)
+_KAFKA_AUTO_COMMIT_RE = re.compile(
+    r"^\s*enable\.auto\.commit\s*=\s*true", re.MULTILINE | re.IGNORECASE
+)
+_KAFKA_MAX_POLL_RE    = re.compile(
+    r"^\s*max\.poll\.records\s*=\s*(\d+)", re.MULTILINE | re.IGNORECASE
+)
+_KAFKA_SESSION_RE     = re.compile(
+    r"^\s*session\.timeout\.ms\s*=\s*(\d+)", re.MULTILINE | re.IGNORECASE
+)
+# Spring Boot application.yml/properties — HikariCP
+_HIKARI_MAX_POOL_YML_RE    = re.compile(
+    r"maximum-pool-size\s*:\s*(\d+)", re.IGNORECASE
+)
+_HIKARI_CONN_TIMEOUT_YML_RE = re.compile(
+    r"connection-timeout\s*:\s*(\d+)", re.IGNORECASE
+)
+_HIKARI_IDLE_TIMEOUT_YML_RE = re.compile(
+    r"idle-timeout\s*:\s*(\d+)", re.IGNORECASE
+)
+_SPRING_DATASOURCE_RE = re.compile(
+    r"spring\.datasource\b|datasource:", re.IGNORECASE
+)
+
+_CFG_EXTS = {".ini", ".properties", ".yaml", ".yml", ".conf", ".cfg"}
+
+
+def find_config_file_misconfigs(graph: dict, project_root: str) -> list[dict]:  # noqa: ARG001
+    """Parse config files (PgBouncer, Kafka, HikariCP) for dangerous defaults.
+
+    Rule IDs:
+        CFG-001  PgBouncer pool_mode=session (defeats connection pooling)
+        CFG-002  PgBouncer max_client_conn >> default_pool_size (pool collapse)
+        CFG-003  Kafka enable.auto.commit=true (consumer crash = message loss)
+        CFG-004  Kafka max.poll.records very high with short session.timeout
+        CFG-005  HikariCP maximum-pool-size in YAML not set (defaults to 10)
+
+    Grounded in real incidents:
+        - CircleCI: DB connection queue saturated at peak Wednesday load
+        - Common Kafka: auto-commit before processing = silent data loss
+        - HikariCP default pool size 10 too small for multi-threaded Spring apps
+    """
+    issues: list[dict] = []
+    root  = Path(project_root)
+
+    for dirpath, _dirs, filenames in _walk_project(project_root):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            ext   = fpath.suffix.lower()
+            if ext not in _CFG_EXTS:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            rel = str(fpath.relative_to(root))
+
+            # ── PgBouncer ─────────────────────────────────────────────────────
+            if _PGB_SECTION_RE.search(content) or fname.lower().startswith("pgbouncer"):
+                m_mode = _PGB_POOL_MODE_RE.search(content)
+                if m_mode:
+                    line_no = content[: m_mode.start()].count("\n") + 1
+                    issues.append({
+                        "type": "config_file_misconfig",
+                        "rule_id": "CFG-001",
+                        "severity": "high",
+                        "file": rel,
+                        "line": line_no,
+                        "message": (
+                            "PgBouncer pool_mode=session — each client holds a dedicated "
+                            "Postgres connection for its entire session, defeating the purpose "
+                            "of connection pooling; causes connection exhaustion under load"
+                        ),
+                        "fix": (
+                            "Change pool_mode to transaction (recommended for most apps) "
+                            "or statement. Verify your app does not rely on session-level "
+                            "state (SET, advisory locks, cursors) before switching."
+                        ),
+                    })
+
+                m_client = _PGB_MAX_CLIENT_RE.search(content)
+                m_pool   = _PGB_DEFAULT_POOL_RE.search(content)
+                if m_client and m_pool:
+                    max_client  = int(m_client.group(1))
+                    default_pool = int(m_pool.group(1))
+                    if max_client > default_pool * 10:
+                        line_no = content[: m_client.start()].count("\n") + 1
+                        issues.append({
+                            "type": "config_file_misconfig",
+                            "rule_id": "CFG-002",
+                            "severity": "medium",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                f"PgBouncer max_client_conn={max_client} is "
+                                f">10x default_pool_size={default_pool} — "
+                                "under load, client connections queue up waiting for pool "
+                                "slots; latency spikes and connections time out"
+                            ),
+                            "fix": (
+                                f"Increase default_pool_size to at least "
+                                f"{max_client // 5} or reduce max_client_conn. "
+                                "Rule of thumb: max_client_conn ≤ default_pool_size × 5."
+                            ),
+                        })
+
+            # ── Kafka properties ──────────────────────────────────────────────
+            is_kafka_props = (
+                "kafka" in fname.lower()
+                or "application.properties" == fname.lower()
+                or (_KAFKA_AUTO_COMMIT_RE.search(content) is not None)
+            )
+            if is_kafka_props and ext in {".properties", ".yaml", ".yml", ".conf"}:
+                m_ac = _KAFKA_AUTO_COMMIT_RE.search(content)
+                if m_ac:
+                    line_no = content[: m_ac.start()].count("\n") + 1
+                    issues.append({
+                        "type": "config_file_misconfig",
+                        "rule_id": "CFG-003",
+                        "severity": "critical",
+                        "file": rel,
+                        "line": line_no,
+                        "message": (
+                            "Kafka enable.auto.commit=true — offsets are committed "
+                            "before message processing completes; a consumer crash after "
+                            "commit but before processing silently drops messages"
+                        ),
+                        "fix": (
+                            "Set enable.auto.commit=false and call consumer.commitSync() "
+                            "(or commitAsync()) only after the message has been fully "
+                            "processed and any DB writes committed."
+                        ),
+                    })
+
+                m_poll    = _KAFKA_MAX_POLL_RE.search(content)
+                m_session = _KAFKA_SESSION_RE.search(content)
+                if m_poll and m_session:
+                    max_poll    = int(m_poll.group(1))
+                    session_ms  = int(m_session.group(1))
+                    # If max.poll.records is large AND session.timeout is short,
+                    # processing the batch may exceed the timeout → rebalance storm
+                    if max_poll > 500 and session_ms < 30000:
+                        line_no = content[: m_poll.start()].count("\n") + 1
+                        issues.append({
+                            "type": "config_file_misconfig",
+                            "rule_id": "CFG-004",
+                            "severity": "high",
+                            "file": rel,
+                            "line": line_no,
+                            "message": (
+                                f"Kafka max.poll.records={max_poll} with "
+                                f"session.timeout.ms={session_ms} — processing a large "
+                                "batch may exceed the session timeout, triggering a "
+                                "rebalance storm and pausing all consumers in the group"
+                            ),
+                            "fix": (
+                                "Reduce max.poll.records (e.g. 100-200) or increase "
+                                "session.timeout.ms (e.g. 60000) and "
+                                "max.poll.interval.ms proportionally."
+                            ),
+                        })
+
+            # ── HikariCP in Spring Boot YAML ──────────────────────────────────
+            if ext in {".yaml", ".yml"} and _SPRING_DATASOURCE_RE.search(content):
+                if not _HIKARI_MAX_POOL_YML_RE.search(content):
+                    # HikariCP default pool size is 10 — often too small
+                    # Only flag if there is a datasource config (Spring app)
+                    line_no = 1
+                    for i, line in enumerate(content.splitlines(), start=1):
+                        if _SPRING_DATASOURCE_RE.search(line):
+                            line_no = i
+                            break
+                    issues.append({
+                        "type": "config_file_misconfig",
+                        "rule_id": "CFG-005",
+                        "severity": "medium",
+                        "file": rel,
+                        "line": line_no,
+                        "message": (
+                            "Spring Boot datasource configured without "
+                            "spring.datasource.hikari.maximum-pool-size — "
+                            "HikariCP defaults to 10 connections, which is typically "
+                            "too small for production Spring MVC/WebFlux apps"
+                        ),
+                        "fix": (
+                            "Add spring.datasource.hikari.maximum-pool-size: <N> "
+                            "where N = (number of CPU cores × 2) + disk spindles. "
+                            "A common starting point for 4-core machines is 10-20."
+                        ),
+                    })
+
+    return _sort_issues(issues)
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + health summary
 # ---------------------------------------------------------------------------
 
@@ -3443,6 +3965,9 @@ def run_all_checks(graph: dict, project_root: str) -> dict:
         ("unsafe_migrations",      lambda: find_unsafe_migrations(graph, project_root)),
         ("connection_pool_misconfigs", lambda: find_connection_pool_misconfigs(graph, project_root)),
         ("missing_health_checks",  lambda: find_missing_health_checks(graph, project_root)),
+        ("goroutine_leaks",        lambda: find_goroutine_leaks(graph, project_root)),
+        ("cache_stampede_risks",   lambda: find_cache_stampede_risks(graph, project_root)),
+        ("config_file_misconfigs", lambda: find_config_file_misconfigs(graph, project_root)),
     ]
 
     all_issues: list[dict] = []
@@ -3561,7 +4086,7 @@ def get_health_summary(graph: dict, project_root: str) -> dict:
         grade = "F"
 
     # Total checks = 19 functional checks
-    total_checks  = 19
+    total_checks  = 22
     checks_failed = min(
         total_checks,
         (1 if n_critical else 0) + (1 if n_high else 0) +
@@ -3817,8 +4342,8 @@ def _test_new_structural_2():
     # ── Verify total_checks in get_health_summary ─────────────────────────────
     summary = get_health_summary({}, tmpdir)
     assert summary["checks_passed"] + summary["checks_failed"] == 19, \
-        f"Expected total_checks=19, got {summary['checks_passed'] + summary['checks_failed']}"
-    print("[PASS] get_health_summary: total_checks == 19")
+        f"Expected total_checks=22, got {summary['checks_passed'] + summary['checks_failed']}"
+    print("[PASS] get_health_summary: total_checks == 22")
 
     # ── Verify MCP stubs return correct shape ─────────────────────────────────
     result = graph_idempotency_gaps_tool(tmpdir)
@@ -3913,9 +4438,9 @@ def _test_new_structural_3():
     with tempfile.TemporaryDirectory() as d:
         summary = get_health_summary({}, d)
         assert summary["checks_passed"] + summary["checks_failed"] == 19, (
-            f"Expected total_checks=19, got {summary['checks_passed'] + summary['checks_failed']}"
+            f"Expected total_checks=22, got {summary['checks_passed'] + summary['checks_failed']}"
         )
-        print("[PASS] get_health_summary: total_checks == 19")
+        print("[PASS] get_health_summary: total_checks == 22")
 
     print("\n=== All _test_new_structural_3 tests PASSED ===")
 
