@@ -38,6 +38,9 @@ cp "$RELEASE_DIR/bin/version.txt" "$STAGE/VERSION"
 cp "$PROJ_ROOT/bin/graph_gate.py" "$STAGE/graph_gate.py"
 cp "$PROJ_ROOT/bin/graph_sync.py" "$STAGE/graph_sync.py"
 
+# 4c. Subagent graph bridge (read-only CLI for worktree/subagents without MCP)
+cp "$PROJ_ROOT/bin/graph_query.py" "$STAGE/graph_query.py"
+
 # 5. Doctor script (diagnostic + auto-fix for MCP issues)
 mkdir -p "$STAGE/bin"
 cp "$RELEASE_DIR/bin/dgc-pro-doctor.py" "$STAGE/bin/"

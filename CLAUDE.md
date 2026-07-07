@@ -3,6 +3,32 @@
 
 **HARD RULE: Do NOT use Bash, Read, grep, rg, or any file tool until you have called `graph_continue` first. This is not optional.**
 
+## Subagent Graph Access (when MCP tools are unavailable)
+
+If you are a subagent and `graph_continue` / `graph_read` are NOT available as MCP tools
+(i.e., you only have Read/Write/Edit/Bash), use the CLI bridge instead:
+
+```bash
+python3 bin/graph_query.py read "src/auth.ts::handleLogin"   # read a symbol
+python3 bin/graph_query.py read "src/db.ts"                  # read full file
+python3 bin/graph_query.py symbols "src/auth.ts"             # list symbols in file
+python3 bin/graph_query.py neighbors "src/auth.ts"           # find connected files
+python3 bin/graph_query.py grep "handleLogin"                # search project
+```
+
+The CLI reads the graph store directly from disk — no server needed. It auto-discovers
+`.dual-graph-pro/` by walking up parent directories (works from worktrees).
+
+**Subagent rules:**
+- You do NOT need to call `graph_continue` — your parent already did and passed context.
+- Use `graph_query.py read` instead of raw `Read` for files mentioned in your task prompt.
+- The CLI is **read-only** — never modify `.dual-graph-pro/`.
+- If `bin/graph_query.py` is not found at relative path, try: `python3 "$(git worktree list --porcelain | head -1 | sed 's/^worktree //')/bin/graph_query.py"`
+
+**For parent agents spawning subagents:**
+Call `graph_continue` yourself BEFORE spawning the subagent. Include `recommended_files`
+in the subagent's prompt so it knows what to read.
+
 ## Required tool order — every single turn
 
 1. **Call `graph_continue` first** — before Bash, Read, grep, rg, or any file exploration.

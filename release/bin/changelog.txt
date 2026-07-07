@@ -1,3 +1,10 @@
+1.0.56  (2026-07-07)
+- Added: subagent graph bridge (bin/graph_query.py) — read-only CLI that gives
+  subagents/worktree agents access to the code graph without MCP. Auto-discovers
+  .dual-graph-pro/ by walking up parent dirs + git worktree resolution.
+- Updated: CLAUDE.md now includes conditional fallback instructions for subagents
+  that don't have MCP tools available. Main session workflow unchanged.
+
 1.0.53  (2026-06-17)
 - Fixed: stop hook no longer sends zero-savings telemetry when dgc-pro was
   never running (e.g. plain `claude` invocation). Send is now gated on

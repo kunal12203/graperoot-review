@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.56: subagent graph bridge — bin/graph_query.py gives worktree/subagents
+         read-only graph access without MCP. CLAUDE.md conditional fallback.
+
 v1.0.53: stop hook now skips telemetry send when dgc-pro was never running —
          no port file and no savings_cache means session ran outside dgc-pro,
          so all-zero rows are no longer written to NeonDB.
