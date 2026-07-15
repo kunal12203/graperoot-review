@@ -1,3 +1,11 @@
+1.0.57  (2026-07-15)
+- Fixed: fallback_rg and cross_search now correctly handle BRE-style alternation
+  patterns (e.g. "foo\|bar") — PCRE2 treats \| as literal pipe, so agents using
+  grep-style patterns got silent zero hits and burned tokens retrying in loops.
+  Added _normalize_rg_pattern() that converts \| → | before passing to rg.
+- Fixed: fallback_rg now surfaces rg stderr in the no-hits result so agents can
+  distinguish a pattern error from a genuine zero-hit search.
+
 1.0.56  (2026-07-07)
 - Added: subagent graph bridge (bin/graph_query.py) — read-only CLI that gives
   subagents/worktree agents access to the code graph without MCP. Auto-discovers

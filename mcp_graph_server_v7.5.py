@@ -818,6 +818,20 @@ def _fire_shadow_file_reads(source: str, hit_files: list[str], inlined_chars: in
     ).start()
 
 
+def _normalize_rg_pattern(pattern: str) -> str:
+    """Convert BRE-style \\| alternation to PCRE2 | alternation.
+
+    Agents frequently pass grep/BRE patterns like "foo\\|bar" expecting
+    alternation, but PCRE2 treats \\| as a literal pipe character so rg
+    returns exit 1 (no match) with no error message — silently wrong.
+
+    Only \\| is normalized. Other BRE escapes (\\( \\) \\+ \\?) intentionally
+    left alone: in PCRE2 they match the literal character, which is usually
+    what the agent wants when searching code.
+    """
+    return pattern.replace("\\|", "|")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2924,6 +2938,8 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                     seen.add(rel_dir)
                     graph_dirs.append(rel_dir)
 
+        pattern = _normalize_rg_pattern(pattern)
+
         def _run_rg(search_paths: list[str]) -> subprocess.CompletedProcess:
             base = ["rg", "-n", "-S", "--engine", "pcre2",
                     "-B2", "-A2",
@@ -3107,7 +3123,10 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             if hit_files_unique:
                 result["next_step"] = f"Call graph_read on: {hit_files_unique}"
             else:
+                rg_stderr = (proc.stderr.strip()[:300] if proc and proc.stderr else "")
                 result["next_step"] = "No hits found. Try a different search term."
+                if rg_stderr:
+                    result["rg_error"] = rg_stderr
         return result
 
     @mcp.tool()
@@ -3388,6 +3407,7 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             return {"ok": False, "error": f"path does not exist: {search_path}"}
 
         max_hits = min(int(max_hits or 50), 50)
+        pattern = _normalize_rg_pattern(pattern)
 
         def _run(target: str) -> subprocess.CompletedProcess:
             base = ["rg", "-n", "-S", "--engine", "pcre2",
@@ -3453,7 +3473,7 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             "hit_count": len(hits), "hit_files": sorted(hit_files)[:10],
         })
 
-        return {
+        result = {
             "ok": True,
             "pattern": pattern,
             "path": str(search_path),
@@ -3464,6 +3484,9 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
                 f"No hits. {search_path} registered — ls/find on this dir now allowed."
             ),
         }
+        if not hits and proc.stderr.strip():
+            result["rg_error"] = proc.stderr.strip()[:300]
+        return result
 
     @mcp.tool()
     def graph_add_memory(

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.57: fix fallback_rg — BRE-style \| alternation now normalized to PCRE2 |,
+         fixing silent zero-hit loops; rg_error field added for diagnosis.
+
 v1.0.56: subagent graph bridge — bin/graph_query.py gives worktree/subagents
          read-only graph access without MCP. CLAUDE.md conditional fallback.
 
