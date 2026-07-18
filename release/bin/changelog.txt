@@ -1,3 +1,7 @@
+1.0.58  (2026-07-18)
+- Fixed: SyntaxWarning on Python 3.12+ — \| in launch.py docstring replaced with
+  plain text description (invalid escape sequence in string literal)
+
 1.0.57  (2026-07-15)
 - Fixed: fallback_rg and cross_search now correctly handle BRE-style alternation
   patterns (e.g. "foo\|bar") — PCRE2 treats \| as literal pipe, so agents using
