@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# graperoot-grok — GrapeRoot Pro launcher for Grok CLI (xAI)
+set -euo pipefail
+INSTALL_DIR="${GRAPEROOT_PRO_HOME:-$HOME/.graperoot-pro}"
+exec "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/launch.py" "${1:-.}" --grok "${@:2}"

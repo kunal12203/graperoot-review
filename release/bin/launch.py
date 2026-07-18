@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.59: add Grok CLI support (--grok / graperoot-grok shim). Grok spawns claude
+         under the hood, so MCP + hooks work identically to --claude.
+
 v1.0.58: fix SyntaxWarning on Python 3.12+ — invalid escape sequence in docstring.
 
 v1.0.57: fix fallback_rg — BRE-style backslash-pipe alternation now normalized
@@ -912,6 +915,14 @@ def resolve_cursor() -> str:
     sys.exit("[graperoot-pro] `cursor` not found. Install from https://www.cursor.com")
 
 
+def resolve_grok() -> str:
+    for c in ("grok", "grok.cmd", "grok.exe"):
+        p = shutil.which(c)
+        if p:
+            return p
+    sys.exit("[graperoot-pro] `grok` CLI not found. Install: npm install -g grok-cli")
+
+
 def _local_version() -> str:
     vf = PRO_HOME / "bin" / "version.txt"
     if vf.exists():
@@ -1032,6 +1043,8 @@ def _detect_tool_from_argv(argv: list[str]) -> str:
             return "opencode"
         if a in ("--cursor", "cursor"):
             return "cursor"
+        if a in ("--grok", "grok"):
+            return "grok"
         if a in ("--claude", "claude"):
             return "claude"
     return "claude"
@@ -1040,7 +1053,7 @@ def _detect_tool_from_argv(argv: list[str]) -> str:
 def main() -> None:
     # Detect tool early so we can set prog name for help text
     tool = _detect_tool_from_argv(sys.argv[1:])
-    prog = {"claude": "dgc-pro", "codex": "dg-pro"}.get(tool, "graperoot-pro")
+    prog = {"claude": "dgc-pro", "codex": "dg-pro", "grok": "graperoot-grok"}.get(tool, "graperoot-pro")
 
     ap = argparse.ArgumentParser(prog=prog,
         description=f"GrapeRoot Pro — dual-graph context engine. Tool: {tool}.")
@@ -1056,6 +1069,7 @@ def main() -> None:
     ap.add_argument("--gemini", dest="_tool", action="store_const", const="gemini")
     ap.add_argument("--opencode", dest="_tool", action="store_const", const="opencode")
     ap.add_argument("--cursor", dest="_tool", action="store_const", const="cursor")
+    ap.add_argument("--grok", dest="_tool", action="store_const", const="grok")
     # Claude-specific passthrough flags (prevent positional confusion)
     ap.add_argument("--resume", "-r", dest="_resume", default=None)
     ap.add_argument("--model", dest="_model", default=None)
@@ -1079,7 +1093,7 @@ def main() -> None:
         if args._system_prompt:
             passthrough = ["--system-prompt", args._system_prompt] + passthrough
 
-    label = {"claude": "dgc-pro", "codex": "dg-pro"}.get(tool, "graperoot-pro")
+    label = {"claude": "dgc-pro", "codex": "dg-pro", "grok": "graperoot-grok"}.get(tool, "graperoot-pro")
 
     cleanup_orphan_servers()
 
@@ -1126,7 +1140,7 @@ def main() -> None:
         checks.append(("Graph gate script", (PRO_HOME / "graph_gate.py").exists()))
         checks.append(("Graph sync script", (PRO_HOME / "graph_sync.py").exists()))
         # Check CLI tool availability
-        tool_name = {"claude": "claude", "codex": "codex", "gemini": "gemini", "opencode": "opencode", "cursor": "cursor"}.get(tool, "claude")
+        tool_name = {"claude": "claude", "codex": "codex", "gemini": "gemini", "opencode": "opencode", "cursor": "cursor", "grok": "grok"}.get(tool, "claude")
         checks.append((f"CLI ({tool_name})", shutil.which(tool_name) is not None))
         # Print results
         all_ok = True
@@ -1194,6 +1208,12 @@ def main() -> None:
         mcp_cfg = write_mcp_config(project, data_dir, port)
         print(f"[{label}] graperoot-pro registered in {mcp_cfg}", flush=True)
         doc, action = write_claude_md(project)
+    elif tool == "grok":
+        # Grok CLI spawns `claude` under the hood (proxy → ANTHROPIC_BASE_URL).
+        # Claude Code reads .mcp.json and fires hooks normally — identical to claude path.
+        mcp_cfg = write_mcp_config(project, data_dir, port)
+        print(f"[{label}] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
+        doc, action = write_claude_md(project)
     else:  # claude (default)
         mcp_cfg = write_mcp_config(project, data_dir, port)
         print(f"[{label}] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
@@ -1204,9 +1224,10 @@ def main() -> None:
     elif action == "prepended":
         print(f"[{label}] dual-graph policy prepended to existing {doc.name}", flush=True)
 
-    # Hooks: Claude uses write_hooks(), Gemini already called write_gemini_hooks() above.
+    # Hooks: Claude and Grok use write_hooks() — Grok spawns claude so hooks fire normally.
+    # Gemini already called write_gemini_hooks() above.
     # Codex and opencode have no hook mechanism — policy doc is the only enforcement.
-    if tool == "claude":
+    if tool in ("claude", "grok"):
         write_hooks(project, data_dir)
         write_stop_hook(project, port)
 
@@ -1223,6 +1244,9 @@ def main() -> None:
     elif tool == "cursor":
         cli = resolve_cursor()
         exit_code = subprocess.call([cli, str(project)] + passthrough)
+    elif tool == "grok":
+        cli = resolve_grok()
+        exit_code = subprocess.call([cli] + passthrough, cwd=str(project))
     else:  # claude
         cli = resolve_claude()
         exit_code = subprocess.call([cli] + passthrough, cwd=str(project))

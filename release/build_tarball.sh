@@ -48,7 +48,7 @@ cp "$RELEASE_DIR/bin/dgc-pro-doctor"    "$STAGE/bin/"
 chmod +x "$STAGE/bin/dgc-pro-doctor"
 
 # 5b. Shims — call launch.py directly (not launch_pro.sh which is not in tarball)
-for shim in dgc-pro dg-pro graperoot-pro; do
+for shim in dgc-pro dg-pro graperoot-pro graperoot-grok; do
   cp "$RELEASE_DIR/bin/$shim" "$STAGE/bin/$shim"
   chmod +x "$STAGE/bin/$shim"
 done

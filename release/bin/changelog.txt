@@ -1,3 +1,9 @@
+1.0.59  (2026-07-18)
+- Added: Grok CLI support via --grok flag and graperoot-grok shim.
+  Grok spawns claude under the hood (xAI proxy → ANTHROPIC_BASE_URL), so
+  .mcp.json, CLAUDE.md, and Claude Code hooks (PreToolUse/Stop) all work
+  identically to --claude. Usage: graperoot-grok . or dgc-pro . --grok
+
 1.0.58  (2026-07-18)
 - Fixed: SyntaxWarning on Python 3.12+ — \| in launch.py docstring replaced with
   plain text description (invalid escape sequence in string literal)
