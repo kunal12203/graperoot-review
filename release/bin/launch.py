@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.60: fix UnboundLocalError in fallback_rg when symbol_index.json absent —
+         symbol_bodies/skipped_large now initialized before sym_idx guard.
+
 v1.0.59: add Grok CLI support (--grok / graperoot-grok shim). Grok spawns claude
          under the hood, so MCP + hooks work identically to --claude.
 

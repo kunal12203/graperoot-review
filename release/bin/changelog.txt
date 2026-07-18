@@ -1,3 +1,8 @@
+1.0.60  (2026-07-18)
+- Fixed: UnboundLocalError in fallback_rg when symbol_index.json is absent.
+  symbol_bodies and skipped_large are now initialized before the sym_idx guard,
+  not inside it. Previously caused a crash on fresh projects without a symbol index.
+
 1.0.59  (2026-07-18)
 - Added: Grok CLI support via --grok flag and graperoot-grok shim.
   Grok spawns claude under the hood (xAI proxy → ANTHROPIC_BASE_URL), so

@@ -2985,6 +2985,8 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         # ── Symbol contextualization ──────────────────────────────────────
         # Map each hit to its enclosing symbol and optionally include bodies
         sym_idx = _load_symbol_index()
+        symbol_bodies: list[dict[str, Any]] = []
+        skipped_large: list[str] = []
         if sym_idx and hits:
             # Build per-file symbol ranges for fast lookup
             file_symbols: dict[str, list[tuple[int, int, str]]] = {}
@@ -3015,8 +3017,6 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             # Include full bodies for top hit symbols (budget-tracked)
             # Cap: skip symbols > 80 lines (too large, agent should graph_read those)
             MAX_BODY_LINES = 80
-            symbol_bodies: list[dict[str, Any]] = []
-            skipped_large: list[str] = []
             if include_symbol_bodies and seen_symbols:
                 budget_used = int(TURN_STATE.get("used_chars", 0))
                 budget_max = int(TURN_STATE.get("char_budget", 60000))
