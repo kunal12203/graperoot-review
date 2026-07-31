@@ -1,10 +1,12 @@
 import {
   claimWelcomeEmail,
+  findByEmail,
   getLicense,
   insertAudit,
   isExpired,
   issueLicenseRecord,
   licenseStats,
+  linkSubscription,
   listLicenses,
   markWelcomeEmailSent,
   recordActivation,
@@ -455,10 +457,14 @@ async function handleLemonSqueezyWebhook(req, env) {
   const data = body.data || {};
   const attrs = data.attributes || {};
   const event = req.headers.get("X-Event-Name") || meta.event_name || "";
-  const subId = String(data.id || "").trim();
+  // For payment events, data.id is the invoice ID; the real subscription ID is in attributes
+  const isPaymentEvent = event.startsWith("subscription_payment_");
+  const subId = String(
+    isPaymentEvent ? (attrs.subscription_id || data.id || "") : (data.id || "")
+  ).trim();
   const eventId = String(
     meta.webhook_id || meta.event_id || body.id ||
-    `${event}:${subId}:${attrs.updated_at || attrs.created_at || attrs.status || ""}`,
+    `${event}:${data.id}:${attrs.updated_at || attrs.created_at || attrs.status || ""}`,
   );
 
   if (env.LEMONSQUEEZY_VARIANT_ID) {
@@ -490,6 +496,26 @@ async function handleLemonSqueezyWebhook(req, env) {
     const isTrial = !!trialEndsAt;
     if (!email) return jsonResp({ ok: false, error: "missing user_email" }, 400);
 
+    const renewsAt = attrs.renews_at || "";
+    const expires = isTrial
+      ? dateOnlyString(trialEndsAt)
+      : (renewsAt ? dateOnlyString(new Date(new Date(renewsAt).getTime() + 86400000)) : "perpetual");
+
+    // Phase 2: reuse existing key for same email instead of issuing a new one
+    const existing = await findByEmail(env, email);
+    if (existing) {
+      // Link new subscription to existing key, reactivate it
+      await linkSubscription(env, existing.key, subId);
+      const fields = { revoked: false, tier: "pro" };
+      // Don't downgrade perpetual to date-based
+      if (existing.expires !== "perpetual") fields.expires = expires;
+      const record = await updateLicenseFields(env, existing.key, fields);
+      await audit(env, req, "lemonsqueezy_subscription_reactivated", {
+        key: existing.key, email, subId, trial: isTrial,
+      });
+      return jsonResp({ ok: true, key: existing.key, reactivated: true, is_trial: isTrial });
+    }
+
     const key = generateKey();
     const record = await upsertSubscriptionLicense(env, {
       key,
@@ -497,7 +523,7 @@ async function handleLemonSqueezyWebhook(req, env) {
       email,
       tier: "pro",
       seats: 3,
-      expires: isTrial ? dateOnlyString(trialEndsAt) : "perpetual",
+      expires,
       issued: new Date().toISOString().slice(0, 10),
       revoked: false,
       activations: [],
@@ -538,21 +564,76 @@ async function handleLemonSqueezyWebhook(req, env) {
   }
 
   if (event === "subscription_payment_success") {
-    const record = await setSubscriptionState(env, subId, { tier: "pro", expires: "perpetual", revoked: false });
-    await audit(env, req, "lemonsqueezy_payment_success", { subId, key: record?.key || "" });
-    return jsonResp({ ok: true, event: "payment_success" });
+    const renewsAt = attrs.renews_at || "";
+    const expires = renewsAt ? dateOnlyString(new Date(new Date(renewsAt).getTime() + 86400000)) : null;
+    const fields = { tier: "pro", revoked: false };
+    if (expires) fields.expires = expires;
+    const record = await setSubscriptionState(env, subId, fields);
+    await audit(env, req, "lemonsqueezy_payment_success", { subId, key: record?.key || "", expires });
+    return jsonResp({ ok: true, event: "payment_success", key: record?.key || "", expires });
+  }
+
+  if (event === "subscription_payment_failed") {
+    await audit(env, req, "lemonsqueezy_payment_failed", { subId });
+    return jsonResp({ ok: true, event: "payment_failed" });
+  }
+
+  if (event === "subscription_payment_refunded") {
+    const record = await setSubscriptionState(env, subId, { revoked: true });
+    await audit(env, req, "lemonsqueezy_payment_refunded", { subId, key: record?.key || "" });
+    return jsonResp({ ok: true, event: "payment_refunded", key: record?.key || "" });
+  }
+
+  if (event === "subscription_expired") {
+    const record = await setSubscriptionState(env, subId, { revoked: true });
+    await audit(env, req, "lemonsqueezy_expired", { subId, key: record?.key || "" });
+    return jsonResp({ ok: true, event: "expired", key: record?.key || "" });
   }
 
   if (event === "subscription_cancelled") {
-    const record = await setSubscriptionState(env, subId, { revoked: true });
-    await audit(env, req, "lemonsqueezy_cancelled", { subId, key: record?.key || "" });
+    // User cancelled but already paid for current period — let them keep access until renews_at + 1 day
+    const renewsAt = attrs.renews_at || attrs.ends_at || "";
+    const fields = {};
+    if (renewsAt) {
+      fields.expires = dateOnlyString(new Date(new Date(renewsAt).getTime() + 86400000));
+    } else {
+      fields.revoked = true;
+    }
+    const record = await setSubscriptionState(env, subId, fields);
+    await audit(env, req, "lemonsqueezy_cancelled", { subId, key: record?.key || "", expires: fields.expires || null });
     return jsonResp({ ok: true, event: "cancelled" });
   }
 
   if (event === "subscription_resumed") {
-    const record = await setSubscriptionState(env, subId, { revoked: false });
-    await audit(env, req, "lemonsqueezy_resumed", { subId, key: record?.key || "" });
+    const renewsAt = attrs.renews_at || "";
+    const expires = renewsAt ? dateOnlyString(new Date(new Date(renewsAt).getTime() + 86400000)) : null;
+    const fields = { revoked: false };
+    if (expires) fields.expires = expires;
+    const record = await setSubscriptionState(env, subId, fields);
+    await audit(env, req, "lemonsqueezy_resumed", { subId, key: record?.key || "", expires });
     return jsonResp({ ok: true, event: "resumed" });
+  }
+
+  if (event === "subscription_updated") {
+    const status = attrs.status || "";
+    const renewsAt = attrs.renews_at || "";
+    if (status === "active" || status === "on_trial") {
+      const expires = renewsAt ? dateOnlyString(new Date(new Date(renewsAt).getTime() + 86400000)) : null;
+      const fields = { revoked: false };
+      if (expires) fields.expires = expires;
+      const record = await setSubscriptionState(env, subId, fields);
+      await audit(env, req, "lemonsqueezy_updated_active", { subId, status, key: record?.key || "", expires });
+      return jsonResp({ ok: true, event: "updated", status, expires });
+    }
+    if (status === "past_due" || status === "unpaid") {
+      await audit(env, req, "lemonsqueezy_updated_past_due", { subId, status });
+      return jsonResp({ ok: true, event: "updated", status });
+    }
+    if (status === "expired" || status === "cancelled") {
+      const record = await setSubscriptionState(env, subId, { revoked: true });
+      await audit(env, req, "lemonsqueezy_updated_terminal", { subId, status, key: record?.key || "" });
+      return jsonResp({ ok: true, event: "updated", status });
+    }
   }
 
   await audit(env, req, "lemonsqueezy_ignored", { event, subId });
@@ -651,7 +732,7 @@ async function dashboardLicense(req, env) {
 // Admin web dashboard (graperoot.dev/admin)
 // Auth: POST ADMIN_TOKEN to /v1/admin/web-login → grp_admin_session cookie.
 // ─────────────────────────────────────────────────────────────────────────
-const ADMIN_SESSION_TTL_S = 24 * 3600;
+const ADMIN_SESSION_TTL_S = 365 * 24 * 3600;
 
 async function adminWebLogin(req, env) {
   const cors = corsHeaders(req, env);
@@ -688,7 +769,11 @@ async function requireAdminWeb(req, env) {
 async function adminWebMe(req, env) {
   const cors = corsHeaders(req, env);
   if (!(await requireAdminWeb(req, env))) return jsonResp({ ok: false, error: "not authenticated" }, 401, cors);
-  return jsonResp({ ok: true, admin: true }, 200, cors);
+  // Re-issue a fresh JWT on every check so the session rolls forward
+  const now = Math.floor(Date.now() / 1000);
+  const jwt = await signSession({ admin: true, iat: now, exp: now + ADMIN_SESSION_TTL_S }, env.SESSION_SECRET);
+  const cookie = `grp_admin_session=${jwt}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ADMIN_SESSION_TTL_S}`;
+  return jsonResp({ ok: true, admin: true }, 200, { ...cors, "Set-Cookie": cookie });
 }
 
 async function adminWebListLicenses(req, env) {
