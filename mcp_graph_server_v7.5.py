@@ -4994,5 +4994,23 @@ echo "  dgc /path/to/project   # Claude Code (local MCP, fully private)"
     return 0
 
 
+def _main_stdio() -> int:
+    """stdio MCP transport — Codex/Claude spawn + own the lifecycle.
+
+    No port management, no orphan processes. Same pattern as filesystem/git MCPs.
+    Triggered by `mcp_graph_server_v7.5.py --stdio`.
+    """
+    DG_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _ping_license_server()
+    if FastMCP is None:
+        print("[graperoot-pro] FastMCP not installed; reinstall the venv", file=_sys.stderr)
+        return 1
+    mcp = build_server(host="127.0.0.1", port=0)
+    mcp.run("stdio")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--stdio" in _sys.argv:
+        raise SystemExit(_main_stdio())
     raise SystemExit(main())

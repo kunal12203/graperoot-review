@@ -1,3 +1,10 @@
+1.0.61  (2026-08-01)
+- Fixed: Codex MCP handshake failure caused by stale hardcoded port in config.toml.
+  write_codex_config now registers graperoot-pro as a stdio MCP server (via
+  `codex mcp add --env ... -- python server.py --stdio`). Codex manages the
+  server lifecycle — no port in config, never goes stale between sessions.
+- Added: --stdio transport mode for mcp_graph_server_v7.5.py.
+
 1.0.60  (2026-07-18)
 - Fixed: UnboundLocalError in fallback_rg when symbol_index.json is absent.
   symbol_bodies and skipped_large are now initialized before the sym_idx guard,

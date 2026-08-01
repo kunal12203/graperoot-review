@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.61: fix Codex MCP handshake failure — write_codex_config now registers as
+         stdio server (no hardcoded port). Added --stdio to mcp_graph_server_v7.5.
+
 v1.0.60: fix UnboundLocalError in fallback_rg when symbol_index.json absent —
          symbol_bodies/skipped_large now initialized before sym_idx guard.
 
@@ -428,31 +431,46 @@ def write_opencode_config(project: Path, port: int) -> Path:
     return cfg
 
 
-def write_codex_config(port: int) -> None:
+def write_codex_config(port: int, project: Path = None, data_dir: Path = None) -> None:
     """Inject graperoot-pro into Codex global MCP config (~/.codex/config.toml).
 
-    Codex uses TOML. Format:
-        [mcp_servers.graperoot-pro]
-        url = "http://127.0.0.1:PORT/mcp"
+    Registers a stdio-based MCP server that Codex spawns and manages.
+    The server reads DG_DATA_DIR from its environment to find the graph.
+    No port hardcoding — eliminates stale port errors permanently.
     """
-    import re
     codex_cfg = Path.home() / ".codex" / "config.toml"
     codex_cfg.parent.mkdir(exist_ok=True)
-    new_block = (
-        f'\n[mcp_servers.graperoot-pro]\n'
-        f'url = "http://127.0.0.1:{port}/mcp"\n'
-    )
+
+    server_script = PRO_HOME / "mcp_graph_server_v7.5.py"
+    python_bin = Path(sys.executable).as_posix()
+
+    # Remove any stale entry (url-based or command-based) via codex CLI
+    subprocess.run(["codex", "mcp", "remove", "graperoot-pro"], capture_output=True)
+
+    # Also strip from toml directly (belt and suspenders — handles entries
+    # codex CLI doesn't know about, e.g. manually edited config)
     if codex_cfg.exists():
+        import re
         content = codex_cfg.read_text(encoding="utf-8")
-        # Remove any stale graperoot-pro block (any port)
         content = re.sub(
-            r'\n\[mcp_servers\.graperoot-pro\]\nurl = "http://127\.0\.0\.1:\d+/mcp"\n',
-            "", content,
+            r'\n\[mcp_servers\.graperoot-pro\]\n[^\[]*',
+            "\n", content,
         )
-        content = content.rstrip("\n") + new_block
-    else:
-        content = new_block.lstrip("\n")
-    codex_cfg.write_text(content, encoding="utf-8")
+        codex_cfg.write_text(content.rstrip("\n") + "\n", encoding="utf-8")
+
+    # Register as stdio server with env vars so it finds the graph
+    env_args = []
+    if data_dir:
+        env_args += ["--env", f"DG_DATA_DIR={data_dir}"]
+    if project:
+        env_args += ["--env", f"DUAL_GRAPH_PROJECT_ROOT={project}"]
+
+    subprocess.run(
+        ["codex", "mcp", "add", "graperoot-pro"]
+        + env_args
+        + ["--", python_bin, str(server_script.as_posix()), "--stdio"],
+        capture_output=True,
+    )
 
 
 def write_gemini_config(project: Path, port: int) -> Path:
@@ -1195,8 +1213,8 @@ def main() -> None:
 
     # ── Per-tool MCP wiring + policy file ──────────────────────────────────
     if tool == "codex":
-        write_codex_config(port)
-        print(f"[{label}] graperoot-pro injected into ~/.codex/config.toml (port {port})", flush=True)
+        write_codex_config(port, project=project, data_dir=data_dir)
+        print(f"[{label}] graperoot-pro registered as stdio MCP in ~/.codex/config.toml", flush=True)
         doc, action = write_codex_md(project)
     elif tool == "gemini":
         mcp_cfg = write_gemini_config(project, port)
