@@ -1,3 +1,11 @@
+1.0.64  (2026-08-03)
+- Fixed: "maximum recursion depth exceeded" on graph_continue and fallback_rg.
+  Root cause: _TurnStateProxy._s() returned `self` when session wasn't initialized
+  yet (stdio mode before first _set_session() call), causing infinite recursion on
+  every TURN_STATE access. Now auto-initializes the session on first access instead.
+  Affected all projects in stdio mode (Claude Code default). Verified fix on 2216-node
+  Enterprise graph that previously crashed on every graph_continue call.
+
 1.0.63  (2026-08-03)
 - Fixed: graph_find_cycles crash on large projects (maximum recursion depth exceeded).
   Replaced recursive Tarjan's SCC with iterative implementation — no stack depth

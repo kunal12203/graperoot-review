@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.64: fix "maximum recursion depth exceeded" on graph_continue/fallback_rg.
+         _TurnStateProxy._s() returned self when session uninitialized — infinite recursion.
+         Now auto-initializes session on first access. All stdio-mode users affected.
+
 v1.0.63: iterative Tarjan in graph_find_cycles (no recursion crash on large graphs).
          write_mcp_config auto-heals pre-v1.0.62 http .mcp.json entries on startup.
 

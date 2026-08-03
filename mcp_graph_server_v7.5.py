@@ -290,7 +290,11 @@ class _TurnStateProxy(dict):
     across sequential tool calls within one Claude conversation.
     """
     def _s(self) -> dict:
-        return _SESSION_STATES.get(_CURRENT_SID, self)
+        # Never fall back to `self` — that causes infinite recursion when the session
+        # isn't initialized yet (e.g. stdio mode before the first _set_session() call).
+        if _CURRENT_SID not in _SESSION_STATES:
+            _SESSION_STATES[_CURRENT_SID] = _default_turn_state()
+        return _SESSION_STATES[_CURRENT_SID]
 
     def __getitem__(self, k):           return self._s()[k]
     def __setitem__(self, k, v):        self._s()[k] = v
@@ -4460,6 +4464,9 @@ def main() -> int:
     from starlette.responses import JSONResponse, Response
     from starlette.routing import Route
 
+    # FastMCP/anyio/uvicorn stack consumes deep frames before tool code runs.
+    _sys.setrecursionlimit(5000)
+
     preferred = int(os.environ.get("PORT", 8080))
     port = preferred
     for _p in range(preferred, preferred + 20):
@@ -5007,6 +5014,9 @@ def _main_stdio() -> int:
     No port management, no orphan processes. Same pattern as filesystem/git MCPs.
     Triggered by `mcp_graph_server_v7.5.py --stdio`.
     """
+    # FastMCP/anyio stack consumes ~800 frames before tool code runs.
+    # Raise the limit so graph tools don't crash on large projects (2000+ nodes).
+    _sys.setrecursionlimit(5000)
     DG_DATA_DIR.mkdir(parents=True, exist_ok=True)
     _ping_license_server()
     if FastMCP is None:
