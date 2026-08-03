@@ -3884,37 +3884,44 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         on_stack: dict[str, bool] = {}
         sccs: list[list[str]] = []
 
-        def strongconnect(v: str) -> None:
-            index[v] = lowlink[v] = index_counter[0]
+        # Iterative Tarjan's SCC — avoids recursion depth crashes on large graphs.
+        # Each work-item is (node, iterator-over-neighbours, parent).
+        def strongconnect_iter(root: str) -> None:
+            work: list[tuple[str, Any, str | None]] = [(root, iter(adj.get(root, [])), None)]
+            index[root] = lowlink[root] = index_counter[0]
             index_counter[0] += 1
-            stack.append(v)
-            on_stack[v] = True
-            for w in adj.get(v, set()):
-                if w not in index:
-                    strongconnect(w)
-                    lowlink[v] = min(lowlink[v], lowlink[w])
-                elif on_stack.get(w):
-                    lowlink[v] = min(lowlink[v], index[w])
-            if lowlink[v] == index[v]:
-                scc: list[str] = []
-                while True:
-                    w = stack.pop()
-                    on_stack[w] = False
-                    scc.append(w)
-                    if w == v:
-                        break
-                if len(scc) > 1:
-                    sccs.append(scc)
+            stack.append(root)
+            on_stack[root] = True
+            while work:
+                v, neighbours, parent = work[-1]
+                try:
+                    w = next(neighbours)
+                    if w not in index:
+                        index[w] = lowlink[w] = index_counter[0]
+                        index_counter[0] += 1
+                        stack.append(w)
+                        on_stack[w] = True
+                        work.append((w, iter(adj.get(w, [])), v))
+                    elif on_stack.get(w):
+                        lowlink[v] = min(lowlink[v], index[w])
+                except StopIteration:
+                    work.pop()
+                    if parent is not None:
+                        lowlink[parent] = min(lowlink[parent], lowlink[v])
+                    if lowlink[v] == index[v]:
+                        scc: list[str] = []
+                        while True:
+                            w = stack.pop()
+                            on_stack[w] = False
+                            scc.append(w)
+                            if w == v:
+                                break
+                        if len(scc) > 1:
+                            sccs.append(scc)
 
-        import sys
-        old_limit = sys.getrecursionlimit()
-        sys.setrecursionlimit(max(old_limit, 5000))
-        try:
-            for v in list(adj.keys()):
-                if v not in index:
-                    strongconnect(v)
-        finally:
-            sys.setrecursionlimit(old_limit)
+        for v in list(adj.keys()):
+            if v not in index:
+                strongconnect_iter(v)
 
         cycles = [{"size": len(s), "files": sorted(s)} for s in sorted(sccs, key=len, reverse=True)]
         cycles = cycles[:limit]

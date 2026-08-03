@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.63: iterative Tarjan in graph_find_cycles (no recursion crash on large graphs).
+         write_mcp_config auto-heals pre-v1.0.62 http .mcp.json entries on startup.
+
 v1.0.62: fix Claude MCP stale port + Pro/Free coexistence.
          write_mcp_config now uses stdio transport (no hardcoded port in .mcp.json).
          _remove_free_tier_mcp scoped to current project only — stops killing Free
@@ -384,6 +387,9 @@ def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
     Claude Code spawns the server on session start and kills it on exit.
     No port hardcoding, no stale entries between sessions. The env vars
     tell the server where to find the pre-built graph.
+
+    Auto-heals legacy http-transport entries from pre-v1.0.62 installs so
+    existing users don't need to manually edit .mcp.json.
     """
     cfg = project / ".mcp.json"
     existing = {}
@@ -393,6 +399,15 @@ def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
         except Exception:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
+
+    # Detect and report stale http entry (pre-v1.0.62)
+    old = servers.get("graperoot-pro", {})
+    if old.get("type") == "http":
+        print(
+            "[graperoot-pro] Migrating .mcp.json from http to stdio transport "
+            "(one-time upgrade from pre-v1.0.62 install).",
+            flush=True,
+        )
 
     server_script = PRO_HOME / "mcp_graph_server_v7.5.py"
     python_bin = Path(sys.executable).as_posix()

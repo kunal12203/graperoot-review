@@ -10,7 +10,7 @@ routes = [
 # Variables (public) — override per env as needed
 [vars]
 PRO_REPO         = "kunal12203/graperoot-pro-releases"
-PRO_VERSION      = "v1.0.62"
+PRO_VERSION      = "v1.0.63"
 PRO_ASSET        = "graperoot-pro.tar.gz"
 DASHBOARD_ORIGIN = "https://graperoot.dev"
 

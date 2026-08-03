@@ -1,3 +1,12 @@
+1.0.63  (2026-08-03)
+- Fixed: graph_find_cycles crash on large projects (maximum recursion depth exceeded).
+  Replaced recursive Tarjan's SCC with iterative implementation — no stack depth
+  limit, handles graphs of any size. Tested against reference recursive impl on
+  random graphs and 2001-node deep chains.
+- Fixed: stale .mcp.json auto-heal on every dgc-pro run.
+  write_mcp_config now detects and migrates pre-v1.0.62 http-transport entries to
+  stdio automatically — existing users self-fix on next dgc-pro run, no manual edit.
+
 1.0.62  (2026-08-03)
 - Fixed: Claude MCP connection failure caused by stale port in .mcp.json.
   write_mcp_config now uses stdio transport — Claude spawns the server as a child
