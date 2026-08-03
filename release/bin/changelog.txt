@@ -1,3 +1,11 @@
+1.0.62  (2026-08-03)
+- Fixed: Claude MCP connection failure caused by stale port in .mcp.json.
+  write_mcp_config now uses stdio transport — Claude spawns the server as a child
+  process, no port coordination needed, never goes stale between sessions.
+- Fixed: Pro killing Free-tier MCP servers on other projects.
+  _remove_free_tier_mcp now scoped to current project only — uses PID file instead
+  of system-wide process grep. Free-tier on other projects stays alive.
+
 1.0.61  (2026-08-01)
 - Fixed: Codex MCP handshake failure caused by stale hardcoded port in config.toml.
   write_codex_config now registers graperoot-pro as a stdio MCP server (via

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.62: fix Claude MCP stale port + Pro/Free coexistence.
+         write_mcp_config now uses stdio transport (no hardcoded port in .mcp.json).
+         _remove_free_tier_mcp scoped to current project only — stops killing Free
+         servers on other projects.
+
 v1.0.61: fix Codex MCP handshake failure — write_codex_config now registers as
          stdio server (no hardcoded port). Added --stdio to mcp_graph_server_v7.5.
 
@@ -276,55 +281,52 @@ def _is_free_tier_hook(cmd: str) -> bool:
     return bool(re.search(r'\.dual-graph[/\\"\'\s]', cmd))
 
 
-def _remove_free_tier_mcp() -> None:
-    """Remove dual-graph (free tier) from all MCP configs and kill its process.
+def _remove_free_tier_mcp(project: Path) -> None:
+    """Remove dual-graph (free tier) from the CURRENT project's MCP config only.
 
-    Pro is a superset — running both causes duplicate tools and confusion.
-    Searches: top-level mcpServers, per-project mcpServers, and settings.local.json.
+    Pro is a superset — running both on the same project causes duplicate tools.
+    Only touches the current project's config; leaves global and other-project
+    free-tier registrations intact so they keep working.
     """
     removed = False
 
-    # 1. Remove from ~/.claude.json — both top-level AND per-project entries
+    # 1. Remove dual-graph from current project's per-project entry in ~/.claude.json
     claude_cfg = Path.home() / ".claude.json"
     if claude_cfg.exists():
         try:
             data = json.loads(claude_cfg.read_text(encoding="utf-8"))
-            # Top-level mcpServers
-            servers = data.get("mcpServers", {})
-            if "dual-graph" in servers:
-                del servers["dual-graph"]
-                data["mcpServers"] = servers
-                removed = True
-            # Per-project mcpServers (projects dict keyed by path)
             projects = data.get("projects", {})
-            for proj_path, proj_data in projects.items():
-                if isinstance(proj_data, dict):
-                    proj_servers = proj_data.get("mcpServers", {})
-                    if "dual-graph" in proj_servers:
-                        del proj_servers["dual-graph"]
-                        proj_data["mcpServers"] = proj_servers
-                        removed = True
+            proj_key = str(project)
+            # Try both exact and case-insensitive match
+            for key in list(projects.keys()):
+                if key == proj_key or os.path.realpath(key) == os.path.realpath(proj_key):
+                    proj_data = projects[key]
+                    if isinstance(proj_data, dict):
+                        proj_servers = proj_data.get("mcpServers", {})
+                        if "dual-graph" in proj_servers:
+                            del proj_servers["dual-graph"]
+                            proj_data["mcpServers"] = proj_servers
+                            removed = True
             if removed:
                 claude_cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         except Exception:
             pass
 
-    # 2. Remove from ~/.claude/settings.local.json
-    claude_local = Path.home() / ".claude" / "settings.local.json"
-    if claude_local.exists():
+    # 2. Remove from project-level .mcp.json (not global)
+    proj_mcp = project / ".mcp.json"
+    if proj_mcp.exists():
         try:
-            data = json.loads(claude_local.read_text(encoding="utf-8"))
+            data = json.loads(proj_mcp.read_text(encoding="utf-8"))
             servers = data.get("mcpServers", {})
             if "dual-graph" in servers:
                 del servers["dual-graph"]
                 data["mcpServers"] = servers
-                claude_local.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                proj_mcp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
                 removed = True
         except Exception:
             pass
 
     # 3. Clean stale dual-graph hooks from project settings.local.json
-    project = Path.cwd()
     proj_settings = project / ".claude" / "settings.local.json"
     if proj_settings.exists():
         try:
@@ -358,36 +360,30 @@ def _remove_free_tier_mcp() -> None:
         except Exception:
             pass
 
-    # 4. Kill any running dual-graph MCP server process
-    try:
-        if IS_WINDOWS:
-            r = subprocess.run(["wmic", "process", "where",
-                                "commandline like '%mcp_graph_server%' and commandline like '%dual-graph%'",
-                                "get", "processid"], capture_output=True, text=True, timeout=5)
-            for line in r.stdout.splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    subprocess.run(["taskkill", "/F", "/PID", line], capture_output=True, timeout=3)
-        else:
-            r = subprocess.run(["ps", "-axo", "pid=,command="],
-                               capture_output=True, text=True, timeout=5)
-            for line in r.stdout.splitlines():
-                if "mcp_graph_server" in line and "dual-graph" in line and "graperoot-pro" not in line:
-                    parts = line.split(None, 1)
-                    if parts and parts[0].isdigit():
-                        os.kill(int(parts[0]), signal.SIGTERM)
-    except Exception:
-        pass
+    # 4. Kill the free-tier server ONLY for the current project (not other projects)
+    pid_file = project / ".dual-graph" / "mcp_server.pid"
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if IS_WINDOWS:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=3)
+            else:
+                os.kill(pid, signal.SIGTERM)
+            pid_file.unlink(missing_ok=True)
+        except (ValueError, ProcessLookupError, OSError):
+            pass
 
     if removed:
         print("[dgc-pro] Removed free-tier dual-graph (Pro replaces it)", flush=True)
 
 
 def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
-    """Merge graperoot-pro into project's .mcp.json as an HTTP MCP entry.
+    """Register graperoot-pro as a stdio MCP server in project's .mcp.json.
 
-    The server runs as a background HTTP process — Claude Code / opencode / cursor
-    connect via HTTP transport. Other MCP entries in the project are preserved.
+    Claude Code spawns the server on session start and kills it on exit.
+    No port hardcoding, no stale entries between sessions. The env vars
+    tell the server where to find the pre-built graph.
     """
     cfg = project / ".mcp.json"
     existing = {}
@@ -397,9 +393,18 @@ def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
         except Exception:
             existing = {}
     servers = existing.setdefault("mcpServers", {})
+
+    server_script = PRO_HOME / "mcp_graph_server_v7.5.py"
+    python_bin = Path(sys.executable).as_posix()
+
     servers["graperoot-pro"] = {
-        "type": "http",
-        "url": f"http://localhost:{port}/mcp",
+        "type": "stdio",
+        "command": python_bin,
+        "args": [str(server_script.as_posix()), "--stdio"],
+        "env": {
+            "DG_DATA_DIR": str(data_dir),
+            "DUAL_GRAPH_PROJECT_ROOT": str(project),
+        },
     }
     cfg.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     return cfg
@@ -1209,7 +1214,7 @@ def main() -> None:
         signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(1)))
 
     # ── Remove free-tier dual-graph if present (Pro is a superset) ─────────
-    _remove_free_tier_mcp()
+    _remove_free_tier_mcp(project)
 
     # ── Per-tool MCP wiring + policy file ──────────────────────────────────
     if tool == "codex":
@@ -1233,11 +1238,11 @@ def main() -> None:
         # Grok CLI spawns `claude` under the hood (proxy → ANTHROPIC_BASE_URL).
         # Claude Code reads .mcp.json and fires hooks normally — identical to claude path.
         mcp_cfg = write_mcp_config(project, data_dir, port)
-        print(f"[{label}] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
+        print(f"[{label}] graperoot-pro registered (stdio) in {mcp_cfg}", flush=True)
         doc, action = write_claude_md(project)
     else:  # claude (default)
         mcp_cfg = write_mcp_config(project, data_dir, port)
-        print(f"[{label}] graperoot-pro registered (http://localhost:{port}/mcp) in {mcp_cfg}", flush=True)
+        print(f"[{label}] graperoot-pro registered (stdio) in {mcp_cfg}", flush=True)
         doc, action = write_claude_md(project)
 
     if action == "created":
