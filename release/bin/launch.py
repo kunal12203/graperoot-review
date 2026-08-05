@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.65: fix "Conflicting scopes" error — auto-remove stale user-scope graperoot-pro
+         from ~/.claude.json when project-scope .mcp.json is written by launch.py.
+
 v1.0.64: fix "maximum recursion depth exceeded" on graph_continue/fallback_rg.
          _TurnStateProxy._s() returned self when session uninitialized — infinite recursion.
          Now auto-initializes session on first access. All stdio-mode users affected.
@@ -385,6 +388,33 @@ def _remove_free_tier_mcp(project: Path) -> None:
         print("[dgc-pro] Removed free-tier dual-graph (Pro replaces it)", flush=True)
 
 
+def _heal_user_scope_conflict() -> None:
+    """Remove graperoot-pro from user-scope ~/.claude.json if present.
+
+    Claude Code raises a "[Conflicting scopes]" error when the same MCP server
+    name exists in both user scope (~/.claude.json mcpServers) and project scope
+    (.mcp.json). Since launch.py always writes the correct project-scope entry,
+    any user-scope entry is stale/redundant and must be removed.
+    """
+    claude_json = Path.home() / ".claude.json"
+    if not claude_json.exists():
+        return
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    mcp_servers = data.get("mcpServers", {})
+    if "graperoot-pro" not in mcp_servers:
+        return
+    del mcp_servers["graperoot-pro"]
+    claude_json.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(
+        "[graperoot-pro] Removed stale user-scope MCP entry from ~/.claude.json "
+        "(was causing 'Conflicting scopes' error). Project-scope .mcp.json is authoritative.",
+        flush=True,
+    )
+
+
 def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
     """Register graperoot-pro as a stdio MCP server in project's .mcp.json.
 
@@ -395,6 +425,9 @@ def write_mcp_config(project: Path, data_dir: Path, port: int) -> Path:
     Auto-heals legacy http-transport entries from pre-v1.0.62 installs so
     existing users don't need to manually edit .mcp.json.
     """
+    # Heal user-scope conflict before writing project scope
+    _heal_user_scope_conflict()
+
     cfg = project / ".mcp.json"
     existing = {}
     if cfg.exists():

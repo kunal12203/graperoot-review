@@ -1,3 +1,9 @@
+1.0.65  (2026-08-04)
+- Fixed: "Conflicting scopes" error when graperoot-pro exists in both user-scope
+  (~/.claude.json) and project-scope (.mcp.json). write_mcp_config now auto-removes
+  the stale user-scope entry before writing the project-scope one. Prevents the
+  intermittent "Server graperoot-pro is defined in multiple scopes" Claude Code error.
+
 1.0.64  (2026-08-03)
 - Fixed: "maximum recursion depth exceeded" on graph_continue and fallback_rg.
   Root cause: _TurnStateProxy._s() returned `self` when session wasn't initialized
