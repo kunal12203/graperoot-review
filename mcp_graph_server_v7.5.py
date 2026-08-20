@@ -1692,6 +1692,15 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
     @mcp.tool()
     def graph_retrieve(query: str, top_files: int = 5, top_edges: int = 12) -> dict[str, Any]:
         """Internal retrieval — prefer graph_continue."""
+        try:
+            return _graph_retrieve_impl(query, top_files, top_edges)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            return {"ok": False, "client_disconnected": True,
+                    "error": f"Tool interrupted: {type(exc).__name__}"}
+
+    def _graph_retrieve_impl(query: str, top_files: int = 5, top_edges: int = 12) -> dict[str, Any]:
         qk = _query_key(query)
         # New query starts a new adaptive turn budget.
         if qk and qk != TURN_STATE.get("query_key", ""):
@@ -2370,6 +2379,15 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         """CALL THIS FIRST — before Read, Bash, grep, or any file exploration.
         Returns recommended_files to read via graph_read, and a confidence level.
         Do NOT use Bash/grep/Read before calling this. If needs_project=True, call graph_scan next."""
+        try:
+            return _graph_continue_impl(query, top_files, top_edges, limit)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            return {"ok": False, "client_disconnected": True,
+                    "error": f"Tool interrupted: {type(exc).__name__}"}
+
+    def _graph_continue_impl(query: str, top_files: int = 5, top_edges: int = 12, limit: int = 8) -> dict[str, Any]:
         # ── Project setup gate ────────────────────────────────────────────────
         # Only check the graph file — NOT PROJECT_ROOT.is_dir().
         # In the Railway upload model the project directory never exists on the
@@ -2920,6 +2938,15 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
         """Use instead of Bash grep/rg when graph_continue confidence is medium or low.
         Returns contextualized hits with enclosing symbol info and bodies.
         Do NOT use Bash grep directly — always use this tool for pattern search."""
+        try:
+            return _fallback_rg_impl(pattern, max_hits, include_symbol_bodies)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            return {"ok": False, "client_disconnected": True,
+                    "error": f"Tool interrupted: {type(exc).__name__}"}
+
+    def _fallback_rg_impl(pattern: str, max_hits: int = 30, include_symbol_bodies: bool = True) -> dict[str, Any]:
         if not TURN_STATE.get("graph_continue_called"):
             return {
                 "ok": False,
@@ -3947,6 +3974,15 @@ def build_server(host: str = "127.0.0.1", port: int = 8080) -> Any:
             file_glob: Optional glob to restrict files (e.g. "*.ts", "**/*.py").
             max_hits: Maximum number of matches to return (default 200).
         """
+        try:
+            return _graph_grep_all_impl(pattern, file_glob, max_hits)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            return {"ok": False, "client_disconnected": True,
+                    "error": f"Tool interrupted: {type(exc).__name__}"}
+
+    def _graph_grep_all_impl(pattern: str, file_glob: str = "", max_hits: int = 200) -> dict[str, Any]:
         if not TURN_STATE.get("graph_continue_called"):
             return {"ok": False, "error": "Call graph_continue first.", "action_required": "graph_continue"}
         # Track call count and enforce soft limit

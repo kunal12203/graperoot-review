@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GrapeRoot Pro — Python core. Called by launch_pro.{sh,ps1} after license check.
 
+v1.0.66: fix "ASGI callable returned without completing response" — wrap long-running
+         tools with BaseException guard for graceful client-disconnect handling.
 v1.0.65: fix "Conflicting scopes" error — auto-remove stale user-scope graperoot-pro
          from ~/.claude.json when project-scope .mcp.json is written by launch.py.
 

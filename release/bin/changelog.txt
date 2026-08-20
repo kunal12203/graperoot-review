@@ -1,3 +1,9 @@
+1.0.66  (2026-08-21)
+- Fixed: "ASGI callable returned without completing response" crash when HTTP client
+  disconnects mid-tool-call. Wrapped graph_continue, graph_retrieve, fallback_rg,
+  and graph_grep_all with BaseException guard that returns a graceful error dict
+  instead of letting CancelledError/ClientDisconnect propagate to uvicorn.
+
 1.0.65  (2026-08-04)
 - Fixed: "Conflicting scopes" error when graperoot-pro exists in both user-scope
   (~/.claude.json) and project-scope (.mcp.json). write_mcp_config now auto-removes
